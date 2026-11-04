@@ -215,6 +215,13 @@ bool parseDecimal(const std::string &line, double &value) {
 	return end != t.c_str();
 }
 
+bool parseDecimalComma(const std::string &line, double &value) {
+	std::string t = trimLeft(line);
+	const size_t comma = t.find(',');
+	if (comma != std::string::npos) t[comma] = '.';
+	return parseDecimal(t, value);
+}
+
 // Strict conversion. Any input the target can't hold exactly fails.
 bool iconvConvert(const char *from, const char *to, const char *input, size_t length, std::string &out) {
 	out.clear();
@@ -434,6 +441,8 @@ std::string applyLineOp(const std::string &text, LineOp op, Eol eol) {
 	case LineOp::SortIntDesc: sortNumeric(lines, false, parseInteger); break;
 	case LineOp::SortDecimalAsc: sortNumeric(lines, true, parseDecimal); break;
 	case LineOp::SortDecimalDesc: sortNumeric(lines, false, parseDecimal); break;
+	case LineOp::SortDecimalCommaAsc: sortNumeric(lines, true, parseDecimalComma); break;
+	case LineOp::SortDecimalCommaDesc: sortNumeric(lines, false, parseDecimalComma); break;
 	case LineOp::SortLengthAsc:
 		std::stable_sort(lines.begin(), lines.end(), [](const std::string &a, const std::string &b) {
 			return utf8Length(a) < utf8Length(b);
@@ -676,27 +685,6 @@ std::string unescapeExtended(const std::string &text) {
 	return out;
 }
 
-std::string normalizeRegexReplacement(const std::string &text) {
-	std::string out;
-	for (size_t i = 0; i < text.size(); i++) {
-		const char c = text[i];
-		if (c == '\\' && i + 1 < text.size()) {
-			if (text[i + 1] == '$') {
-				out += '$';
-			} else {
-				out += c;
-				out += text[i + 1];
-			}
-			i++;
-		} else if (c == '$' && i + 1 < text.size() && std::isdigit(static_cast<unsigned char>(text[i + 1]))) {
-			out += '\\';
-		} else {
-			out += c;
-		}
-	}
-	return out;
-}
-
 std::vector<std::string> commentLines(const std::vector<std::string> &lines, const std::string &token, CommentMode mode) {
 	const auto indentOf = [](const std::string &line) {
 		size_t i = 0;
@@ -738,6 +726,51 @@ std::vector<std::string> commentLines(const std::vector<std::string> &lines, con
 			out.push_back(line.substr(0, indent) + token + " " + line.substr(indent));
 		}
 	}
+	return out;
+}
+
+std::string normalizeShortcut(const std::string &shortcut) {
+	bool mod = false, ctrl = false, alt = false, shift = false;
+	std::string key;
+	size_t start = 0;
+	while (start <= shortcut.size()) {
+		size_t plus = shortcut.find('+', start);
+		// A trailing + is the key itself, as in "Mod++".
+		if (plus == start && start + 1 >= shortcut.size()) plus = std::string::npos;
+		const std::string part = shortcut.substr(start, plus == std::string::npos ? std::string::npos : plus - start);
+		std::string lower = part;
+		std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		if (lower == "mod") mod = true;
+		else if (lower == "ctrl") ctrl = true;
+		else if (lower == "alt") alt = true;
+		else if (lower == "shift") shift = true;
+		else if (!part.empty()) key = part;
+		if (plus == std::string::npos) break;
+		start = plus + 1;
+	}
+	if (key.empty()) return std::string();
+	if (key.size() == 1) key[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(key[0])));
+	std::string out;
+	if (mod) out += "Mod+";
+	if (ctrl) out += "Ctrl+";
+	if (alt) out += "Alt+";
+	if (shift) out += "Shift+";
+	return out + key;
+}
+
+std::string formatNumber(long value, int base, size_t width) {
+	static const char *digits = "0123456789ABCDEF";
+	if (base != 2 && base != 8 && base != 16) base = 10;
+	const bool negative = value < 0;
+	unsigned long magnitude = negative ? 0UL - static_cast<unsigned long>(value) : static_cast<unsigned long>(value);
+	std::string out;
+	do {
+		out.insert(out.begin(), digits[magnitude % static_cast<unsigned long>(base)]);
+		magnitude /= static_cast<unsigned long>(base);
+	} while (magnitude);
+	const size_t signSize = negative ? 1 : 0;
+	if (out.size() + signSize < width) out.insert(0, width - out.size() - signSize, '0');
+	if (negative) out.insert(0, "-");
 	return out;
 }
 

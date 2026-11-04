@@ -14,8 +14,6 @@
 #include <memory>
 #include <set>
 #include <string>
-#include <sys/resource.h>
-#include <unistd.h>
 #include <vector>
 
 using namespace omapad;
@@ -69,6 +67,59 @@ std::string findResources() {
 }
 
 enum FolderColumn { ColName, ColPath, ColIsDir, ColIsRoot, ColIcon, ColPopulated, ColCount };
+enum FunctionColumn { FnName, FnIndex, FnCount };
+enum ShortcutColumn { ScCommand, ScShortcut, ScId, ScWeight, ScCount };
+
+// The keyval for the key part of a shortcut like "Mod+Shift+F", or 0.
+guint keyvalFromShortcutKey(const std::string &name) {
+	static const std::map<std::string, guint> named = {
+		{"Space", GDK_KEY_space}, {"PageUp", GDK_KEY_Page_Up}, {"PageDown", GDK_KEY_Page_Down},
+		{"/", GDK_KEY_slash}, {"=", GDK_KEY_equal}, {"-", GDK_KEY_minus}, {"+", GDK_KEY_plus},
+		{"[", GDK_KEY_bracketleft}, {"]", GDK_KEY_bracketright}, {",", GDK_KEY_comma}, {".", GDK_KEY_period},
+		{";", GDK_KEY_semicolon}, {"'", GDK_KEY_apostrophe}, {"\\", GDK_KEY_backslash}, {"`", GDK_KEY_grave},
+	};
+	const auto found = named.find(name);
+	if (found != named.end()) return found->second;
+	if (name.size() == 1) {
+		const char lower = g_ascii_tolower(name[0]);
+		return gdk_unicode_to_keyval(static_cast<guchar>(lower));
+	}
+	const guint key = gdk_keyval_from_name(name.c_str());
+	return key == GDK_KEY_VoidSymbol ? 0 : key;
+}
+
+// The event as a shortcut, or empty if it isn't usable as one. Reads the key as if Shift
+// weren't held, so Control+Shift+1 is that and not Control+!.
+std::string shortcutFromEvent(const GdkEventKey *event) {
+	if (event->is_modifier) return {};
+	guint keyval = event->keyval;
+	gdk_keymap_translate_keyboard_state(gdk_keymap_get_for_display(gdk_display_get_default()), event->hardware_keycode,
+	                                    GdkModifierType(0), event->group, &keyval, nullptr, nullptr, nullptr);
+	static const std::map<guint, const char *> named = {
+		{GDK_KEY_space, "Space"}, {GDK_KEY_Return, "Return"}, {GDK_KEY_Tab, "Tab"}, {GDK_KEY_BackSpace, "BackSpace"},
+		{GDK_KEY_Delete, "Delete"}, {GDK_KEY_Home, "Home"}, {GDK_KEY_End, "End"}, {GDK_KEY_Up, "Up"}, {GDK_KEY_Down, "Down"},
+		{GDK_KEY_Left, "Left"}, {GDK_KEY_Right, "Right"}, {GDK_KEY_Page_Up, "PageUp"}, {GDK_KEY_Page_Down, "PageDown"},
+	};
+	std::string key;
+	const auto found = named.find(keyval);
+	const bool functionKey = keyval >= GDK_KEY_F1 && keyval <= GDK_KEY_F35;
+	if (found != named.end()) {
+		key = found->second;
+	} else if (functionKey) {
+		key = "F" + std::to_string(keyval - GDK_KEY_F1 + 1);
+	} else {
+		const guint32 character = gdk_keyval_to_unicode(keyval);
+		if (character < 0x21 || character > 0x7E) return {};  // Only keys every layout can name.
+		key = std::string(1, g_ascii_toupper(static_cast<char>(character)));
+	}
+	std::string out;
+	if (event->state & GDK_CONTROL_MASK) out += "Mod+";
+	if (event->state & GDK_MOD1_MASK) out += "Alt+";
+	// Without Control or Alt, a key types text, unless it's a function key.
+	if (out.empty() && !functionKey) return {};
+	if (event->state & GDK_SHIFT_MASK) out += "Shift+";
+	return out + key;
+}
 
 bool isCheckable(Cmd cmd) {
 	static const std::set<Cmd> checkable = {
@@ -76,6 +127,7 @@ bool isCheckable(Cmd cmd) {
 		Cmd::ToggleWrapSymbol, Cmd::ToggleWrap, Cmd::ToggleResults, Cmd::RotateSplit, Cmd::SyncVertical, Cmd::SyncHorizontal,
 		Cmd::ToggleFolderPanel, Cmd::ToggleHiddenInFolders, Cmd::EolConvert, Cmd::ReopenEncoding, Cmd::ConvertEncoding,
 		Cmd::SetLanguage, Cmd::SetTheme, Cmd::SetTabWidth, Cmd::ToggleInsertSpaces, Cmd::SelectDocument,
+		Cmd::ToggleFunctionList, Cmd::ToggleDocumentMap, Cmd::ToggleReadOnly,
 	};
 	return checkable.count(cmd) != 0;
 }
@@ -94,6 +146,7 @@ public:
 	SciView &paneView(int pane) override { return panes[pane].sci; }
 	SciView &resultsView() override { return results; }
 	SciView &backgroundView() override { return background; }
+	SciView &mapView() override { return map; }
 	int ask(const std::string &title, const std::string &detail, const std::vector<std::string> &buttons) override;
 	bool chooseFilesToOpen(const std::string &start, std::vector<std::string> &out) override;
 	bool chooseSavePath(const std::string &name, const std::string &start, std::string &out) override;
@@ -119,6 +172,12 @@ public:
 		if (panes[pane].sci.widget) gtk_widget_grab_focus(panes[pane].sci.widget);
 	}
 	void themeChanged() override;
+	void menusChanged() override;
+	bool runForm(const std::string &title, std::vector<FormField> &fields) override;
+	void runShortcutMapper() override;
+	void setDocumentMapVisible(bool visible) override;
+	void setFunctionListVisible(bool visible) override;
+	void functionListChanged() override;
 	void showFind(FindTab tab, const std::string &prefill, const std::string &directory) override;
 	void setFindText(const std::string &text) override { gtk_entry_set_text(whatEntry(), text.c_str()); }
 	FindOptions currentFindOptions() override;
@@ -162,7 +221,11 @@ private:
 	GtkWidget *nativeMenu(const std::vector<MenuItem> &items, GtkAccelGroup *accel);
 	void refreshMenu(GtkWidget *menu);
 	void popup(const std::vector<MenuItem> &items);
+	void buildMenuBar();
 	void buildFolderPanel();
+	void buildFunctionPanel();
+	void buildDocumentMap();
+	void arrangeSidePanels();
 	void addFolderChildren(GtkTreeIter *parent, const std::string &path);
 	void populateRow(GtkTreeIter *iter);
 	void restoreExpansion(GtkTreeIter *iter);
@@ -177,8 +240,10 @@ private:
 	GtkApplication *application;
 	GtkWidget *window = nullptr;
 	PaneWidgets panes[2];
-	GtkSciView results, background;
-	GtkWidget *editorPaned = nullptr, *rightPaned = nullptr, *outerPaned = nullptr;
+	GtkSciView results, background, map;
+	GtkWidget *editorPaned = nullptr, *rightPaned = nullptr, *outerPaned = nullptr, *sidePaned = nullptr, *sideBox = nullptr;
+	GtkWidget *menubar = nullptr;
+	GtkAccelGroup *accelGroup = nullptr;
 	GtkWidget *statusLeft = nullptr, *statusRight = nullptr, *statusMessage = nullptr;
 	guint flashTimer = 0, activationTimer = 0, themeTimer = 0;
 	int dialogDepth = 0;
@@ -189,10 +254,15 @@ private:
 	GtkWidget *folderBox = nullptr, *folderView = nullptr;
 	GtkTreeStore *folderStore = nullptr;
 
+	GtkWidget *functionBox = nullptr, *functionView = nullptr, *functionFilter = nullptr, *functionEmpty = nullptr, *functionSort = nullptr;
+	GtkTreeStore *functionStore = nullptr;
+	std::set<std::string> collapsedClasses;
+	bool reloadingFunctions = false;
+
 	GtkWidget *findWindow = nullptr, *findTabs[3] = {nullptr, nullptr, nullptr};
 	GtkWidget *what = nullptr, *with = nullptr, *filters = nullptr, *directory = nullptr;
 	GtkWidget *matchCase = nullptr, *wholeWord = nullptr, *wrap = nullptr, *backward = nullptr, *inSelection = nullptr;
-	GtkWidget *recursive = nullptr, *hidden = nullptr, *mode = nullptr, *findStatus = nullptr;
+	GtkWidget *recursive = nullptr, *hidden = nullptr, *mode = nullptr, *findStatus = nullptr, *dotNewline = nullptr;
 	GtkWidget *withRow = nullptr, *filtersRow = nullptr, *directoryRow = nullptr, *filesOptions = nullptr, *selectionRow = nullptr;
 	GtkWidget *findButtons = nullptr, *replaceButtons = nullptr, *filesButtons = nullptr;
 	GtkWidget *findInFilesButton = nullptr, *stopButton = nullptr;
@@ -334,6 +404,8 @@ void App::setTabLabel(int pane, int index, const TabInfo &info) {
 	GtkWidget *label = GTK_WIDGET(g_object_get_data(G_OBJECT(events), "omapad-label"));
 	const std::string title = (info.dirty ? "● " : "") + info.title;
 	gtk_label_set_text(GTK_LABEL(label), title.c_str());
+	// An ellipsized label asks for almost no width, and a scrolling notebook gives it just that.
+	gtk_label_set_width_chars(GTK_LABEL(label), static_cast<gint>(std::min<glong>(g_utf8_strlen(title.c_str(), -1), 28)));
 	gtk_widget_set_tooltip_text(events, info.toolTip.c_str());
 }
 
@@ -440,24 +512,22 @@ GtkWidget *App::nativeItem(const MenuItem &item, GtkAccelGroup *accel, bool topL
 	if (!item.shortcut.empty()) {
 		guint key = 0;
 		GdkModifierType mods = GdkModifierType(0);
-		gchar **parts = g_strsplit(item.shortcut.c_str(), "+", -1);
+		std::string shortcut = item.shortcut;
+		// "Mod++" means the plus key, which splitting on + would lose.
+		if (shortcut.size() >= 2 && shortcut.compare(shortcut.size() - 2, 2, "++") == 0) {
+			key = GDK_KEY_plus;
+			shortcut.resize(shortcut.size() - 2);
+		}
+		gchar **parts = g_strsplit(shortcut.c_str(), "+", -1);
 		for (gchar **part = parts; *part; part++) {
 			const std::string name = *part;
 			if (name == "Mod" || name == "Ctrl") mods = GdkModifierType(mods | GDK_CONTROL_MASK);
 			else if (name == "Alt") mods = GdkModifierType(mods | GDK_MOD1_MASK);
 			else if (name == "Shift") mods = GdkModifierType(mods | GDK_SHIFT_MASK);
-			else if (name == "/") key = GDK_KEY_slash;
-			else if (name == "=") key = GDK_KEY_equal;
-			else if (name == "-") key = GDK_KEY_minus;
-			else if (name == "[") key = GDK_KEY_bracketleft;
-			else if (name == "]") key = GDK_KEY_bracketright;
-			else if (name == "PageUp") key = GDK_KEY_Page_Up;
-			else if (name == "PageDown") key = GDK_KEY_Page_Down;
-			else if (name.size() == 1) key = gdk_keyval_from_name(g_ascii_strdown(name.c_str(), -1));
-			else key = gdk_keyval_from_name(name.c_str());
+			else if (!name.empty()) key = keyvalFromShortcutKey(name);
 		}
 		g_strfreev(parts);
-		if (key != 0 && key != GDK_KEY_VoidSymbol) {
+		if (key != 0) {
 			if (!item.macAction.empty() || !accel) {
 				// Standard editing keys stay with whichever view has focus, so they work in the
 				// results pane too. The menu only shows them. Omarchy's Super+C and Super+V arrive
@@ -497,6 +567,21 @@ void App::popup(const std::vector<MenuItem> &items) {
 		g_idle_add(+[](gpointer data) -> gboolean { gtk_widget_destroy(GTK_WIDGET(data)); return G_SOURCE_REMOVE; }, m);
 	}), nullptr);
 	gtk_menu_popup_at_pointer(GTK_MENU(menu), nullptr);
+}
+
+void App::buildMenuBar() {
+	if (accelGroup) gtk_window_remove_accel_group(GTK_WINDOW(window), accelGroup);
+	accelGroup = gtk_accel_group_new();
+	gtk_window_add_accel_group(GTK_WINDOW(window), accelGroup);
+	GList *children = gtk_container_get_children(GTK_CONTAINER(menubar));
+	for (GList *child = children; child; child = child->next) gtk_widget_destroy(GTK_WIDGET(child->data));
+	g_list_free(children);
+	for (const MenuItem &top : workspace->mainMenu()) gtk_menu_shell_append(GTK_MENU_SHELL(menubar), nativeItem(top, accelGroup, true));
+	gtk_widget_show_all(menubar);
+}
+
+void App::menusChanged() {
+	if (window && menubar) buildMenuBar();
 }
 
 #pragma mark - Folder as Workspace
@@ -702,6 +787,196 @@ void App::setFolderPanelVisible(bool visible) {
 	}
 }
 
+#pragma mark - Function List and Document Map
+
+void App::buildFunctionPanel() {
+	functionBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+	gtk_style_context_add_class(gtk_widget_get_style_context(functionBox), "omapad-folders");
+	gtk_widget_set_size_request(functionBox, 160, -1);
+	GtkWidget *header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+	gtk_widget_set_margin_start(header, 10);
+	gtk_widget_set_margin_end(header, 4);
+	GtkWidget *title = gtk_label_new("FUNCTIONS");
+	gtk_style_context_add_class(gtk_widget_get_style_context(title), "omapad-folder-title");
+	gtk_label_set_xalign(GTK_LABEL(title), 0);
+	functionSort = gtk_toggle_button_new();
+	gtk_button_set_image(GTK_BUTTON(functionSort), gtk_image_new_from_icon_name("view-sort-ascending-symbolic", GTK_ICON_SIZE_MENU));
+	gtk_widget_set_tooltip_text(functionSort, "Sort by name");
+	GtkWidget *refresh = gtk_button_new_from_icon_name("view-refresh-symbolic", GTK_ICON_SIZE_MENU);
+	gtk_widget_set_tooltip_text(refresh, "Refresh");
+	for (GtkWidget *button : {functionSort, refresh}) {
+		gtk_button_set_relief(GTK_BUTTON(button), GTK_RELIEF_NONE);
+		gtk_widget_set_can_focus(button, FALSE);
+	}
+	gtk_box_pack_start(GTK_BOX(header), title, TRUE, TRUE, 0);
+	gtk_box_pack_start(GTK_BOX(header), functionSort, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(header), refresh, FALSE, FALSE, 0);
+	onSignal(functionSort, "toggled", [this]() { functionListChanged(); });
+	onSignal(refresh, "clicked", [this]() { workspace->refreshFunctionList(); });
+
+	functionFilter = gtk_search_entry_new();
+	gtk_entry_set_placeholder_text(GTK_ENTRY(functionFilter), "Filter");
+	gtk_widget_set_margin_start(functionFilter, 6);
+	gtk_widget_set_margin_end(functionFilter, 6);
+	gtk_widget_set_margin_bottom(functionFilter, 4);
+	onSignal(functionFilter, "search-changed", [this]() { functionListChanged(); });
+
+	functionEmpty = gtk_label_new("");
+	gtk_label_set_line_wrap(GTK_LABEL(functionEmpty), TRUE);
+	gtk_widget_set_margin_top(functionEmpty, 12);
+	gtk_widget_set_no_show_all(functionEmpty, TRUE);
+
+	functionStore = gtk_tree_store_new(FnCount, G_TYPE_STRING, G_TYPE_INT);
+	functionView = gtk_tree_view_new_with_model(GTK_TREE_MODEL(functionStore));
+	gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(functionView), FALSE);
+	gtk_tree_view_set_enable_search(GTK_TREE_VIEW(functionView), FALSE);
+	gtk_tree_view_set_tooltip_column(GTK_TREE_VIEW(functionView), FnName);
+	GtkCellRenderer *text = gtk_cell_renderer_text_new();
+	g_object_set(text, "ellipsize", PANGO_ELLIPSIZE_END, nullptr);
+	gtk_tree_view_append_column(GTK_TREE_VIEW(functionView), gtk_tree_view_column_new_with_attributes("", text, "text", FnName, nullptr));
+	g_signal_connect(functionView, "row-activated", G_CALLBACK(+[](GtkTreeView *view, GtkTreePath *path, GtkTreeViewColumn *, gpointer self) {
+		App *app = static_cast<App *>(self);
+		GtkTreeIter iter;
+		if (!gtk_tree_model_get_iter(GTK_TREE_MODEL(app->functionStore), &iter, path)) return;
+		gint index = -1;
+		gtk_tree_model_get(GTK_TREE_MODEL(app->functionStore), &iter, FnIndex, &index, -1);
+		if (index >= 0) {
+			app->workspace->goToFunction(static_cast<size_t>(index));
+		} else if (gtk_tree_view_row_expanded(view, path)) {
+			gtk_tree_view_collapse_row(view, path);
+		} else {
+			gtk_tree_view_expand_row(view, path, FALSE);
+		}
+	}), this);
+	const auto expansion = +[](GtkTreeView *, GtkTreeIter *iter, GtkTreePath *, gpointer self, bool collapsed) {
+		App *app = static_cast<App *>(self);
+		if (app->reloadingFunctions) return;
+		gchar *name = nullptr;
+		gtk_tree_model_get(GTK_TREE_MODEL(app->functionStore), iter, FnName, &name, -1);
+		if (name && collapsed) app->collapsedClasses.insert(name);
+		else if (name) app->collapsedClasses.erase(name);
+		g_free(name);
+	};
+	static const auto recordExpansion = expansion;
+	g_signal_connect(functionView, "row-collapsed", G_CALLBACK(+[](GtkTreeView *v, GtkTreeIter *i, GtkTreePath *p, gpointer self) { recordExpansion(v, i, p, self, true); }), this);
+	g_signal_connect(functionView, "row-expanded", G_CALLBACK(+[](GtkTreeView *v, GtkTreeIter *i, GtkTreePath *p, gpointer self) { recordExpansion(v, i, p, self, false); }), this);
+
+	GtkWidget *scroll = gtk_scrolled_window_new(nullptr, nullptr);
+	gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+	gtk_container_add(GTK_CONTAINER(scroll), functionView);
+	gtk_box_pack_start(GTK_BOX(functionBox), header, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(functionBox), functionFilter, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(functionBox), functionEmpty, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(functionBox), scroll, TRUE, TRUE, 0);
+}
+
+void App::functionListChanged() {
+	if (!functionStore || !gtk_widget_get_visible(functionBox)) return;
+	const auto lower = [](std::string value) {
+		std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(g_ascii_tolower(c)); });
+		return value;
+	};
+	const std::string filter = lower(gtk_entry_get_text(GTK_ENTRY(functionFilter)));
+	const std::vector<FunctionEntry> &entries = workspace->functionEntries();
+	std::vector<size_t> order;
+	for (size_t i = 0; i < entries.size(); i++) {
+		if (filter.empty() || lower(entries[i].name).find(filter) != std::string::npos || lower(entries[i].className).find(filter) != std::string::npos)
+			order.push_back(i);
+	}
+	if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(functionSort)))
+		std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return lower(entries[a].name) < lower(entries[b].name); });
+
+	reloadingFunctions = true;
+	gtk_tree_store_clear(functionStore);
+	std::map<std::string, GtkTreeIter> classes;
+	for (const size_t i : order) {
+		const FunctionEntry &entry = entries[i];
+		GtkTreeIter *parent = nullptr;
+		if (!entry.className.empty()) {
+			auto found = classes.find(entry.className);
+			if (found == classes.end()) {
+				GtkTreeIter classIter;
+				gtk_tree_store_append(functionStore, &classIter, nullptr);
+				gtk_tree_store_set(functionStore, &classIter, FnName, entry.className.c_str(), FnIndex, -1, -1);
+				found = classes.emplace(entry.className, classIter).first;
+			}
+			parent = &found->second;
+		}
+		GtkTreeIter iter;
+		gtk_tree_store_append(functionStore, &iter, parent);
+		gtk_tree_store_set(functionStore, &iter, FnName, entry.name.c_str(), FnIndex, static_cast<gint>(i), -1);
+	}
+	for (auto &entry : classes) {
+		if (collapsedClasses.count(entry.first)) continue;
+		GtkTreePath *path = gtk_tree_model_get_path(GTK_TREE_MODEL(functionStore), &entry.second);
+		gtk_tree_view_expand_row(GTK_TREE_VIEW(functionView), path, FALSE);
+		gtk_tree_path_free(path);
+	}
+	reloadingFunctions = false;
+
+	const bool nothing = order.empty();
+	gtk_widget_set_visible(functionEmpty, nothing);
+	if (nothing) {
+		const char *message = !filter.empty() ? "Nothing matches the filter."
+			: !workspace->activeLanguageHasFunctionList() ? "This language has no function list."
+			: "No functions found.";
+		gtk_label_set_text(GTK_LABEL(functionEmpty), message);
+	}
+}
+
+void App::setFunctionListVisible(bool visible) {
+	gtk_widget_set_visible(functionBox, visible);
+	if (visible) {
+		gtk_widget_show_all(functionBox);
+		functionListChanged();
+	}
+	arrangeSidePanels();
+}
+
+// The map takes no input of its own: presses jump the editor there, and scrolling scrolls the
+// editor. Stopping these signals here also keeps it from ever taking the keyboard focus.
+void App::buildDocumentMap() {
+	map.widget = scintilla_new();
+	gtk_widget_set_can_focus(map.widget, FALSE);
+	gtk_widget_set_size_request(map.widget, 120, -1);
+	g_signal_connect(map.widget, "button-press-event", G_CALLBACK(+[](GtkWidget *, GdkEventButton *event, gpointer self) -> gboolean {
+		if (event->button == GDK_BUTTON_PRIMARY) static_cast<App *>(self)->workspace->mapPressed(static_cast<long>(event->x), static_cast<long>(event->y));
+		return TRUE;
+	}), this);
+	g_signal_connect(map.widget, "button-release-event", G_CALLBACK(+[](GtkWidget *, GdkEventButton *, gpointer) -> gboolean { return TRUE; }), nullptr);
+	g_signal_connect(map.widget, "motion-notify-event", G_CALLBACK(+[](GtkWidget *, GdkEventMotion *event, gpointer self) -> gboolean {
+		if (event->state & GDK_BUTTON1_MASK) static_cast<App *>(self)->workspace->mapPressed(static_cast<long>(event->x), static_cast<long>(event->y));
+		return TRUE;
+	}), this);
+	g_signal_connect(map.widget, "scroll-event", G_CALLBACK(+[](GtkWidget *, GdkEventScroll *event, gpointer self) -> gboolean {
+		App *app = static_cast<App *>(self);
+		static double pending = 0;
+		if (event->direction == GDK_SCROLL_UP) pending -= 3;
+		else if (event->direction == GDK_SCROLL_DOWN) pending += 3;
+		else if (event->direction == GDK_SCROLL_SMOOTH) pending += event->delta_y * 3;
+		// Trackpads send fractions of a line, so they're saved up until there's a whole one.
+		const long whole = static_cast<long>(pending);
+		pending -= static_cast<double>(whole);
+		if (whole != 0) app->workspace->mapScrolled(whole);
+		return TRUE;
+	}), this);
+}
+
+void App::setDocumentMapVisible(bool visible) {
+	gtk_widget_set_visible(map.widget, visible);
+	arrangeSidePanels();
+}
+
+// Gives the side panels their room, now and whenever one is shown or hidden.
+void App::arrangeSidePanels() {
+	if (!sidePaned) return;
+	const int wanted = (gtk_widget_get_visible(functionBox) ? 250 : 0) + (gtk_widget_get_visible(map.widget) ? 120 : 0);
+	gtk_widget_set_visible(sideBox, wanted > 0);
+	GtkAllocation allocation;
+	gtk_widget_get_allocation(sidePaned, &allocation);
+	if (wanted > 0 && allocation.width > wanted + 100) gtk_paned_set_position(GTK_PANED(sidePaned), allocation.width - wanted);
+}
+
 #pragma mark - Find window
 
 void App::buildFindWindow() {
@@ -789,7 +1064,10 @@ void App::buildFindWindow() {
 	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(recursive), TRUE);
 	hidden = gtk_check_button_new_with_label("In hidden folders");
 	checkRow({matchCase, wholeWord, wrap, backward});
-	selectionRow = checkRow({inSelection});
+	dotNewline = gtk_check_button_new_with_label(". matches newline");
+	gtk_widget_set_sensitive(dotNewline, FALSE);
+	onSignal(mode, "changed", [this]() { gtk_widget_set_sensitive(dotNewline, gtk_combo_box_get_active(GTK_COMBO_BOX(mode)) == 2); });
+	selectionRow = checkRow({inSelection, dotNewline});
 	filesOptions = checkRow({recursive, hidden});
 
 	const auto buttonRow = [&](std::initializer_list<std::pair<const char *, std::function<void()>>> buttons) {
@@ -878,6 +1156,7 @@ FindOptions App::currentFindOptions() {
 	o.backward = on(backward);
 	o.inSelection = on(inSelection);
 	o.mode = static_cast<SearchMode>(gtk_combo_box_get_active(GTK_COMBO_BOX(mode)));
+	o.dotMatchesNewline = on(dotNewline);
 	std::string folder = gtk_entry_get_text(GTK_ENTRY(directory));
 	if (folder.rfind("~/", 0) == 0 || folder == "~") folder = std::string(g_get_home_dir()) + folder.substr(1);
 	o.directory = folder;
@@ -1018,6 +1297,271 @@ bool App::promptText(const std::string &title, const std::string &label, const s
 	if (ok) out = gtk_entry_get_text(GTK_ENTRY(entry));
 	gtk_widget_destroy(dialog);
 	return ok;
+}
+
+bool App::runForm(const std::string &title, std::vector<FormField> &fields) {
+	GtkWidget *dialog = gtk_dialog_new_with_buttons(title.c_str(), GTK_WINDOW(window), GTK_DIALOG_MODAL, "Cancel", GTK_RESPONSE_CANCEL, "OK", GTK_RESPONSE_OK, nullptr);
+	gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_OK);
+	gtk_window_set_default_size(GTK_WINDOW(dialog), 520, 620);
+	GtkWidget *grid = gtk_grid_new();
+	gtk_grid_set_row_spacing(GTK_GRID(grid), 6);
+	gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
+	gtk_container_set_border_width(GTK_CONTAINER(grid), 14);
+	std::vector<GtkWidget *> controls(fields.size(), nullptr);
+	int row = 0;
+	for (size_t i = 0; i < fields.size(); i++) {
+		const FormField &field = fields[i];
+		switch (field.kind) {
+		case FormField::Kind::Heading: {
+			GtkWidget *heading = gtk_label_new(nullptr);
+			char *markup = g_markup_printf_escaped("<b>%s</b>", field.label.c_str());
+			gtk_label_set_markup(GTK_LABEL(heading), markup);
+			g_free(markup);
+			gtk_label_set_xalign(GTK_LABEL(heading), 0);
+			if (i > 0) gtk_widget_set_margin_top(heading, 12);
+			gtk_grid_attach(GTK_GRID(grid), heading, 0, row++, 2, 1);
+			break;
+		}
+		case FormField::Kind::Bool: {
+			GtkWidget *box = gtk_check_button_new_with_label(field.label.c_str());
+			gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(box), field.value == "1");
+			gtk_grid_attach(GTK_GRID(grid), box, 0, row++, 2, 1);
+			controls[i] = box;
+			break;
+		}
+		default: {
+			GtkWidget *label = gtk_label_new(field.label.c_str());
+			gtk_label_set_xalign(GTK_LABEL(label), 0);
+			gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+			GtkWidget *control;
+			if (field.kind == FormField::Kind::Int) {
+				control = gtk_spin_button_new_with_range(field.minimum, field.maximum, 1);
+				gtk_spin_button_set_value(GTK_SPIN_BUTTON(control), std::strtod(field.value.c_str(), nullptr));
+				gtk_widget_set_halign(control, GTK_ALIGN_START);
+			} else if (field.kind == FormField::Kind::Text) {
+				control = gtk_entry_new();
+				gtk_entry_set_text(GTK_ENTRY(control), field.value.c_str());
+				gtk_entry_set_activates_default(GTK_ENTRY(control), TRUE);
+				gtk_widget_set_hexpand(control, TRUE);
+			} else {
+				control = gtk_combo_box_text_new();
+				int active = 0, index = 0;
+				for (const auto &choice : field.choices) {
+					gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(control), choice.second.c_str());
+					if (choice.first == field.value) active = index;
+					index++;
+				}
+				gtk_combo_box_set_active(GTK_COMBO_BOX(control), active);
+				gtk_widget_set_halign(control, GTK_ALIGN_START);
+			}
+			gtk_grid_attach(GTK_GRID(grid), label, 0, row, 1, 1);
+			gtk_grid_attach(GTK_GRID(grid), control, 1, row++, 1, 1);
+			controls[i] = control;
+			break;
+		}
+		}
+	}
+	GtkWidget *scroll = gtk_scrolled_window_new(nullptr, nullptr);
+	gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+	gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(scroll), TRUE);
+	gtk_scrolled_window_set_max_content_height(GTK_SCROLLED_WINDOW(scroll), 620);
+	gtk_container_add(GTK_CONTAINER(scroll), grid);
+	GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+	gtk_box_pack_start(GTK_BOX(content), scroll, TRUE, TRUE, 0);
+	gtk_widget_show_all(content);
+	dialogDepth++;
+	const bool ok = gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK;
+	dialogDepth--;
+	if (ok) {
+		for (size_t i = 0; i < fields.size(); i++) {
+			FormField &field = fields[i];
+			GtkWidget *control = controls[i];
+			switch (field.kind) {
+			case FormField::Kind::Heading: break;
+			case FormField::Kind::Bool: field.value = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(control)) ? "1" : "0"; break;
+			case FormField::Kind::Int:
+				gtk_spin_button_update(GTK_SPIN_BUTTON(control));
+				field.value = std::to_string(gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(control)));
+				break;
+			case FormField::Kind::Text: field.value = gtk_entry_get_text(GTK_ENTRY(control)); break;
+			case FormField::Kind::Choice: {
+				const int active = gtk_combo_box_get_active(GTK_COMBO_BOX(control));
+				if (active >= 0 && active < static_cast<int>(field.choices.size())) field.value = field.choices[active].first;
+				break;
+			}
+			}
+		}
+	}
+	gtk_widget_destroy(dialog);
+	return ok;
+}
+
+namespace {
+
+struct ShortcutMapper {
+	App *app = nullptr;
+	Workspace *workspace = nullptr;
+	GtkWidget *dialog = nullptr, *view = nullptr, *search = nullptr, *hint = nullptr;
+	GtkListStore *store = nullptr;
+	std::string capturing;
+	std::vector<ShortcutEntry> entries;
+
+	static const char *idleHint() { return "Double-click a command, then press its new shortcut."; }
+
+	std::string selectedId() const {
+		GtkTreeIter iter;
+		GtkTreeModel *model = nullptr;
+		if (!gtk_tree_selection_get_selected(gtk_tree_view_get_selection(GTK_TREE_VIEW(view)), &model, &iter)) return {};
+		gchar *id = nullptr;
+		gtk_tree_model_get(model, &iter, ScId, &id, -1);
+		const std::string out = id ? id : "";
+		g_free(id);
+		return out;
+	}
+
+	void reload() {
+		const std::string selected = selectedId();
+		const auto lower = [](std::string value) {
+			std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(g_ascii_tolower(c)); });
+			return value;
+		};
+		const std::string filter = lower(gtk_entry_get_text(GTK_ENTRY(search)));
+		entries = workspace->shortcutEntries();
+		gtk_list_store_clear(store);
+		for (const ShortcutEntry &entry : entries) {
+			if (!filter.empty() && lower(entry.id).find(filter) == std::string::npos && lower(entry.shortcut).find(filter) == std::string::npos) continue;
+			std::string shown = entry.shortcut;
+			const size_t mod = shown.find("Mod+");
+			if (mod != std::string::npos) shown.replace(mod, 4, "Ctrl+");
+			std::string command = entry.id;
+			for (size_t at = command.find('/'); at != std::string::npos; at = command.find('/', at + 3)) command.replace(at, 1, " › ");
+			GtkTreeIter iter;
+			gtk_list_store_append(store, &iter);
+			gtk_list_store_set(store, &iter, ScCommand, command.c_str(), ScShortcut, shown.c_str(), ScId, entry.id.c_str(),
+			                   ScWeight, entry.shortcut != entry.defaultShortcut ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL, -1);
+			if (entry.id == selected) {
+				gtk_tree_selection_select_iter(gtk_tree_view_get_selection(GTK_TREE_VIEW(view)), &iter);
+				GtkTreePath *path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), &iter);
+				gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(view), path, nullptr, FALSE, 0, 0);
+				gtk_tree_path_free(path);
+			}
+		}
+	}
+
+	void startCapture() {
+		capturing = selectedId();
+		if (capturing.empty()) return;
+		gtk_label_set_text(GTK_LABEL(hint), "Press the new shortcut, or Esc to cancel.");
+		gtk_widget_grab_focus(view);
+	}
+
+	void stopCapture() {
+		capturing.clear();
+		gtk_label_set_text(GTK_LABEL(hint), idleHint());
+	}
+};
+
+}  // namespace
+
+void App::runShortcutMapper() {
+	ShortcutMapper m;
+	m.app = this;
+	m.workspace = workspace.get();
+	m.dialog = gtk_dialog_new_with_buttons("Shortcut Mapper", GTK_WINDOW(window), GTK_DIALOG_MODAL, nullptr, nullptr);
+	gtk_window_set_default_size(GTK_WINDOW(m.dialog), 640, 560);
+
+	m.search = gtk_search_entry_new();
+	gtk_entry_set_placeholder_text(GTK_ENTRY(m.search), "Filter commands or shortcuts");
+	m.store = gtk_list_store_new(ScCount, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_INT);
+	m.view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(m.store));
+	gtk_tree_view_set_enable_search(GTK_TREE_VIEW(m.view), FALSE);
+	GtkCellRenderer *commandText = gtk_cell_renderer_text_new();
+	g_object_set(commandText, "ellipsize", PANGO_ELLIPSIZE_MIDDLE, nullptr);
+	GtkTreeViewColumn *commandColumn = gtk_tree_view_column_new_with_attributes("Command", commandText, "text", ScCommand, nullptr);
+	gtk_tree_view_column_set_expand(commandColumn, TRUE);
+	gtk_tree_view_append_column(GTK_TREE_VIEW(m.view), commandColumn);
+	gtk_tree_view_append_column(GTK_TREE_VIEW(m.view), gtk_tree_view_column_new_with_attributes("Shortcut", gtk_cell_renderer_text_new(), "text", ScShortcut, "weight", ScWeight, nullptr));
+	GtkWidget *scroll = gtk_scrolled_window_new(nullptr, nullptr);
+	gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+	gtk_scrolled_window_set_shadow_type(GTK_SCROLLED_WINDOW(scroll), GTK_SHADOW_IN);
+	gtk_container_add(GTK_CONTAINER(scroll), m.view);
+	m.hint = gtk_label_new(ShortcutMapper::idleHint());
+	gtk_label_set_xalign(GTK_LABEL(m.hint), 0);
+
+	ShortcutMapper *mapper = &m;
+	GtkWidget *buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+	const auto addButton = [&](const char *label, std::function<void()> action, bool end) {
+		GtkWidget *button = gtk_button_new_with_label(label);
+		onSignal(button, "clicked", std::move(action));
+		if (end) gtk_box_pack_end(GTK_BOX(buttons), button, FALSE, FALSE, 0);
+		else gtk_box_pack_start(GTK_BOX(buttons), button, FALSE, FALSE, 0);
+	};
+	addButton("Set…", [mapper]() { mapper->startCapture(); }, false);
+	addButton("Clear", [mapper]() {
+		const std::string id = mapper->selectedId();
+		mapper->stopCapture();
+		if (id.empty()) return;
+		mapper->workspace->assignShortcut(id, "");
+		mapper->reload();
+	}, false);
+	addButton("Reset", [mapper]() {
+		const std::string id = mapper->selectedId();
+		mapper->stopCapture();
+		for (const ShortcutEntry &entry : mapper->entries) {
+			if (entry.id != id) continue;
+			mapper->workspace->assignShortcut(id, entry.defaultShortcut);
+			break;
+		}
+		mapper->reload();
+	}, false);
+	addButton("Reset All…", [this, mapper]() {
+		mapper->stopCapture();
+		if (ask("Reset every shortcut to its default?", "", {"Cancel", "Reset All"}) != 1) return;
+		mapper->workspace->resetShortcuts();
+		mapper->reload();
+	}, false);
+	addButton("Done", [mapper]() { gtk_dialog_response(GTK_DIALOG(mapper->dialog), GTK_RESPONSE_CLOSE); }, true);
+
+	GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(m.dialog));
+	gtk_container_set_border_width(GTK_CONTAINER(content), 12);
+	gtk_box_set_spacing(GTK_BOX(content), 8);
+	gtk_box_pack_start(GTK_BOX(content), m.search, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(content), scroll, TRUE, TRUE, 0);
+	gtk_box_pack_start(GTK_BOX(content), m.hint, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(content), buttons, FALSE, FALSE, 0);
+
+	onSignal(m.search, "search-changed", [mapper]() { mapper->reload(); });
+	g_signal_connect(m.view, "row-activated", G_CALLBACK(+[](GtkTreeView *, GtkTreePath *, GtkTreeViewColumn *, gpointer data) {
+		static_cast<ShortcutMapper *>(data)->startCapture();
+	}), mapper);
+	// Connected to run first, so a key being captured never reaches the menus or the dialog.
+	g_signal_connect(m.dialog, "key-press-event", G_CALLBACK(+[](GtkWidget *, GdkEventKey *event, gpointer data) -> gboolean {
+		auto *self = static_cast<ShortcutMapper *>(data);
+		if (self->capturing.empty()) return FALSE;
+		if (event->keyval == GDK_KEY_Escape) {
+			self->stopCapture();
+			return TRUE;
+		}
+		if (event->is_modifier) return TRUE;
+		const std::string shortcut = shortcutFromEvent(event);
+		if (shortcut.empty()) {
+			gtk_label_set_text(GTK_LABEL(self->hint), "That key types text. Add Control or Alt, or press Esc to cancel.");
+			return TRUE;
+		}
+		const std::string id = self->capturing;
+		self->stopCapture();
+		self->workspace->assignShortcut(id, shortcut);
+		self->reload();
+		return TRUE;
+	}), mapper);
+
+	m.reload();
+	gtk_widget_show_all(content);
+	dialogDepth++;
+	gtk_dialog_run(GTK_DIALOG(m.dialog));
+	dialogDepth--;
+	gtk_widget_destroy(m.dialog);
+	g_object_unref(m.store);
 }
 
 void App::reveal(const std::string &path) {
@@ -1211,6 +1755,7 @@ void App::build() {
 	}), this);
 	background.widget = scintilla_new();
 	g_object_ref_sink(background.widget);
+	buildDocumentMap();
 
 	editorPaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
 	gtk_paned_pack1(GTK_PANED(editorPaned), panes[0].box, TRUE, FALSE);
@@ -1219,9 +1764,16 @@ void App::build() {
 	gtk_paned_pack1(GTK_PANED(rightPaned), editorPaned, TRUE, FALSE);
 	gtk_paned_pack2(GTK_PANED(rightPaned), results.widget, FALSE, FALSE);
 	buildFolderPanel();
+	buildFunctionPanel();
+	sideBox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+	gtk_box_pack_start(GTK_BOX(sideBox), functionBox, TRUE, TRUE, 0);
+	gtk_box_pack_start(GTK_BOX(sideBox), map.widget, FALSE, FALSE, 0);
+	sidePaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+	gtk_paned_pack1(GTK_PANED(sidePaned), rightPaned, TRUE, FALSE);
+	gtk_paned_pack2(GTK_PANED(sidePaned), sideBox, FALSE, FALSE);
 	outerPaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
 	gtk_paned_pack1(GTK_PANED(outerPaned), folderBox, FALSE, FALSE);
-	gtk_paned_pack2(GTK_PANED(outerPaned), rightPaned, TRUE, FALSE);
+	gtk_paned_pack2(GTK_PANED(outerPaned), sidePaned, TRUE, FALSE);
 
 	GtkWidget *status = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
 	gtk_style_context_add_class(gtk_widget_get_style_context(status), "omapad-status");
@@ -1246,10 +1798,8 @@ void App::build() {
 
 	workspace->start();
 
-	GtkAccelGroup *accel = gtk_accel_group_new();
-	gtk_window_add_accel_group(GTK_WINDOW(window), accel);
-	GtkWidget *menubar = gtk_menu_bar_new();
-	for (const MenuItem &top : workspace->mainMenu()) gtk_menu_shell_append(GTK_MENU_SHELL(menubar), nativeItem(top, accel, true));
+	menubar = gtk_menu_bar_new();
+	buildMenuBar();
 	gtk_box_pack_start(GTK_BOX(root), menubar, FALSE, FALSE, 0);
 	gtk_box_pack_start(GTK_BOX(root), outerPaned, TRUE, TRUE, 0);
 	gtk_box_pack_start(GTK_BOX(root), status, FALSE, FALSE, 0);
@@ -1263,7 +1813,7 @@ void App::build() {
 	g_signal_connect(window, "notify::is-active", G_CALLBACK(+[](GObject *object, GParamSpec *, gpointer self) {
 		if (gtk_window_is_active(GTK_WINDOW(object))) static_cast<App *>(self)->scheduleActivationCheck();
 	}), this);
-	g_timeout_add_seconds(7, +[](gpointer self) -> gboolean {
+	g_timeout_add_seconds(1, +[](gpointer self) -> gboolean {
 		static_cast<App *>(self)->workspace->tick();
 		return G_SOURCE_CONTINUE;
 	}, this);
@@ -1272,6 +1822,9 @@ void App::build() {
 	gtk_widget_hide(folderBox);
 	gtk_widget_hide(panes[1].box);
 	gtk_widget_hide(results.widget);
+	gtk_widget_hide(sideBox);
+	gtk_widget_hide(functionBox);
+	gtk_widget_hide(map.widget);
 	themeChanged();
 	watchTheme();
 	tabsChanged();
@@ -1286,6 +1839,7 @@ void App::build() {
 		g_timeout_add(50, +[](gpointer data) -> gboolean {
 			App *a = static_cast<App *>(data);
 			if (!a->splitPositioned && a->workspace->splitVisible()) a->splitChanged(true, a->workspace->splitStacked());
+			a->arrangeSidePanels();
 			return G_SOURCE_REMOVE;
 		}, app);
 		return FALSE;
@@ -1305,24 +1859,7 @@ void App::present() {
 	focusPane(workspace->focusedPane());
 }
 
-// libstdc++'s regex recurses once per character, so a long line in the document being
-// searched can overflow an ordinary stack and crash. Scintilla searches on this thread, so
-// give it a large stack, which is only reserved rather than used. This takes a new exec.
-static void ensureLargeStack(char **argv) {
-	const rlim_t wanted = 1024UL * 1024UL * 1024UL;
-	struct rlimit limit;
-	if (getrlimit(RLIMIT_STACK, &limit) != 0 || limit.rlim_cur >= wanted || limit.rlim_cur == RLIM_INFINITY) return;
-	if (limit.rlim_max != RLIM_INFINITY && limit.rlim_max < wanted) return;
-	limit.rlim_cur = wanted;
-	if (setrlimit(RLIMIT_STACK, &limit) != 0) return;
-	std::error_code error;
-	const fs::path executable = fs::read_symlink("/proc/self/exe", error);
-	if (!error) execv(executable.c_str(), argv);
-	// If that fails, carry on with what we have.
-}
-
 int main(int argc, char **argv) {
-	ensureLargeStack(argv);
 	GApplicationFlags flags = G_APPLICATION_HANDLES_OPEN;
 	if (g_getenv("OMAPAD_NON_UNIQUE")) flags = GApplicationFlags(flags | G_APPLICATION_NON_UNIQUE);
 	g_set_prgname("omapad");

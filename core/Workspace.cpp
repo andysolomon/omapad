@@ -4,6 +4,7 @@
 #include "json.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
 #include <ctime>
@@ -11,7 +12,7 @@
 #include <filesystem>
 #include <fnmatch.h>
 #include <fstream>
-#include <regex>
+#include <set>
 #include <sstream>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -30,7 +31,9 @@ namespace {
 const int kMarginNumber = 0;
 const int kMarginBookmark = 1;
 const int kMarginFold = 2;
-const int kMarkerBookmark = 24;
+const int kMarginHistory = 3;
+const int kMarkerBookmark = 20;  // Change history uses markers 21 to 24.
+const int kIndicatorMap = 19;    // The Document Map's visible range. Only the map draws it.
 const int kIndicatorSmart = 30;
 const int kIndicatorMark = 31;
 
@@ -38,7 +41,6 @@ const int kIndicatorMark = 31;
 const unsigned long long kMaxOpenBytes = 2ULL * 1024 * 1024 * 1024;
 const unsigned long long kMaxSearchBytes = 256ULL * 1024 * 1024;
 const long kMaxResultLines = 50000;
-const size_t kMaxRegexLine = 1000000;
 
 const int kPaneArgFactor = 10000;
 
@@ -254,7 +256,7 @@ struct BackgroundDocument {
 };
 
 Workspace::Workspace(Host &h, const std::string &resources, const std::string &settingsDirectory, const std::string &stateDirectory)
-	: host(h), catalog(resources), settingsDir(settingsDirectory), stateDir(stateDirectory), alive(std::make_shared<bool>(true)) {
+	: host(h), catalog(resources), completion(resources), functionCatalog(resources), settingsDir(settingsDirectory), stateDir(stateDirectory), alive(std::make_shared<bool>(true)) {
 	panes[0] = std::make_unique<Pane>();
 	panes[1] = std::make_unique<Pane>();
 	std::error_code error;
@@ -311,6 +313,7 @@ void Workspace::start() {
 	paneAt(0).active = 0;
 	view(0).send(SCI_SETCODEPAGE, SC_CP_UTF8);
 	view(0).send(SCI_SETEOLMODE, SC_EOL_LF);
+	applyChangeHistoryTo(view(0));
 	applyThemeEverywhere();
 	refreshChrome();
 }
@@ -338,6 +341,36 @@ void Workspace::loadSettings() {
 	settings.tabsToSpaces = jsonBool(j, "tabsToSpaces", settings.tabsToSpaces);
 	settings.showHiddenInFolders = jsonBool(j, "showHiddenInFolders", settings.showHiddenInFolders);
 	settings.recent = jsonStrings(j, "recent");
+	const auto shortcuts = j.find("shortcuts");
+	if (shortcuts != j.end() && shortcuts->is_object())
+		for (auto it = shortcuts->begin(); it != shortcuts->end(); ++it)
+			if (it.value().is_string()) settings.shortcuts[it.key()] = normalizeShortcut(it.value().get<std::string>());
+	settings.autoIndent = jsonBool(j, "autoIndent", settings.autoIndent);
+	settings.highlightCurrentLine = jsonBool(j, "highlightCurrentLine", settings.highlightCurrentLine);
+	settings.smartHighlight = jsonBool(j, "smartHighlight", settings.smartHighlight);
+	settings.matchBraces = jsonBool(j, "matchBraces", settings.matchBraces);
+	settings.lineNumbers = jsonBool(j, "lineNumbers", settings.lineNumbers);
+	settings.bookmarkMargin = jsonBool(j, "bookmarkMargin", settings.bookmarkMargin);
+	settings.changeHistory = jsonBool(j, "changeHistory", settings.changeHistory);
+	settings.multiEditing = jsonBool(j, "multiEditing", settings.multiEditing);
+	settings.scrollBeyondEnd = jsonBool(j, "scrollBeyondEnd", settings.scrollBeyondEnd);
+	const long edge = jsonLong(j, "edgeColumn", settings.edgeColumn);
+	if (edge >= 0 && edge <= 1000) settings.edgeColumn = static_cast<int>(edge);
+	const long caret = jsonLong(j, "caretWidth", settings.caretWidth);
+	if (caret >= 1 && caret <= 3) settings.caretWidth = static_cast<int>(caret);
+	const std::string eol = jsonString(j, "defaultEol", settings.defaultEol);
+	if (eol == "lf" || eol == "crlf" || eol == "cr") settings.defaultEol = eol;
+	const std::string encodingId = jsonString(j, "defaultEncoding", settings.defaultEncoding);
+	if (encodingWithIdentifier(encodingId)) settings.defaultEncoding = encodingId;
+	settings.autoComplete = jsonBool(j, "autoComplete", settings.autoComplete);
+	settings.completeFunctions = jsonBool(j, "completeFunctions", settings.completeFunctions);
+	settings.completeWords = jsonBool(j, "completeWords", settings.completeWords);
+	settings.functionHints = jsonBool(j, "functionHints", settings.functionHints);
+	const long threshold = jsonLong(j, "completeThreshold", settings.completeThreshold);
+	if (threshold >= 1 && threshold <= 9) settings.completeThreshold = static_cast<int>(threshold);
+	settings.restoreSessionOnStart = jsonBool(j, "restoreSessionOnStart", settings.restoreSessionOnStart);
+	const long backup = jsonLong(j, "backupSeconds", settings.backupSeconds);
+	if (backup >= 0 && backup <= 3600) settings.backupSeconds = static_cast<int>(backup);
 }
 
 void Workspace::saveSettings() const {
@@ -354,6 +387,27 @@ void Workspace::saveSettings() const {
 	j["tabsToSpaces"] = settings.tabsToSpaces;
 	j["showHiddenInFolders"] = settings.showHiddenInFolders;
 	j["recent"] = settings.recent;
+	j["shortcuts"] = settings.shortcuts;
+	j["autoIndent"] = settings.autoIndent;
+	j["highlightCurrentLine"] = settings.highlightCurrentLine;
+	j["smartHighlight"] = settings.smartHighlight;
+	j["matchBraces"] = settings.matchBraces;
+	j["lineNumbers"] = settings.lineNumbers;
+	j["bookmarkMargin"] = settings.bookmarkMargin;
+	j["changeHistory"] = settings.changeHistory;
+	j["multiEditing"] = settings.multiEditing;
+	j["scrollBeyondEnd"] = settings.scrollBeyondEnd;
+	j["edgeColumn"] = settings.edgeColumn;
+	j["caretWidth"] = settings.caretWidth;
+	j["defaultEol"] = settings.defaultEol;
+	j["defaultEncoding"] = settings.defaultEncoding;
+	j["autoComplete"] = settings.autoComplete;
+	j["completeFunctions"] = settings.completeFunctions;
+	j["completeWords"] = settings.completeWords;
+	j["functionHints"] = settings.functionHints;
+	j["completeThreshold"] = settings.completeThreshold;
+	j["restoreSessionOnStart"] = settings.restoreSessionOnStart;
+	j["backupSeconds"] = settings.backupSeconds;
 	std::string error;
 	atomicWrite(j.dump(1, '\t', false, json::error_handler_t::replace), (fs::path(settingsDir) / "settings.json").string(), 0600, error);
 }
@@ -372,6 +426,9 @@ void Workspace::configureView(int pane) {
 	v.send(SCI_SETMARGINMASKN, kMarginFold, SC_MASK_FOLDERS);
 	v.send(SCI_SETMARGINWIDTHN, kMarginFold, 14);
 	v.send(SCI_SETMARGINSENSITIVEN, kMarginFold, 1);
+	v.send(SCI_SETMARGINS, 4);
+	v.send(SCI_SETMARGINTYPEN, kMarginHistory, SC_MARGIN_SYMBOL);
+	v.send(SCI_SETMARGINMASKN, kMarginHistory, 0xF << SC_MARKNUM_HISTORY_REVERTED_TO_ORIGIN);
 	v.send(SCI_MARKERDEFINE, kMarkerBookmark, SC_MARK_BOOKMARK);
 	v.send(SCI_MARKERSETBACK, kMarkerBookmark, 0xD07020);
 	v.send(SCI_MARKERSETFORE, kMarkerBookmark, 0xD07020);
@@ -392,7 +449,8 @@ void Workspace::configureView(int pane) {
 	v.send(SCI_SETSCROLLWIDTH, 1);
 	v.send(SCI_SETSCROLLWIDTHTRACKING, 1);
 	v.send(SCI_SETMODEVENTMASK, SC_MOD_INSERTTEXT | SC_MOD_DELETETEXT);
-	for (int indicator : {kIndicatorSmart, kIndicatorMark}) {
+	v.send(SCI_INDICSETSTYLE, kIndicatorMap, INDIC_HIDDEN);
+	for (int indicator : {kIndicatorSmart, kIndicatorMark, 25, 24, 23, 22, 21}) {
 		v.send(SCI_INDICSETSTYLE, indicator, INDIC_ROUNDBOX);
 		v.send(SCI_INDICSETALPHA, indicator, 110);
 		v.send(SCI_INDICSETOUTLINEALPHA, indicator, 200);
@@ -408,6 +466,35 @@ void Workspace::applyViewPreferences(int pane) {
 	v.send(SCI_SETINDENTATIONGUIDES, settings.showGuides ? SC_IV_LOOKBOTH : SC_IV_NONE);
 	v.send(SCI_SETWRAPVISUALFLAGS, settings.showWrapSymbol ? SC_WRAPVISUALFLAG_END : SC_WRAPVISUALFLAG_NONE);
 	v.send(SCI_SETWRAPMODE, settings.wordWrap ? SC_WRAP_WORD : SC_WRAP_NONE);
+	if (!settings.highlightCurrentLine) v.send(SCI_SETCARETLINEVISIBLE, 0);
+	v.send(SCI_SETADDITIONALSELECTIONTYPING, settings.multiEditing);
+	v.send(SCI_SETENDATLASTLINE, !settings.scrollBeyondEnd);
+	v.send(SCI_SETCARETWIDTH, settings.caretWidth);
+	v.send(SCI_SETEDGEMODE, settings.edgeColumn > 0 ? EDGE_LINE : EDGE_NONE);
+	v.send(SCI_SETEDGECOLUMN, settings.edgeColumn);
+	v.send(SCI_SETMARGINWIDTHN, kMarginBookmark, settings.bookmarkMargin ? 14 : 0);
+	v.send(SCI_SETMARGINWIDTHN, kMarginHistory, settings.changeHistory ? 4 : 0);
+	v.send(SCI_SETCHANGEHISTORY, settings.changeHistory ? SC_CHANGE_HISTORY_ENABLED | SC_CHANGE_HISTORY_MARKERS : SC_CHANGE_HISTORY_DISABLED);
+	if (!settings.matchBraces) v.send(SCI_BRACEHIGHLIGHT, INVALID_POSITION, INVALID_POSITION);
+	paneAt(pane).lineDigits = 0;
+	updateLineNumberMargin(pane);
+}
+
+void Workspace::applyChangeHistoryTo(SciView &target) {
+	// Scintilla only accepts this while the undo history is empty.
+	target.send(SCI_SETCHANGEHISTORY, settings.changeHistory ? SC_CHANGE_HISTORY_ENABLED | SC_CHANGE_HISTORY_MARKERS : SC_CHANGE_HISTORY_DISABLED);
+}
+
+void Workspace::applyPreferencesEverywhere() {
+	applyViewPreferences(0);
+	applyViewPreferences(1);
+	applyLanguageTo(0);
+	applyLanguageTo(1);
+	if (!settings.smartHighlight) {
+		for (int pn = 0; pn < 2; pn++) updateSmartHighlight(pn);
+	}
+	saveSettings();
+	refreshChrome();
 }
 
 std::string Workspace::effectiveTheme() const {
@@ -477,6 +564,8 @@ void Workspace::applyLanguageTo(int pane) {
 	if (p.active < 0 || p.active >= static_cast<int>(p.tabs.size())) return;
 	const Document &document = *p.tabs[p.active].document;
 	catalog.apply(*document.language, view(pane), effectiveTheme(), settings.fontName, settings.fontSize);
+	// Giving the current line a colour also turns it on.
+	if (!settings.highlightCurrentLine) view(pane).send(SCI_SETCARETLINEVISIBLE, 0);
 	const int tabWidth = document.language->tabSize > 0 ? document.language->tabSize : settings.tabWidth;
 	const bool spaces = document.language->tabSize > 0 ? document.language->tabsToSpaces : settings.tabsToSpaces;
 	view(pane).send(SCI_SETTABWIDTH, tabWidth);
@@ -494,11 +583,18 @@ void Workspace::applyThemeEverywhere() {
 	catalog.apply(*catalog.plainText(), results, effectiveTheme(), settings.fontName, settings.fontSize > 1 ? settings.fontSize - 1 : settings.fontSize);
 	results.send(SCI_SETMARGINWIDTHN, kMarginNumber, 0);
 	results.send(SCI_SETMARGINWIDTHN, kMarginBookmark, 0);
+	results.send(SCI_SETMARGINWIDTHN, kMarginFold, 0);
+	syncDocumentMap(true);
 	host.themeChanged();
 }
 
 void Workspace::updateLineNumberMargin(int pane) {
 	SciView &v = view(pane);
+	if (!settings.lineNumbers) {
+		v.send(SCI_SETMARGINWIDTHN, kMarginNumber, 0);
+		paneAt(pane).lineDigits = 0;
+		return;
+	}
 	long lines = v.send(SCI_GETLINECOUNT);
 	int digits = 1;
 	while (lines >= 10) {
@@ -528,14 +624,17 @@ std::string Workspace::nextUntitledName() const {
 std::shared_ptr<Document> Workspace::addDocument() {
 	auto document = std::make_shared<Document>();
 	document->sciDoc = view(0).send(SCI_CREATEDOCUMENT, 0, SC_DOCUMENTOPTION_DEFAULT);
-	document->encoding = encodingWithIdentifier("utf8");
+	const Encoding *preferred = encodingWithIdentifier(settings.defaultEncoding);
+	document->encoding = preferred ? preferred : encodingWithIdentifier("utf8");
+	document->eol = settings.defaultEol == "crlf" ? Eol::CRLF : settings.defaultEol == "cr" ? Eol::CR : Eol::LF;
 	document->language = catalog.plainText();
 	document->untitledName = nextUntitledName();
 	document->backupId = randomId();
 	{
 		BackgroundDocument background(host, *document);
 		background.view.send(SCI_SETCODEPAGE, SC_CP_UTF8);
-		background.view.send(SCI_SETEOLMODE, SC_EOL_LF);
+		background.view.send(SCI_SETEOLMODE, static_cast<int>(document->eol));
+		applyChangeHistoryTo(background.view);
 	}
 	documents.push_back(document);
 	return document;
@@ -580,6 +679,11 @@ void Workspace::activate(int pane, int index) {
 	v.send(SCI_SETFIRSTVISIBLELINE, v.send(SCI_VISIBLEFROMDOCLINE, tab.firstLine));
 	v.send(SCI_SETXOFFSET, tab.xOffset);
 	p.smartActive = false;
+	if (pane == focus) {
+		hint.active = false;
+		syncDocumentMap(true);
+		functionsPending = 1;
+	}
 	refreshChrome();
 }
 
@@ -628,6 +732,9 @@ int Workspace::activeTab(int pane) const { return paneAt(pane).active; }
 void Workspace::paneFocused(int pane) {
 	if (pane < 0 || pane > 1 || paneAt(pane).tabs.empty() || pane == focus) return;
 	focus = pane;
+	hint.active = false;
+	syncDocumentMap(true);
+	functionsPending = 1;
 	refreshChrome();
 }
 
@@ -667,6 +774,10 @@ void Workspace::detachPane(int pane) {
 void Workspace::releaseIfUnused(const std::shared_ptr<Document> &document) {
 	if (documentOpenElsewhere(document.get(), -1, -1)) return;
 	removeBackup(*document);
+	if (mapDocument == document->sciDoc) {
+		host.mapView().send(SCI_SETDOCPOINTER, 0, 0);
+		mapDocument = 0;
+	}
 	view(0).send(SCI_RELEASEDOCUMENT, 0, document->sciDoc);
 	documents.erase(std::remove(documents.begin(), documents.end(), document), documents.end());
 }
@@ -834,6 +945,9 @@ void Workspace::loadInto(Document &document, const std::string &utf8) {
 		v.send(SCI_EMPTYUNDOBUFFER);
 		v.send(SCI_SETSAVEPOINT);
 		v.send(SCI_SETEOLMODE, static_cast<int>(document.eol));
+		// A load isn't a change, so history starts here.
+		v.send(SCI_SETCHANGEHISTORY, SC_CHANGE_HISTORY_DISABLED);
+		applyChangeHistoryTo(v);
 	}
 	document.modified = false;
 	document.forceDirty = false;
@@ -1129,6 +1243,8 @@ bool Workspace::writeSession() {
 	session["folders"] = folderRoots;
 	session["expanded"] = expandedFolders;
 	session["folderPanel"] = folderPanel;
+	session["functionList"] = functionPanel;
+	session["documentMap"] = mapVisible;
 	const std::string text = session.dump(-1, ' ', false, json::error_handler_t::replace);
 	if (text != lastSession) {
 		std::string error;
@@ -1146,6 +1262,7 @@ bool Workspace::writeSession() {
 }
 
 bool Workspace::restoreSession() {
+	if (!settings.restoreSessionOnStart) return false;
 	std::ifstream in(fs::path(stateDir) / "session.json", std::ios::binary);
 	if (!in) return false;
 	std::stringstream buffer;
@@ -1163,6 +1280,10 @@ bool Workspace::restoreSession() {
 	stacked = jsonBool(session, "stacked");
 	host.setFolderPanelVisible(folderPanel);
 	host.foldersChanged();
+	functionPanel = jsonBool(session, "functionList");
+	host.setFunctionListVisible(functionPanel);
+	showDocumentMap(jsonBool(session, "documentMap"));
+	functionsPending = 1;
 
 	const auto documentList = session.find("documents");
 	const auto paneList = session.find("panes");
@@ -1293,7 +1414,23 @@ bool Workspace::restoreSession() {
 	return true;
 }
 
-bool Workspace::tick() { return writeSession(); }
+bool Workspace::tick() {
+	tickCount++;
+	// A pending refresh waits for a pause in typing, so parsing never gets in its way.
+	if (functionPanel) {
+		const Document *document = activeDocument();
+		const bool changed = document && (document != functionsDocument || document->editGeneration != functionsGeneration);
+		if (document != functionsDocument) refreshFunctionList();  // Another tab, so nobody's typing.
+		else if (changed && functionsPending == 0) functionsPending = 1;
+		else if (changed && ++functionsPending >= 2) refreshFunctionList();
+		else if (!changed) functionsPending = 0;
+	}
+	if (settings.backupSeconds > 0 && tickCount - lastBackupTick >= settings.backupSeconds) {
+		lastBackupTick = tickCount;
+		return writeSession();
+	}
+	return true;
+}
 
 bool Workspace::prepareToQuit() {
 	if (writeSession()) return true;
@@ -1338,9 +1475,19 @@ void Workspace::editorNotification(int pane, const SCNotification &n) {
 		if (n.updated & (SC_UPDATE_SELECTION | SC_UPDATE_CONTENT)) updateBraceHighlight(pane);
 		if (n.updated & SC_UPDATE_SELECTION) updateSmartHighlight(pane);
 		if (n.updated & (SC_UPDATE_V_SCROLL | SC_UPDATE_H_SCROLL)) syncScroll(pane);
+		if (pane == focus && (n.updated & (SC_UPDATE_V_SCROLL | SC_UPDATE_CONTENT))) syncDocumentMap(false);
+		// Moving away from a call's arguments ends its hint.
+		if (pane == focus && hint.active && (n.updated & SC_UPDATE_SELECTION) && view(pane).send(SCI_GETCURRENTPOS) < hint.open) {
+			view(pane).send(SCI_CALLTIPCANCEL);
+			hint.active = false;
+		}
 		break;
 	case SCN_CHARADDED:
-		if (pane == focus) autoIndent(pane, n.ch);
+		if (pane == focus) afterCharacter(pane, n.ch);
+		break;
+	case SCN_CALLTIPCLICK:
+		if (hint.active && n.position == 1) run(Cmd::PreviousHint);
+		else if (hint.active && n.position == 2) run(Cmd::NextHint);
 		break;
 	case SCN_MARGINCLICK:
 		if (n.margin == kMarginBookmark) {
@@ -1363,6 +1510,279 @@ void Workspace::resultsNotification(const SCNotification &n) {
 	if (n.nmhdr.code == SCN_DOUBLECLICK) jumpToResultLine(n.line);
 }
 
+// The map takes no input of its own. Its selection also moves whenever the shared document
+// changes, so the front end reports presses instead of the map's selection being watched.
+void Workspace::mapPressed(long x, long y) {
+	if (!mapVisible) return;
+	SciView &map = host.mapView();
+	const long line = map.send(SCI_LINEFROMPOSITION, map.send(SCI_POSITIONFROMPOINT, x, y));
+	const long top = std::max(0L, static_cast<long>(s(SCI_VISIBLEFROMDOCLINE, line)) - static_cast<long>(s(SCI_LINESONSCREEN)) / 2);
+	s(SCI_SETFIRSTVISIBLELINE, top);
+	syncDocumentMap(false);
+}
+
+void Workspace::mapScrolled(long lines) {
+	if (!mapVisible) return;
+	s(SCI_LINESCROLL, 0, lines);
+	syncDocumentMap(false);
+}
+
+void Workspace::showDocumentMap(bool visible) {
+	mapVisible = visible;
+	host.setDocumentMapVisible(visible);
+	if (visible) syncDocumentMap(true);
+}
+
+void Workspace::syncDocumentMap(bool documentChanged) {
+	if (!mapVisible || !started || mapSyncing) return;
+	Tab *tab = activeTabPointer();
+	if (!tab) return;
+	mapSyncing = true;
+	SciView &map = host.mapView();
+	const Document &document = *tab->document;
+	if (documentChanged || mapDocument != document.sciDoc) {
+		if (mapDocument != document.sciDoc) {
+			map.send(SCI_SETDOCPOINTER, 0, document.sciDoc);
+			mapDocument = document.sciDoc;
+		}
+		map.send(SCI_SETCODEPAGE, SC_CP_UTF8);
+		catalog.apply(*document.language, map, effectiveTheme(), settings.fontName, settings.fontSize);
+		map.send(SCI_SETZOOM, -10);
+		for (int margin = 0; margin < 5; margin++) map.send(SCI_SETMARGINWIDTHN, margin, 0);
+		map.send(SCI_SETHSCROLLBAR, 0);
+		map.send(SCI_SETVSCROLLBAR, 0);
+		map.send(SCI_SETCARETLINEVISIBLE, 0);
+		map.send(SCI_SETCARETSTYLE, CARETSTYLE_INVISIBLE);
+		map.send(SCI_SETWRAPMODE, settings.wordWrap ? SC_WRAP_WORD : SC_WRAP_NONE);
+		map.send(SCI_SETVIEWWS, SCWS_INVISIBLE);
+		map.send(SCI_SETINDENTATIONGUIDES, SC_IV_NONE);
+		map.send(SCI_SETELEMENTCOLOUR, SC_ELEMENT_SELECTION_BACK, 0);
+		map.send(SCI_SETELEMENTCOLOUR, SC_ELEMENT_SELECTION_INACTIVE_BACK, 0);
+		map.send(SCI_INDICSETSTYLE, kIndicatorMap, INDIC_FULLBOX);
+		map.send(SCI_INDICSETFORE, kIndicatorMap, catalog.themeIsDark(effectiveTheme()) ? 0xFFFFFF : 0x000000);
+		map.send(SCI_INDICSETALPHA, kIndicatorMap, 30);
+		map.send(SCI_INDICSETOUTLINEALPHA, kIndicatorMap, 60);
+		map.send(SCI_INDICSETUNDER, kIndicatorMap, 1);
+	}
+	// Shade what the editor shows, and keep it in view in the map.
+	const long topVisible = s(SCI_GETFIRSTVISIBLELINE);
+	const long screenLines = s(SCI_LINESONSCREEN);
+	const long firstLine = s(SCI_DOCLINEFROMVISIBLE, topVisible);
+	const long lastLine = s(SCI_DOCLINEFROMVISIBLE, topVisible + screenLines);
+	const long length = s(SCI_GETLENGTH);
+	const long rangeStart = s(SCI_POSITIONFROMLINE, firstLine);
+	const long rangeEnd = lastLine + 1 < s(SCI_GETLINECOUNT) ? s(SCI_POSITIONFROMLINE, lastLine + 1) : length;
+	map.send(SCI_SETINDICATORCURRENT, kIndicatorMap);
+	map.send(SCI_INDICATORCLEARRANGE, 0, length);
+	if (rangeEnd > rangeStart) map.send(SCI_INDICATORFILLRANGE, rangeStart, rangeEnd - rangeStart);
+	const long mapScreen = map.send(SCI_LINESONSCREEN);
+	const long total = s(SCI_VISIBLEFROMDOCLINE, s(SCI_GETLINECOUNT));
+	const long room = std::max(1L, total - screenLines);
+	const long mapRoom = std::max(0L, total - mapScreen);
+	map.send(SCI_SETFIRSTVISIBLELINE, mapRoom * topVisible / room);
+	mapSyncing = false;
+}
+
+void Workspace::afterCharacter(int pane, int ch) {
+	if (settings.autoIndent) autoIndent(pane, ch);
+	updateHintAfterCharacter(ch);
+	if (!settings.autoComplete) return;
+	const unsigned char c = static_cast<unsigned char>(ch);
+	const bool wordChar = std::isalnum(c) || c == '_' || ch >= 0x80;
+	if (wordChar) {
+		showCompletion(settings.completeFunctions, settings.completeWords, false);
+	} else if (!view(pane).send(SCI_AUTOCACTIVE)) {
+		return;
+	}
+}
+
+std::string Workspace::wordBeforeCaret(long &start) const {
+	const long position = s(SCI_GETCURRENTPOS);
+	const Document *document = activeDocument();
+	const LanguageApi *api = document ? completion.forLanguage(document->language->name) : nullptr;
+	const std::string additional = api ? api->additionalWordChars : std::string();
+	const long earliest = std::max(0L, position - 256);
+	const std::string before = rangeOf(earliest, position);
+	size_t i = before.size();
+	while (i > 0) {
+		const unsigned char c = static_cast<unsigned char>(before[i - 1]);
+		if (!(std::isalnum(c) || c == '_' || c >= 0x80 || additional.find(static_cast<char>(c)) != std::string::npos)) break;
+		i--;
+	}
+	start = earliest + static_cast<long>(i);
+	return before.substr(i);
+}
+
+std::vector<std::string> Workspace::completionCandidates(const std::string &prefix, bool functionNames, bool words, size_t excludeAt) {
+	const Document *document = activeDocument();
+	const LanguageApi *api = document ? completion.forLanguage(document->language->name) : nullptr;
+	const bool ignoreCase = api && api->ignoreCase;
+	std::set<std::string> found;
+	if (functionNames && api)
+		for (const std::string &name : api->matching(prefix, false))
+			if (name != prefix) found.insert(name);
+	if (words && s(SCI_GETLENGTH) <= 8 * 1024 * 1024) {
+		const long length = s(SCI_GETLENGTH);
+		const char *pointer = reinterpret_cast<const char *>(s(SCI_GETCHARACTERPOINTER));
+		const std::string content = pointer ? std::string(pointer, static_cast<size_t>(length)) : std::string();
+		for (const std::string &word : documentWords(content, prefix, ignoreCase, excludeAt, api ? api->additionalWordChars : std::string()))
+			found.insert(word);
+	}
+	std::vector<std::string> out(found.begin(), found.end());
+	const auto folded = [](std::string value) {
+		std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		return value;
+	};
+	std::stable_sort(out.begin(), out.end(), [&](const std::string &a, const std::string &b) { return folded(a) < folded(b); });
+	return out;
+}
+
+bool Workspace::showCompletion(bool functionNames, bool words, bool explicitRequest) {
+	long start = 0;
+	const std::string prefix = wordBeforeCaret(start);
+	if (!explicitRequest && static_cast<int>(prefix.size()) < settings.completeThreshold) return false;
+	const std::vector<std::string> candidates = completionCandidates(prefix, functionNames, words, static_cast<size_t>(s(SCI_GETCURRENTPOS)));
+	if (candidates.empty()) {
+		s(SCI_AUTOCCANCEL);
+		if (explicitRequest) host.flash("No completions");
+		return false;
+	}
+	std::string list;
+	for (const std::string &candidate : candidates) {
+		if (!list.empty()) list += '\n';
+		list += candidate;
+	}
+	lastCompletionList = list;
+	const Document *document = activeDocument();
+	const LanguageApi *api = document ? completion.forLanguage(document->language->name) : nullptr;
+	s(SCI_AUTOCSETSEPARATOR, '\n');
+	s(SCI_AUTOCSETIGNORECASE, api && api->ignoreCase);
+	s(SCI_AUTOCSETORDER, SC_ORDER_PERFORMSORT);
+	s(SCI_AUTOCSETMAXHEIGHT, 12);
+	s(SCI_AUTOCSHOW, prefix.size(), reinterpret_cast<intptr_t>(list.c_str()));
+	return true;
+}
+
+void Workspace::showPathCompletion() {
+	const long position = s(SCI_GETCURRENTPOS);
+	const long earliest = std::max(0L, position - 1024);
+	const std::string before = rangeOf(earliest, position);
+	const size_t tokenStart = before.find_last_of(" \t\r\n\"'<>|") + 1;
+	const std::string token = before.substr(tokenStart);
+	const size_t slash = token.rfind('/');
+	if (slash == std::string::npos) {
+		host.flash("Type part of a path first");
+		return;
+	}
+	const std::string folder = expandPath(token.substr(0, slash + 1));
+	const std::string leaf = token.substr(slash + 1);
+	std::vector<std::string> names;
+	std::error_code error;
+	for (fs::directory_iterator it(folder, fs::directory_options::skip_permission_denied, error), last; !error && it != last && names.size() < 2000; it.increment(error)) {
+		const std::string name = it->path().filename().string();
+		if (name.compare(0, leaf.size(), leaf) == 0) names.push_back(name);
+	}
+	if (names.empty()) {
+		host.flash("No matching paths");
+		return;
+	}
+	std::sort(names.begin(), names.end());
+	std::string list;
+	for (const std::string &name : names) {
+		if (!list.empty()) list += '\n';
+		list += name;
+	}
+	lastCompletionList = list;
+	s(SCI_AUTOCSETSEPARATOR, '\n');
+	s(SCI_AUTOCSETIGNORECASE, 0);
+	s(SCI_AUTOCSHOW, leaf.size(), reinterpret_cast<intptr_t>(list.c_str()));
+}
+
+// The call the caret is inside, found by walking back over balanced brackets.
+bool Workspace::showParameterHint(bool explicitRequest) {
+	const Document *document = activeDocument();
+	const LanguageApi *api = document ? completion.forLanguage(document->language->name) : nullptr;
+	if (!api || api->startFunc.empty() || api->stopFunc.empty()) {
+		if (explicitRequest) host.flash("No function hints for this language");
+		return false;
+	}
+	const char open = api->startFunc[0], close = api->stopFunc[0];
+	const char separator = api->paramSeparator.empty() ? ',' : api->paramSeparator[0];
+	const long position = s(SCI_GETCURRENTPOS);
+	const long earliest = std::max(0L, position - 8192);
+	const std::string before = rangeOf(earliest, position);
+	int depth = 0;
+	size_t parameter = 0;
+	size_t i = before.size();
+	bool found = false;
+	while (i > 0) {
+		const char c = before[--i];
+		if (c == close) depth++;
+		else if (c == open) {
+			if (depth == 0) {
+				found = true;
+				break;
+			}
+			depth--;
+		} else if (c == separator && depth == 0) parameter++;
+	}
+	if (!found) {
+		s(SCI_CALLTIPCANCEL);
+		hint.active = false;
+		return false;
+	}
+	size_t nameEnd = i;
+	while (nameEnd > 0 && (before[nameEnd - 1] == ' ' || before[nameEnd - 1] == '\t')) nameEnd--;
+	size_t nameStart = nameEnd;
+	while (nameStart > 0) {
+		const unsigned char c = static_cast<unsigned char>(before[nameStart - 1]);
+		if (!(std::isalnum(c) || c == '_' || c >= 0x80 || api->additionalWordChars.find(static_cast<char>(c)) != std::string::npos)) break;
+		nameStart--;
+	}
+	const std::string name = before.substr(nameStart, nameEnd - nameStart);
+	const ApiKeyword *keyword = name.empty() ? nullptr : api->find(name);
+	if (!keyword || keyword->overloads.empty()) {
+		s(SCI_CALLTIPCANCEL);
+		hint.active = false;
+		if (explicitRequest) host.flash("No hint for “" + name + "”");
+		return false;
+	}
+	const bool sameCall = hint.active && hint.keyword == keyword->name && hint.language == document->language->name;
+	hint.active = true;
+	hint.language = document->language->name;
+	hint.keyword = keyword->name;
+	if (!sameCall) hint.overload = 0;
+	hint.parameter = parameter;
+	hint.open = earliest + static_cast<long>(i) + 1;
+	renderHint();
+	return true;
+}
+
+void Workspace::renderHint() {
+	const LanguageApi *api = completion.forLanguage(hint.language);
+	const ApiKeyword *keyword = api ? api->find(hint.keyword) : nullptr;
+	if (!keyword || keyword->overloads.empty()) return;
+	if (hint.overload >= keyword->overloads.size()) hint.overload = 0;
+	const ApiOverload &overload = keyword->overloads[hint.overload];
+	const std::string tip = formatHint(*keyword, overload, api->startFunc, api->stopFunc, api->paramSeparator, hint.overload, keyword->overloads.size());
+	s(SCI_CALLTIPSHOW, hint.open, reinterpret_cast<intptr_t>(tip.c_str()));
+	const auto range = hintHighlight(*keyword, overload, api->startFunc, api->paramSeparator, hint.overload, keyword->overloads.size(), hint.parameter);
+	s(SCI_CALLTIPSETHLT, range.first, range.second);
+}
+
+void Workspace::updateHintAfterCharacter(int ch) {
+	if (!settings.functionHints) return;
+	const Document *document = activeDocument();
+	const LanguageApi *api = document ? completion.forLanguage(document->language->name) : nullptr;
+	if (!api) return;
+	const std::string typed(1, static_cast<char>(ch));
+	if (typed == api->startFunc) showParameterHint(false);
+	else if (hint.active && typed == api->stopFunc) {
+		// Closing a nested call goes back to the outer one's hint.
+		showParameterHint(false);
+	} else if (hint.active && typed == api->paramSeparator) showParameterHint(false);
+}
+
 void Workspace::autoIndent(int pane, int ch) {
 	SciView &v = view(pane);
 	const int eol = static_cast<int>(v.send(SCI_GETEOLMODE));
@@ -1380,6 +1800,7 @@ void Workspace::autoIndent(int pane, int ch) {
 }
 
 void Workspace::updateBraceHighlight(int pane) {
+	if (!settings.matchBraces) return;
 	SciView &v = view(pane);
 	const auto isBrace = [](int c) { return c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}'; };
 	const long position = v.send(SCI_GETCURRENTPOS);
@@ -1407,7 +1828,7 @@ void Workspace::updateSmartHighlight(int pane) {
 	}
 	const long start = v.send(SCI_GETSELECTIONSTART);
 	const long end = v.send(SCI_GETSELECTIONEND);
-	if (end <= start || end - start > 256 || v.send(SCI_GETSELECTIONS) != 1) return;
+	if (!settings.smartHighlight || end <= start || end - start > 256 || v.send(SCI_GETSELECTIONS) != 1) return;
 	if (v.send(SCI_WORDSTARTPOSITION, start, 1) != start || v.send(SCI_WORDENDPOSITION, start, 1) != end) return;
 	const char *pointer = reinterpret_cast<const char *>(v.send(SCI_GETRANGEPOINTER, start, end - start));
 	if (!pointer) return;
@@ -1452,26 +1873,66 @@ std::string Workspace::patternFrom(const FindOptions &options) const {
 int Workspace::flagsFrom(const FindOptions &options) const {
 	int flags = 0;
 	if (options.matchCase) flags |= SCFIND_MATCHCASE;
-	if (options.mode == SearchMode::Regex) flags |= SCFIND_REGEXP | SCFIND_CXX11REGEX;
+	regexOptions = Regex::Options();
+	regexOptions.ignoreCase = !options.matchCase;
+	regexOptions.dotMatchesNewline = options.dotMatchesNewline;
+	// SCFIND_REGEXP only marks the mode here. PCRE2 does the matching, in searchIn.
+	if (options.mode == SearchMode::Regex) flags |= SCFIND_REGEXP;
 	else if (options.wholeWord) flags |= SCFIND_WHOLEWORD;
 	return flags;
 }
 
-long Workspace::searchIn(SciView &target, const std::string &pattern, long from, long to) const {
-	target.send(SCI_SETTARGETRANGE, from, to);
-	const long found = target.send(SCI_SEARCHINTARGET, pattern.size(), reinterpret_cast<intptr_t>(pattern.data()));
-	// A bad pattern returns the same -1 as no match, and only the status tells them apart.
-	if (found < 0 && target.send(SCI_GETSTATUS) == SC_STATUS_WARN_REGEX) {
-		target.send(SCI_SETSTATUS, SC_STATUS_OK);
-		return -2;
+const Regex *Workspace::regexFor(const std::string &pattern) const {
+	const std::string key = std::string(regexOptions.ignoreCase ? "i" : "c") + (regexOptions.dotMatchesNewline ? "s" : "l") + pattern;
+	if (!cachedRegex || key != cachedRegexKey) {
+		cachedRegex = std::make_unique<Regex>(pattern, regexOptions);
+		cachedRegexKey = key;
 	}
-	return found;
+	return cachedRegex.get();
+}
+
+long Workspace::searchIn(SciView &target, const std::string &pattern, long from, long to) const {
+	if (!(target.send(SCI_GETSEARCHFLAGS) & SCFIND_REGEXP)) {
+		target.send(SCI_SETTARGETRANGE, from, to);
+		return target.send(SCI_SEARCHINTARGET, pattern.size(), reinterpret_cast<intptr_t>(pattern.data()));
+	}
+	const Regex *regex = regexFor(pattern);
+	if (!regex->valid()) return -2;
+	const size_t length = static_cast<size_t>(target.send(SCI_GETLENGTH));
+	const char *subject = reinterpret_cast<const char *>(target.send(SCI_GETCHARACTERPOINTER));
+	static const char kEmpty = '\0';
+	if (!subject) subject = &kEmpty;
+	Regex::Match match;
+	bool found = false;
+	if (from <= to) {
+		const Regex::Result result = regex->search(subject, length, static_cast<size_t>(from), match);
+		if (result == Regex::Result::Failed) return -2;
+		found = result == Regex::Result::Found && match.end <= static_cast<size_t>(to);
+	} else {
+		// Backward: the last match that ends by `from`.
+		size_t position = static_cast<size_t>(to);
+		Regex::Match candidate;
+		while (position <= static_cast<size_t>(from)) {
+			const Regex::Result result = regex->search(subject, length, position, candidate);
+			if (result == Regex::Result::Failed) return -2;
+			if (result != Regex::Result::Found || candidate.end > static_cast<size_t>(from)) break;
+			match = candidate;
+			found = true;
+			position = candidate.end > candidate.start ? candidate.end : candidate.start + 1;
+		}
+	}
+	if (!found) return -1;
+	lastMatch = match;
+	target.send(SCI_SETTARGETRANGE, static_cast<intptr_t>(match.start), static_cast<intptr_t>(match.end));
+	return static_cast<long>(match.start);
 }
 
 long Workspace::replaceTarget(SciView &target, const FindOptions &options) const {
 	if (options.mode == SearchMode::Regex) {
-		const std::string with = normalizeRegexReplacement(options.with);
-		return target.send(SCI_REPLACETARGETRE, with.size(), reinterpret_cast<intptr_t>(with.data()));
+		const char *subject = reinterpret_cast<const char *>(target.send(SCI_GETCHARACTERPOINTER));
+		const std::string with = expandReplacement(options.with, subject ? subject : "", lastMatch);
+		target.send(SCI_REPLACETARGET, with.size(), reinterpret_cast<intptr_t>(with.data()));
+		return static_cast<long>(with.size());
 	}
 	const std::string with = options.mode == SearchMode::Extended ? unescapeExtended(options.with) : options.with;
 	return target.send(SCI_REPLACETARGET, with.size(), reinterpret_cast<intptr_t>(with.data()));
@@ -1767,7 +2228,7 @@ struct SearchJob {
 	const long *currentGeneration = nullptr;
 	FindOptions options;
 	std::vector<std::string> filters;
-	std::unique_ptr<std::wregex> regex;
+	std::unique_ptr<Regex> regex;
 	std::u32string literal;
 	std::string literalBytes;
 	std::function<void(const std::string &, std::vector<ResultEntry>)> emit;
@@ -1778,16 +2239,7 @@ void searchLine(const SearchJob &job, const std::string &lineBytes, long lineNum
                 std::string &block, std::vector<ResultEntry> &entries, long &fileMatches) {
 	const std::u32string line = utf8ToCodePoints(lineBytes);
 	std::vector<std::pair<size_t, size_t>> matches;  // Code point start and length.
-	if (job.regex) {
-		if (line.size() > kMaxRegexLine) return;
-		const std::wstring wide(line.begin(), line.end());
-		try {
-			for (std::wsregex_iterator it(wide.begin(), wide.end(), *job.regex), last; it != last; ++it)
-				if (it->length() > 0) matches.emplace_back(static_cast<size_t>(it->position()), static_cast<size_t>(it->length()));
-		} catch (const std::regex_error &) {
-			return;
-		}
-	} else {
+	{
 		const std::u32string &needle = job.literal;
 		const bool matchCase = job.options.matchCase;
 		if (needle.empty() || line.size() < needle.size()) return;
@@ -1899,6 +2351,47 @@ void *searchThreadMain(void *argument) {
 		long fileMatches = 0;
 		long lineNumber = 0;
 		const std::string &contents = decoded.utf8;
+		if (job->regex) {
+			// The whole file at once, so a pattern can span lines.
+			size_t lineStart = 0, offset = 0;
+			long currentLine = 0;
+			Regex::Match match;
+			while (offset <= contents.size() && !job->cancel->load() && fileMatches < kMaxResultLines) {
+				if (job->regex->search(contents.data(), contents.size(), offset, match) != Regex::Result::Found) break;
+				if (match.end == match.start) {
+					offset = match.end + 1;
+					continue;
+				}
+				for (size_t i = lineStart; i < match.start; i++) {
+					const char c = contents[i];
+					if (c != '\n' && c != '\r') continue;
+					if (c == '\r' && i + 1 < contents.size() && contents[i + 1] == '\n') i++;
+					currentLine++;
+					lineStart = i + 1;
+				}
+				size_t lineEnd = contents.find_first_of("\r\n", match.start);
+				if (lineEnd == std::string::npos) lineEnd = contents.size();
+				if (fileMatches == 0) {
+					block += path + "\n";
+					entries.emplace_back();
+				}
+				block += "  Line " + std::to_string(currentLine + 1) + ": " + truncateUtf8(contents.substr(lineStart, lineEnd - lineStart), 400) + "\n";
+				ResultEntry result;
+				result.path = path;
+				result.line = currentLine;
+				result.offset = static_cast<long>(match.start - lineStart);
+				result.length = static_cast<long>(match.end - match.start);
+				entries.push_back(result);
+				fileMatches++;
+				offset = match.end;
+			}
+			if (fileMatches > 0) {
+				matches += fileMatches;
+				filesWithMatches++;
+				job->emit(block, std::move(entries));
+			}
+			continue;
+		}
 		size_t start = 0;
 		while (start <= contents.size() && !job->cancel->load()) {
 			size_t end = contents.find_first_of("\r\n", start);
@@ -1938,12 +2431,12 @@ void Workspace::findInFiles(const FindOptions &options, std::function<void(long,
 	auto job = std::make_unique<SearchJob>();
 	job->options = options;
 	if (options.mode == SearchMode::Regex) {
-		const std::u32string pattern = utf8ToCodePoints(options.wholeWord ? "\\b(?:" + options.what + ")\\b" : options.what);
-		try {
-			auto flags = std::regex::ECMAScript;
-			if (!options.matchCase) flags |= std::regex::icase;
-			job->regex = std::make_unique<std::wregex>(std::wstring(pattern.begin(), pattern.end()), flags);
-		} catch (const std::regex_error &) {
+		Regex::Options regexFlags;
+		regexFlags.ignoreCase = !options.matchCase;
+		regexFlags.dotMatchesNewline = options.dotMatchesNewline;
+		regexFlags.wholeWord = options.wholeWord;
+		job->regex = std::make_unique<Regex>(options.what, regexFlags);
+		if (!job->regex->valid()) {
 			completion(-1, 0);
 			return;
 		}
@@ -1978,20 +2471,12 @@ void Workspace::findInFiles(const FindOptions &options, std::function<void(long,
 		});
 	};
 
-	pthread_attr_t attributes;
-	pthread_attr_init(&attributes);
-	pthread_attr_setstacksize(&attributes, 512 * 1024 * 1024);  // Only reserved, not used up front.
 	SearchJob *raw = job.release();
-	if (pthread_create(&searchThread, &attributes, searchThreadMain, raw) != 0) {
-		pthread_attr_setstacksize(&attributes, 64 * 1024 * 1024);
-		if (pthread_create(&searchThread, &attributes, searchThreadMain, raw) != 0) {
-			delete raw;
-			pthread_attr_destroy(&attributes);
-			completion(0, 0);
-			return;
-		}
+	if (pthread_create(&searchThread, nullptr, searchThreadMain, raw) != 0) {
+		delete raw;
+		completion(0, 0);
+		return;
 	}
-	pthread_attr_destroy(&attributes);
 	searchThreadRunning = true;
 }
 
@@ -2537,6 +3022,505 @@ void Workspace::runFromMenu(bool backward, bool useSelection) {
 	else if (result == SearchResult::InvalidPattern) host.flash("That regular expression isn't valid");
 }
 
+#pragma mark - Preferences and shortcuts
+
+std::vector<FormField> Workspace::preferenceFields() const {
+	std::vector<FormField> fields;
+	const auto heading = [&](const char *label) {
+		FormField field;
+		field.kind = FormField::Kind::Heading;
+		field.label = label;
+		fields.push_back(field);
+	};
+	const auto toggle = [&](const char *key, const char *label, bool value) {
+		FormField field;
+		field.key = key;
+		field.label = label;
+		field.kind = FormField::Kind::Bool;
+		field.value = value ? "1" : "0";
+		fields.push_back(field);
+	};
+	const auto number = [&](const char *key, const char *label, int value, int minimum, int maximum) {
+		FormField field;
+		field.key = key;
+		field.label = label;
+		field.kind = FormField::Kind::Int;
+		field.value = std::to_string(value);
+		field.minimum = minimum;
+		field.maximum = maximum;
+		fields.push_back(field);
+	};
+	heading("Editing");
+	toggle("autoIndent", "Keep the indent on a new line", settings.autoIndent);
+	toggle("multiEditing", "Typing applies to all selections", settings.multiEditing);
+	toggle("tabsToSpaces", "Insert spaces for tabs", settings.tabsToSpaces);
+	number("tabWidth", "Tab size", settings.tabWidth, 1, 32);
+	number("caretWidth", "Caret width", settings.caretWidth, 1, 3);
+
+	heading("Display");
+	toggle("lineNumbers", "Show line numbers", settings.lineNumbers);
+	toggle("bookmarkMargin", "Show the bookmark margin", settings.bookmarkMargin);
+	toggle("changeHistory", "Show change history (for files opened after this)", settings.changeHistory);
+	toggle("highlightCurrentLine", "Highlight the current line", settings.highlightCurrentLine);
+	toggle("smartHighlight", "Highlight other copies of the selected word", settings.smartHighlight);
+	toggle("matchBraces", "Highlight matching braces", settings.matchBraces);
+	toggle("wordWrap", "Word wrap", settings.wordWrap);
+	toggle("showGuides", "Show indent guides", settings.showGuides);
+	toggle("scrollBeyondEnd", "Allow scrolling past the last line", settings.scrollBeyondEnd);
+	number("edgeColumn", "Column guide (0 for none)", settings.edgeColumn, 0, 1000);
+	FormField fontName;
+	fontName.key = "fontName";
+	fontName.label = "Font";
+	fontName.kind = FormField::Kind::Text;
+	fontName.value = settings.fontName;
+	fields.push_back(fontName);
+	number("fontSize", "Font size", static_cast<int>(settings.fontSize), 4, 96);
+
+	heading("New documents");
+	FormField eol;
+	eol.key = "defaultEol";
+	eol.label = "Line endings";
+	eol.kind = FormField::Kind::Choice;
+	eol.value = settings.defaultEol;
+	eol.choices = {{"lf", "Unix (LF)"}, {"crlf", "Windows (CR LF)"}, {"cr", "Macintosh (CR)"}};
+	fields.push_back(eol);
+	FormField encodingField;
+	encodingField.key = "defaultEncoding";
+	encodingField.label = "Encoding";
+	encodingField.kind = FormField::Kind::Choice;
+	encodingField.value = settings.defaultEncoding;
+	for (const Encoding &e : allEncodings()) encodingField.choices.emplace_back(e.identifier, e.name);
+	fields.push_back(encodingField);
+
+	heading("Auto-completion");
+	toggle("autoComplete", "Offer completions while typing", settings.autoComplete);
+	number("completeThreshold", "Start after this many characters", settings.completeThreshold, 1, 9);
+	toggle("completeFunctions", "Include the language's functions and keywords", settings.completeFunctions);
+	toggle("completeWords", "Include words from the document", settings.completeWords);
+	toggle("functionHints", "Show function hints when a call opens", settings.functionHints);
+
+	heading("Session");
+	toggle("restoreSessionOnStart", "Reopen the last session at launch", settings.restoreSessionOnStart);
+	number("backupSeconds", "Back up unsaved work every (seconds, 0 for only on quit)", settings.backupSeconds, 0, 3600);
+	return fields;
+}
+
+void Workspace::applyPreferenceFields(const std::vector<FormField> &fields) {
+	const auto clamped = [](const FormField &field) {
+		const long value = std::strtol(field.value.c_str(), nullptr, 10);
+		return static_cast<int>(std::min<long>(std::max<long>(value, field.minimum), field.maximum));
+	};
+	for (const FormField &field : fields) {
+		const bool on = field.value == "1";
+		const std::string &key = field.key;
+		if (key == "autoIndent") settings.autoIndent = on;
+		else if (key == "multiEditing") settings.multiEditing = on;
+		else if (key == "tabsToSpaces") settings.tabsToSpaces = on;
+		else if (key == "tabWidth") settings.tabWidth = clamped(field);
+		else if (key == "caretWidth") settings.caretWidth = clamped(field);
+		else if (key == "lineNumbers") settings.lineNumbers = on;
+		else if (key == "bookmarkMargin") settings.bookmarkMargin = on;
+		else if (key == "changeHistory") settings.changeHistory = on;
+		else if (key == "highlightCurrentLine") settings.highlightCurrentLine = on;
+		else if (key == "smartHighlight") settings.smartHighlight = on;
+		else if (key == "matchBraces") settings.matchBraces = on;
+		else if (key == "wordWrap") settings.wordWrap = on;
+		else if (key == "showGuides") settings.showGuides = on;
+		else if (key == "scrollBeyondEnd") settings.scrollBeyondEnd = on;
+		else if (key == "edgeColumn") settings.edgeColumn = clamped(field);
+		else if (key == "fontName" && !field.value.empty()) settings.fontName = field.value;
+		else if (key == "fontSize") settings.fontSize = clamped(field);
+		else if (key == "defaultEol" && (field.value == "lf" || field.value == "crlf" || field.value == "cr")) settings.defaultEol = field.value;
+		else if (key == "defaultEncoding" && encodingWithIdentifier(field.value)) settings.defaultEncoding = field.value;
+		else if (key == "autoComplete") settings.autoComplete = on;
+		else if (key == "completeThreshold") settings.completeThreshold = clamped(field);
+		else if (key == "completeFunctions") settings.completeFunctions = on;
+		else if (key == "completeWords") settings.completeWords = on;
+		else if (key == "functionHints") settings.functionHints = on;
+		else if (key == "restoreSessionOnStart") settings.restoreSessionOnStart = on;
+		else if (key == "backupSeconds") settings.backupSeconds = clamped(field);
+	}
+	applyPreferencesEverywhere();
+	applyThemeEverywhere();
+}
+
+namespace {
+
+void walkMenu(std::vector<MenuItem> &items, const std::string &prefix, const std::function<void(MenuItem &, const std::string &)> &visit) {
+	for (MenuItem &item : items) {
+		if (item.separator) continue;
+		const std::string id = prefix.empty() ? item.title : prefix + "/" + item.title;
+		if (!item.children.empty()) walkMenu(item.children, id, visit);
+		else if (item.dynamic == MenuItem::Dynamic::None) visit(item, id);
+	}
+}
+
+}  // namespace
+
+std::vector<MenuItem> Workspace::mainMenu() const {
+	std::vector<MenuItem> menu = baseMenu();
+	walkMenu(menu, "", [&](MenuItem &item, const std::string &id) {
+		const auto custom = settings.shortcuts.find(id);
+		if (custom == settings.shortcuts.end()) return;
+		item.shortcut = custom->second;
+#ifndef __APPLE__
+		// GTK leaves standard editing keys to the editor. A changed one has to be a real accelerator.
+		item.macAction.clear();
+#endif
+	});
+	return menu;
+}
+
+std::vector<ShortcutEntry> Workspace::shortcutEntries() const {
+	std::vector<ShortcutEntry> entries;
+	std::vector<MenuItem> menu = baseMenu();
+	walkMenu(menu, "", [&](MenuItem &item, const std::string &id) {
+		ShortcutEntry entry;
+		entry.id = id;
+		entry.defaultShortcut = normalizeShortcut(item.shortcut);
+		const auto custom = settings.shortcuts.find(id);
+		entry.shortcut = custom != settings.shortcuts.end() ? custom->second : entry.defaultShortcut;
+		entries.push_back(entry);
+	});
+	return entries;
+}
+
+bool Workspace::assignShortcut(const std::string &id, const std::string &raw) {
+	const std::string shortcut = normalizeShortcut(raw);
+	const std::vector<ShortcutEntry> entries = shortcutEntries();
+	const auto self = std::find_if(entries.begin(), entries.end(), [&](const ShortcutEntry &e) { return e.id == id; });
+	if (self == entries.end()) return false;
+	if (!shortcut.empty()) {
+		for (const ShortcutEntry &entry : entries) {
+			if (entry.id == id || entry.shortcut != shortcut) continue;
+			if (host.ask(shortcut + " is already used.", "It's assigned to " + entry.id + ". Move it to " + id + "?", {"Cancel", "Move It"}) != 1) return false;
+			settings.shortcuts[entry.id] = "";
+		}
+	}
+	if (shortcut == self->defaultShortcut) settings.shortcuts.erase(id);
+	else settings.shortcuts[id] = shortcut;
+	saveSettings();
+	host.menusChanged();
+	return true;
+}
+
+void Workspace::resetShortcuts() {
+	settings.shortcuts.clear();
+	saveSettings();
+	host.menusChanged();
+}
+
+#pragma mark - Function List
+
+bool Workspace::activeLanguageHasFunctionList() const {
+	const Document *document = activeDocument();
+	return document && functionCatalog.supports(document->language->name);
+}
+
+void Workspace::refreshFunctionList() {
+	const Document *document = activeDocument();
+	functions.clear();
+	functionsPending = 0;
+	if (document) {
+		functionsDocument = document;
+		functionsGeneration = document->editGeneration;
+		functions = functionCatalog.parse(document->language->name, text());
+	}
+	host.functionListChanged();
+}
+
+void Workspace::goToFunction(size_t index) {
+	if (index >= functions.size()) return;
+	const long position = static_cast<long>(functions[index].position);
+	const long line = s(SCI_LINEFROMPOSITION, position);
+	s(SCI_ENSUREVISIBLEENFORCEPOLICY, line);
+	s(SCI_GOTOPOS, position);
+	const long top = std::max(0L, static_cast<long>(s(SCI_VISIBLEFROMDOCLINE, line)) - static_cast<long>(s(SCI_LINESONSCREEN)) / 3);
+	s(SCI_SETFIRSTVISIBLELINE, top);
+	host.focusPane(focus);
+}
+
+#pragma mark - Column Editor and multi-select
+
+void Workspace::columnInsert(const std::vector<std::string> &values) {
+	if (values.empty()) return;
+	const long selectionStart = s(SCI_GETSELECTIONSTART);
+	const long selectionEnd = s(SCI_GETSELECTIONEND);
+	const bool rectangle = s(SCI_SELECTIONISRECTANGLE) != 0;
+	const long firstLine = s(SCI_LINEFROMPOSITION, selectionStart);
+	const long column = s(SCI_GETCOLUMN, selectionStart);
+	// A rectangle fills its own lines. A caret fills from its line to the end of the document.
+	const long lastLine = rectangle ? s(SCI_LINEFROMPOSITION, selectionEnd) : s(SCI_GETLINECOUNT) - 1;
+	s(SCI_BEGINUNDOACTION);
+	for (long line = lastLine; line >= firstLine; line--) {
+		const std::string &value = values[static_cast<size_t>(line - firstLine) % values.size()];
+		const long lineEnd = s(SCI_GETLINEENDPOSITION, line);
+		const long position = s(SCI_FINDCOLUMN, line, column);
+		const long reached = s(SCI_GETCOLUMN, position);
+		// A short line is padded, so the column stays straight.
+		const std::string padding(reached < column ? static_cast<size_t>(column - reached) : 0, ' ');
+		const std::string insert = padding + value;
+		s(SCI_INSERTTEXT, reached < column ? lineEnd : position, reinterpret_cast<intptr_t>(insert.c_str()));
+	}
+	s(SCI_ENDUNDOACTION);
+}
+
+bool Workspace::columnInsertText(const std::string &value) {
+	if (value.empty()) return false;
+	columnInsert({value});
+	return true;
+}
+
+bool Workspace::columnInsertNumbers(long initial, long increment, long repeat, bool leadingZeros, int base) {
+	if (repeat < 1) repeat = 1;
+	const long selectionStart = s(SCI_GETSELECTIONSTART);
+	const long firstLine = s(SCI_LINEFROMPOSITION, selectionStart);
+	const long lastLine = s(SCI_SELECTIONISRECTANGLE) ? s(SCI_LINEFROMPOSITION, s(SCI_GETSELECTIONEND)) : s(SCI_GETLINECOUNT) - 1;
+	const long count = lastLine - firstLine + 1;
+	size_t width = 0;
+	std::vector<std::string> values;
+	for (long i = 0; i < count; i++) {
+		const long value = initial + increment * (i / repeat);
+		const std::string formatted = formatNumber(value, base, 0);
+		values.push_back(formatted);
+		width = std::max(width, formatted.size());
+	}
+	// Numbers line up on the right, padded with zeros or spaces.
+	for (std::string &value : values) {
+		if (value.size() >= width) continue;
+		if (leadingZeros) {
+			const bool negative = value[0] == '-';
+			value.insert(negative ? 1 : 0, width - value.size(), '0');
+		} else {
+			value.insert(0, width - value.size(), ' ');
+		}
+	}
+	columnInsert(values);
+	return true;
+}
+
+void Workspace::columnEditorDialog() {
+	std::vector<FormField> fields;
+	const auto add = [&](const char *key, const char *label, FormField::Kind kind, const char *value, int minimum = 0, int maximum = 0) {
+		FormField field;
+		field.key = key;
+		field.label = label;
+		field.kind = kind;
+		field.value = value;
+		field.minimum = minimum;
+		field.maximum = maximum;
+		fields.push_back(field);
+	};
+	add("", "Text to Insert", FormField::Kind::Heading, "");
+	add("text", "Text", FormField::Kind::Text, "");
+	add("", "Number to Insert (used when Text is empty)", FormField::Kind::Heading, "");
+	add("initial", "Initial number", FormField::Kind::Int, "1", -1000000000, 1000000000);
+	add("increment", "Increase by", FormField::Kind::Int, "1", -1000000, 1000000);
+	add("repeat", "Repeat", FormField::Kind::Int, "1", 1, 1000000);
+	add("zeros", "Leading zeros", FormField::Kind::Bool, "0");
+	FormField base;
+	base.key = "base";
+	base.label = "Format";
+	base.kind = FormField::Kind::Choice;
+	base.value = "10";
+	base.choices = {{"10", "Decimal"}, {"16", "Hexadecimal"}, {"8", "Octal"}, {"2", "Binary"}};
+	fields.push_back(base);
+	if (!host.runForm("Column Editor", fields)) return;
+	std::map<std::string, std::string> values;
+	for (const FormField &field : fields) values[field.key] = field.value;
+	if (!values["text"].empty()) {
+		columnInsertText(values["text"]);
+	} else {
+		const auto number = [&](const char *key) { return std::strtol(values[key].c_str(), nullptr, 10); };
+		columnInsertNumbers(number("initial"), number("increment"), number("repeat"), values["zeros"] == "1", static_cast<int>(number("base")));
+	}
+}
+
+void Workspace::multiSelectPrepare(int flags) {
+	s(SCI_TARGETWHOLEDOCUMENT);
+	int searchFlags = 0;
+	if (flags & 1) searchFlags |= SCFIND_MATCHCASE;
+	if (flags & 2) searchFlags |= SCFIND_WHOLEWORD;
+	s(SCI_SETSEARCHFLAGS, searchFlags);
+	// With no selection, start from the word at the caret.
+	if (s(SCI_GETSELECTIONSTART) == s(SCI_GETSELECTIONEND)) {
+		const long position = s(SCI_GETCURRENTPOS);
+		s(SCI_SETSEL, s(SCI_WORDSTARTPOSITION, position, 1), s(SCI_WORDENDPOSITION, position, 1));
+	}
+}
+
+#pragma mark - Token styles and change history
+
+long Workspace::styleIndicator(int style) const { return style >= 1 && style <= 5 ? 26 - style : kIndicatorMark; }
+
+void Workspace::styleOccurrences(int style) {
+	const std::string word = selectionOrWord();
+	if (word.empty()) return;
+	s(SCI_SETINDICATORCURRENT, styleIndicator(style));
+	s(SCI_SETSEARCHFLAGS, SCFIND_MATCHCASE | (selectedText().empty() ? SCFIND_WHOLEWORD : 0));
+	const long length = s(SCI_GETLENGTH);
+	long position = 0;
+	while (position <= length) {
+		s(SCI_SETTARGETRANGE, position, length);
+		const long found = s(SCI_SEARCHINTARGET, word.size(), reinterpret_cast<intptr_t>(word.data()));
+		if (found < 0) break;
+		const long end = s(SCI_GETTARGETEND);
+		s(SCI_INDICATORFILLRANGE, found, end - found);
+		position = end > found ? end : found + 1;
+	}
+}
+
+void Workspace::styleSelection(int style) {
+	long start = s(SCI_GETSELECTIONSTART), end = s(SCI_GETSELECTIONEND);
+	if (start == end) {
+		const long position = s(SCI_GETCURRENTPOS);
+		start = s(SCI_WORDSTARTPOSITION, position, 1);
+		end = s(SCI_WORDENDPOSITION, position, 1);
+	}
+	if (end <= start) return;
+	s(SCI_SETINDICATORCURRENT, styleIndicator(style));
+	s(SCI_INDICATORFILLRANGE, start, end - start);
+}
+
+void Workspace::clearStyle(int style) {
+	const long length = s(SCI_GETLENGTH);
+	const auto clearOne = [&](long indicator) {
+		s(SCI_SETINDICATORCURRENT, indicator);
+		s(SCI_INDICATORCLEARRANGE, 0, length);
+	};
+	if (style >= 1 && style <= 5) clearOne(styleIndicator(style));
+	else for (int i = 1; i <= 5; i++) clearOne(styleIndicator(i));
+}
+
+void Workspace::jumpStyle(int style, bool forward) {
+	const long indicator = styleIndicator(style);
+	const long length = s(SCI_GETLENGTH);
+	const auto valueAt = [&](long position) { return s(SCI_INDICATORVALUEAT, indicator, position) != 0; };
+	std::vector<std::pair<long, long>> ranges;
+	long position = 0;
+	while (position < length) {
+		const long end = s(SCI_INDICATOREND, indicator, position);
+		if (valueAt(position)) ranges.emplace_back(position, end);
+		if (end <= position) break;
+		position = end;
+	}
+	if (ranges.empty()) {
+		host.flash("Nothing marked with that style");
+		return;
+	}
+	const long selectionStart = s(SCI_GETSELECTIONSTART);
+	const long selectionEnd = s(SCI_GETSELECTIONEND);
+	std::pair<long, long> target = forward ? ranges.front() : ranges.back();  // Wraps by default.
+	if (forward) {
+		for (const auto &range : ranges) {
+			if (range.first >= selectionEnd) {
+				target = range;
+				break;
+			}
+		}
+	} else {
+		for (auto it = ranges.rbegin(); it != ranges.rend(); ++it) {
+			if (it->second <= selectionStart) {
+				target = *it;
+				break;
+			}
+		}
+	}
+	s(SCI_ENSUREVISIBLEENFORCEPOLICY, s(SCI_LINEFROMPOSITION, target.first));
+	s(SCI_SETSEL, target.first, target.second);
+	s(SCI_SCROLLCARET);
+}
+
+void Workspace::copyStyled(int style) {
+	const long length = s(SCI_GETLENGTH);
+	std::string out;
+	const auto collect = [&](long indicator) {
+		long position = 0;
+		while (position < length) {
+			const long end = s(SCI_INDICATOREND, indicator, position);
+			if (s(SCI_INDICATORVALUEAT, indicator, position)) {
+				out += rangeOf(position, end);
+				out += eolString(activeDocument()->eol);
+			}
+			if (end <= position) break;
+			position = end;
+		}
+	};
+	if (style == 6) for (int i = 1; i <= 5; i++) collect(styleIndicator(i));
+	else collect(styleIndicator(style));
+	if (out.empty()) host.flash("Nothing marked with that style");
+	else host.setClipboard(out);
+}
+
+// Scintilla keeps change history apart from ordinary markers, so SCI_MARKERNEXT can't see it
+// and each line has to be asked. A run of changed lines counts as one change.
+void Workspace::goToChange(bool forward) {
+	const long mask = 0xFL << SC_MARKNUM_HISTORY_REVERTED_TO_ORIGIN;
+	const long lines = s(SCI_GETLINECOUNT);
+	const auto changed = [&](long line) { return (s(SCI_MARKERGET, line) & mask) != 0; };
+	const long start = currentLine();
+	long line = start;
+	bool inRun = changed(line);
+	for (long step = 0; step < lines; step++) {
+		line = (line + (forward ? 1 : lines - 1)) % lines;
+		const bool isChanged = changed(line);
+		if (isChanged && !inRun) {
+			if (!forward)
+				while (line > 0 && changed(line - 1)) line--;
+			s(SCI_ENSUREVISIBLEENFORCEPOLICY, line);
+			s(SCI_GOTOLINE, line);
+			return;
+		}
+		// Wrapping past either end of the document also ends a run.
+		const bool wrapped = forward ? line == lines - 1 : line == 0;
+		inRun = isChanged && !wrapped;
+	}
+	if (changed(start)) {
+		line = start;
+		while (line > 0 && changed(line - 1)) line--;
+		s(SCI_GOTOLINE, line);
+		return;
+	}
+	host.flash("No changes");
+}
+
+void Workspace::goToNextResult(bool forward) {
+	const long count = static_cast<long>(resultEntries.size());
+	for (long step = 1; step <= count; step++) {
+		const long line = (nextResultLine + (forward ? step : -step) + count * 2) % count;
+		if (resultEntries[static_cast<size_t>(line)].line < 0) continue;
+		nextResultLine = line;
+		SciView &results = host.resultsView();
+		results.send(SCI_GOTOLINE, line);
+		results.send(SCI_SETSEL, results.send(SCI_POSITIONFROMLINE, line), results.send(SCI_GETLINEENDPOSITION, line));
+		jumpToResultLine(line);
+		return;
+	}
+	host.flash("No search results");
+}
+
+void Workspace::selectInBraces() {
+	const long position = s(SCI_GETCURRENTPOS);
+	const std::string opens = "([{";
+	const long earliest = std::max(0L, position - 1000000);
+	const std::string before = rangeOf(earliest, position);
+	std::vector<char> closers;
+	for (size_t i = before.size(); i > 0; i--) {
+		const char c = before[i - 1];
+		if (c == ')' || c == ']' || c == '}') closers.push_back(c);
+		else if (opens.find(c) != std::string::npos) {
+			if (!closers.empty()) {
+				closers.pop_back();
+				continue;
+			}
+			const long open = earliest + static_cast<long>(i) - 1;
+			const long close = s(SCI_BRACEMATCH, open);
+			if (close > open) s(SCI_SETSEL, open + 1, close);
+			return;
+		}
+	}
+}
+
 #pragma mark - Commands
 
 namespace {
@@ -2964,6 +3948,99 @@ void Workspace::run(Cmd cmd, int arg, const std::string &argument) {
 	}
 	case Cmd::TabMoveToOther: moveTabToOtherView(tabPane, tabIndex); break;
 	case Cmd::TabCloneToOther: cloneTabToOtherView(tabPane, tabIndex); break;
+
+	case Cmd::ShowPreferences: {
+		std::vector<FormField> fields = preferenceFields();
+		if (host.runForm("Preferences", fields)) applyPreferenceFields(fields);
+		break;
+	}
+	case Cmd::ShowShortcutMapper: host.runShortcutMapper(); break;
+
+	case Cmd::CompleteFunction: showCompletion(true, false, true); break;
+	case Cmd::CompleteWord: showCompletion(false, true, true); break;
+	case Cmd::ParameterHint: showParameterHint(true); break;
+	case Cmd::PreviousHint:
+	case Cmd::NextHint: {
+		if (!hint.active) break;
+		const LanguageApi *api = completion.forLanguage(hint.language);
+		const ApiKeyword *keyword = api ? api->find(hint.keyword) : nullptr;
+		if (!keyword || keyword->overloads.empty()) break;
+		const size_t count = keyword->overloads.size();
+		hint.overload = (hint.overload + (cmd == Cmd::NextHint ? 1 : count - 1)) % count;
+		renderHint();
+		break;
+	}
+	case Cmd::CompletePath: showPathCompletion(); break;
+
+	case Cmd::MultiSelectAll:
+		multiSelectPrepare(arg);
+		if (s(SCI_GETSELECTIONSTART) != s(SCI_GETSELECTIONEND)) s(SCI_MULTIPLESELECTADDEACH);
+		break;
+	case Cmd::MultiSelectNext:
+		multiSelectPrepare(arg);
+		if (s(SCI_GETSELECTIONSTART) != s(SCI_GETSELECTIONEND)) s(SCI_MULTIPLESELECTADDNEXT);
+		break;
+	case Cmd::MultiSelectUndo:
+		if (s(SCI_GETSELECTIONS) > 1) s(SCI_DROPSELECTIONN, s(SCI_GETMAINSELECTION));
+		break;
+	case Cmd::MultiSelectSkip:
+		if (s(SCI_GETSELECTIONS) > 1) {
+			const long main = s(SCI_GETMAINSELECTION);
+			s(SCI_TARGETWHOLEDOCUMENT);
+			s(SCI_MULTIPLESELECTADDNEXT);
+			s(SCI_DROPSELECTIONN, main);
+		}
+		break;
+	case Cmd::ColumnEditor: columnEditorDialog(); break;
+
+	case Cmd::ToggleFunctionList:
+		functionPanel = !functionPanel;
+		host.setFunctionListVisible(functionPanel);
+		if (functionPanel) refreshFunctionList();
+		break;
+	case Cmd::RefreshFunctionList: refreshFunctionList(); break;
+	case Cmd::ToggleDocumentMap: showDocumentMap(!mapVisible); break;
+
+	case Cmd::NextChange: goToChange(true); break;
+	case Cmd::PreviousChange: goToChange(false); break;
+	case Cmd::ClearChangeHistory:
+		if (host.ask("Clear the change history?", "This also clears undo history for this document.", {"Cancel", "Clear"}) != 1) break;
+		s(SCI_SETCHANGEHISTORY, SC_CHANGE_HISTORY_DISABLED);
+		s(SCI_EMPTYUNDOBUFFER);
+		applyChangeHistoryTo(view());
+		break;
+
+	case Cmd::StyleAllOccurrences: styleOccurrences(arg); break;
+	case Cmd::StyleOneToken: styleSelection(arg); break;
+	case Cmd::ClearStyle: clearStyle(arg); break;
+	case Cmd::JumpStyleUp: jumpStyle(arg, false); break;
+	case Cmd::JumpStyleDown: jumpStyle(arg, true); break;
+	case Cmd::CopyStyled: copyStyled(arg); break;
+
+	case Cmd::NextSearchResult: goToNextResult(true); break;
+	case Cmd::PreviousSearchResult: goToNextResult(false); break;
+	case Cmd::SelectInBraces: selectInBraces(); break;
+	case Cmd::IndentLine: s(SCI_TAB); break;
+	case Cmd::UnindentLine: s(SCI_BACKTAB); break;
+	case Cmd::DeleteSelection: s(SCI_CLEAR); break;
+	case Cmd::ToggleReadOnly: s(SCI_SETREADONLY, !s(SCI_GETREADONLY)); break;
+	case Cmd::Rename: {
+		if (document->path.empty()) break;
+		std::string name, error;
+		const std::string current = document->path;
+		if (host.promptText("Rename", "New name:", baseName(current), name) && !renamePath(current, name, error))
+			host.ask("That could not be renamed.", error, {"OK"});
+		break;
+	}
+	case Cmd::CloseLeft:
+	case Cmd::CloseRight: {
+		std::vector<std::pair<int, std::shared_ptr<Document>>> targets;
+		const Pane &p = paneAt(focus);
+		for (int i = 0; i < static_cast<int>(p.tabs.size()); i++)
+			if (cmd == Cmd::CloseLeft ? i < p.active : i > p.active) targets.emplace_back(focus, p.tabs[i].document);
+		closeTabs(targets);
+		break;
+	}
 	}
 }
 
@@ -3008,6 +4085,10 @@ MenuState Workspace::stateOf(const MenuItem &item) {
 		break;
 	case Cmd::RotateSplit: state.checked = stacked; state.enabled = splitVisible(); break;
 	case Cmd::ToggleFolderPanel: state.checked = folderPanel; break;
+	case Cmd::ToggleFunctionList: state.checked = functionPanel; break;
+	case Cmd::ToggleDocumentMap: state.checked = mapVisible; break;
+	case Cmd::ToggleReadOnly: state.checked = s(SCI_GETREADONLY) != 0; break;
+	case Cmd::Rename: state.enabled = saved; break;
 	case Cmd::ToggleHiddenInFolders: state.checked = settings.showHiddenInFolders; break;
 	case Cmd::CloseAllFolders:
 	case Cmd::RefreshFolders: state.enabled = !folderRoots.empty(); break;
@@ -3127,7 +4208,7 @@ std::vector<MenuItem> Workspace::folderMenu(const std::string &path, bool isDire
 	return out;
 }
 
-std::vector<MenuItem> Workspace::mainMenu() const {
+std::vector<MenuItem> Workspace::baseMenu() const {
 #ifdef __APPLE__
 	const auto key = [](const char *mac, const char *) { return std::string(mac); };
 #else
@@ -3197,8 +4278,11 @@ std::vector<MenuItem> Workspace::mainMenu() const {
 		item("Close All", Cmd::CloseAll, "Mod+Shift+W"),
 		sub("Close Multiple Documents", {
 			item("Close All but Active Document", Cmd::CloseOthers),
+			item("Close All to the Left", Cmd::CloseLeft),
+			item("Close All to the Right", Cmd::CloseRight),
 			item("Close All Unchanged", Cmd::CloseUnchanged),
 		}),
+		item("Rename…", Cmd::Rename),
 		item("Move to Trash", Cmd::Trash),
 	};
 #ifndef __APPLE__
@@ -3224,13 +4308,15 @@ std::vector<MenuItem> Workspace::mainMenu() const {
 		op("Sort Lines Lexicographically Ascending", LineOp::SortLexAsc),
 		op("Sort Lines Lex. Ascending Ignoring Case", LineOp::SortFoldAsc),
 		op("Sort Lines As Integers Ascending", LineOp::SortIntAsc),
-		op("Sort Lines As Decimals Ascending", LineOp::SortDecimalAsc),
+		op("Sort Lines As Decimals (Dot) Ascending", LineOp::SortDecimalAsc),
+		op("Sort Lines As Decimals (Comma) Ascending", LineOp::SortDecimalCommaAsc),
 		op("Sort Lines By Length Ascending", LineOp::SortLengthAsc),
 		separator(),
 		op("Sort Lines Lexicographically Descending", LineOp::SortLexDesc),
 		op("Sort Lines Lex. Descending Ignoring Case", LineOp::SortFoldDesc),
 		op("Sort Lines As Integers Descending", LineOp::SortIntDesc),
-		op("Sort Lines As Decimals Descending", LineOp::SortDecimalDesc),
+		op("Sort Lines As Decimals (Dot) Descending", LineOp::SortDecimalDesc),
+		op("Sort Lines As Decimals (Comma) Descending", LineOp::SortDecimalCommaDesc),
 		op("Sort Lines By Length Descending", LineOp::SortLengthDesc),
 	};
 
@@ -3242,7 +4328,37 @@ std::vector<MenuItem> Workspace::mainMenu() const {
 		edit("Copy", Cmd::Copy, "Mod+C", "copy:"),
 		edit("Paste", Cmd::Paste, "Mod+V", "paste:"),
 		edit("Select All", Cmd::SelectAll, "Mod+A", "selectAll:"),
+		item("Delete", Cmd::DeleteSelection),
 		separator(),
+		sub("Multi-select All", {
+			item("Ignore Case & Whole Word", Cmd::MultiSelectAll, key("Mod+Ctrl+A", "Mod+Alt+A"), 0),
+			item("Match Case Only", Cmd::MultiSelectAll, "", 1),
+			item("Match Whole Word Only", Cmd::MultiSelectAll, "", 2),
+			item("Match Case & Whole Word", Cmd::MultiSelectAll, "", 3),
+		}),
+		sub("Multi-select Next", {
+			item("Ignore Case & Whole Word", Cmd::MultiSelectNext, key("Mod+Ctrl+D", "Mod+Alt+D"), 0),
+			item("Match Case Only", Cmd::MultiSelectNext, "", 1),
+			item("Match Whole Word Only", Cmd::MultiSelectNext, "", 2),
+			item("Match Case & Whole Word", Cmd::MultiSelectNext, "", 3),
+		}),
+		item("Undo the Latest Added Multi-Select", Cmd::MultiSelectUndo),
+		item("Skip Current & Go to Next Multi-select", Cmd::MultiSelectSkip),
+		item("Column Editor…", Cmd::ColumnEditor, key("Mod+Alt+C", "Alt+C")),
+		separator(),
+		sub("Auto-Completion", {
+			item("Function Completion", Cmd::CompleteFunction, key("Ctrl+Space", "Mod+Space")),
+			item("Word Completion", Cmd::CompleteWord, key("Ctrl+Shift+Space", "Mod+Shift+Space")),
+			item("Function Parameters Hint", Cmd::ParameterHint, key("Ctrl+Alt+Space", "Mod+Alt+Space")),
+			item("Function Parameters Previous Hint", Cmd::PreviousHint, "Alt+Up"),
+			item("Function Parameters Next Hint", Cmd::NextHint, "Alt+Down"),
+			item("Path Completion", Cmd::CompletePath, key("Ctrl+Alt+P", "Mod+Alt+P")),
+		}),
+		sub("Indent", {
+			item("Increase Line Indent", Cmd::IndentLine),
+			item("Decrease Line Indent", Cmd::UnindentLine),
+		}),
+		item("Read-Only", Cmd::ToggleReadOnly),
 		sub("Insert", {
 			item("Date and Time (short)", Cmd::InsertDate, "", 0),
 			item("Date and Time (long)", Cmd::InsertDate, "", 1),
@@ -3286,6 +4402,24 @@ std::vector<MenuItem> Workspace::mainMenu() const {
 		}),
 	};
 
+	const char *ordinals[] = {"1st", "2nd", "3rd", "4th", "5th"};
+	const auto styleMenu = [&](Cmd cmd, const std::string &format, int count) {
+		std::vector<MenuItem> out;
+		for (int i = 1; i <= 5; i++) {
+			std::string title = format;
+			title.replace(title.find("%d"), 2, ordinals[i - 1]);
+			out.push_back(item(title, cmd, "", i));
+		}
+		if (count == 6) out.push_back(item("Find Mark Style", cmd, "", 0));
+		return out;
+	};
+	std::vector<MenuItem> clearStyles;
+	for (int i = 1; i <= 5; i++) clearStyles.push_back(item(std::string("Clear ") + ordinals[i - 1] + " Style", Cmd::ClearStyle, "", i));
+	clearStyles.push_back(item("Clear all Styles", Cmd::ClearStyle, "", 0));
+	std::vector<MenuItem> copyStyles = styleMenu(Cmd::CopyStyled, "%d Style", 5);
+	copyStyles.push_back(item("All Styles", Cmd::CopyStyled, "", 6));
+	copyStyles.push_back(item("Find Mark Style", Cmd::CopyStyled, "", 0));
+
 	std::vector<MenuItem> search = {
 		item("Find…", Cmd::ShowFind, "Mod+F"),
 		item("Find in Files…", Cmd::ShowFindInFiles, "Mod+Shift+F"),
@@ -3295,9 +4429,24 @@ std::vector<MenuItem> Workspace::mainMenu() const {
 		item("Select and Find Previous", Cmd::SelectFindPrevious, key("Mod+Shift+E", "Mod+Shift+F3")),
 		item("Replace…", Cmd::ShowReplace, key("Mod+Alt+F", "Mod+H")),
 		item("Search Results Window", Cmd::ToggleResults, "F7"),
+		item("Next Search Result", Cmd::NextSearchResult, "F4"),
+		item("Previous Search Result", Cmd::PreviousSearchResult, "Shift+F4"),
 		separator(),
 		item("Go to Line…", Cmd::GoToLine, key("Mod+L", "Mod+G")),
 		item("Go to Matching Brace", Cmd::MatchingBrace, "Mod+B"),
+		item("Select All In-between {} [] or ()", Cmd::SelectInBraces, "Mod+Alt+Shift+B"),
+		separator(),
+		sub("Change History", {
+			item("Go to Next Change", Cmd::NextChange, "Mod+Alt+Down"),
+			item("Go to Previous Change", Cmd::PreviousChange, "Mod+Alt+Up"),
+			item("Clear Change History", Cmd::ClearChangeHistory),
+		}),
+		sub("Style All Occurrences of Token", styleMenu(Cmd::StyleAllOccurrences, "Using %d Style", 5)),
+		sub("Style One Token", styleMenu(Cmd::StyleOneToken, "Using %d Style", 5)),
+		sub("Clear Style", clearStyles),
+		sub("Jump Up", styleMenu(Cmd::JumpStyleUp, "%d Style", 6)),
+		sub("Jump Down", styleMenu(Cmd::JumpStyleDown, "%d Style", 6)),
+		sub("Copy Styled Text", copyStyles),
 		separator(),
 		sub("Bookmark", {
 			item("Toggle Bookmark", Cmd::ToggleBookmark, "Mod+F2"),
@@ -3330,6 +4479,8 @@ std::vector<MenuItem> Workspace::mainMenu() const {
 		item("Toggle Full Screen", Cmd::FullScreen, key("Mod+Ctrl+F", "F11")),
 		separator(),
 		item("Folder as Workspace", Cmd::ToggleFolderPanel, "Mod+Alt+B"),
+		item("Function List", Cmd::ToggleFunctionList, "Mod+Alt+L"),
+		item("Document Map", Cmd::ToggleDocumentMap, "Mod+Alt+M"),
 		sub("Split View", {
 			item("Move to Other View", Cmd::MoveToOtherView, "Mod+Alt+Right"),
 			item("Clone to Other View", Cmd::CloneToOtherView, "Mod+Alt+Shift+Right"),
@@ -3414,6 +4565,8 @@ std::vector<MenuItem> Workspace::mainMenu() const {
 			item("Font…", Cmd::ChooseFont, key("Mod+T", "")),
 			sub("Tab Size", widths),
 			item("Insert Spaces for Tabs", Cmd::ToggleInsertSpaces),
+			item("Preferences…", Cmd::ShowPreferences, "Mod+,"),
+			item("Shortcut Mapper…", Cmd::ShowShortcutMapper),
 		}),
 		sub("Tools", toolsMenu),
 		sub("Macro", {

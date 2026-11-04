@@ -1,16 +1,34 @@
-# Validation — omapad 0.2.0
+# Validation — omapad 0.3.0
 
-Verified on 2026-11-03 on an Intel Mac and two x86_64 Linux machines running Omarchy.
+Verified on 2026-11-04 on an Intel Mac and two x86_64 Linux machines running Omarchy.
 
 | Target | Build | Core tests | Installed application |
 | --- | --- | --- | --- |
-| macOS / AppKit | CMake Release | 1,228 checks, zero failures | `/Applications/omapad.app`; ad-hoc signature verified |
-| Omarchy machine 1 / GTK3 | GCC, GNUmakefile | 1,234 checks, zero failures | `~/.local/bin/omapad`; resources, icon and desktop entry installed |
-| Omarchy machine 2 / GTK3 | GCC, GNUmakefile | 1,234 checks, zero failures | `~/.local/bin/omapad`; resources, icon and desktop entry installed |
+| macOS / AppKit | CMake Release | 2,094 checks, zero failures | `/Applications/omapad.app`; ad-hoc signature verified |
+| Omarchy machine 1 / GTK3 | GCC, GNUmakefile | 2,101 checks, zero failures | `~/.local/bin/omapad`; resources, icon and desktop entry installed |
+| Omarchy machine 2 / GTK3 | GCC, GNUmakefile | 2,101 checks, zero failures | `~/.local/bin/omapad`; resources, icon and desktop entry installed |
 
 The tests exercise the real Scintilla editing widgets, including encodings, file operations,
-search, split views, clones, scrolling state, folders, session restore, themes and language lexers.
-The totals differ by platform; both suites completed without failures.
+search and PCRE2 regex, split views, clones, folders, session restore, themes, language lexers,
+preferences, shortcuts, completion, hints, all 47 Function List rule files, multi-select, the
+Column Editor, change history, token styles and the Document Map. The totals differ by platform;
+all suites completed without failures.
+
+Added in 0.3.0, checked by driving the real windows with isolated support directories:
+
+- macOS: Function List, Document Map click, completion list and Return to accept, Preferences,
+  and Shortcut Mapper with a captured key saved to settings and shown in the menu.
+- Linux, through GTK's Broadway backend and a headless browser: the same panels, function hints,
+  Function List filter and double-click, Document Map click, drag and wheel, Column Editor form,
+  Shortcut Mapper capture, and a rebound Undo key. The installed binary found its resources.
+
+**Not checked in 0.3.0:** these new windows on a live Wayland session. One Linux machine's session
+was locked and the other was in use, so Broadway stood in for Wayland. That leaves the placement
+of the completion list and hint popups on Hyprland unconfirmed. Word completion's list was seen
+on macOS only; on Linux it's covered by the core tests. Also not exercised: Apple Silicon hardware,
+live compositor-wide theme changes, and every menu command.
+
+## 0.2.0 results
 
 Native application checks used isolated support directories and temporary sample files:
 
@@ -33,6 +51,5 @@ following stack-size re-exec, and the desktop entry's window-class identifier. G
 tracks header dependencies.
 
 The core tests cover theme loading and reload behavior. Live compositor-wide theme changes,
-all menus, file/tab drag-and-drop, printing (not implemented), and Apple Silicon hardware were
-not exercised. Linux window screenshot capture was unavailable in the current remote display
+all menus, file/tab drag-and-drop, and Apple Silicon hardware were not exercised. Printing isn't implemented. Linux window screenshot capture was unavailable in the current remote display
 state; Linux interaction and persistence checks used the running Wayland applications.

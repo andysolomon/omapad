@@ -10,7 +10,7 @@
 	NSComboBox *_with;
 	NSTextField *_filters;
 	NSTextField *_directory;
-	NSButton *_matchCase, *_wholeWord, *_wrap, *_backward, *_inSelection, *_recursive, *_hidden;
+	NSButton *_matchCase, *_wholeWord, *_wrap, *_backward, *_inSelection, *_recursive, *_hidden, *_dotNewline;
 	NSPopUpButton *_mode;
 	NSTextField *_status;
 	NSView *_withRow, *_filesRow, *_directoryRow, *_filesOptionsRow, *_inSelectionRow;
@@ -107,12 +107,16 @@
 	_hidden = [self checkbox:@"In hidden folders"];
 	_mode = [NSPopUpButton new];
 	[_mode addItemsWithTitles:@[@"Normal", @"Extended (\\n, \\r, \\t, \\x…)", @"Regular expression"]];
+	_mode.target = self;
+	_mode.action = @selector(modeChanged:);
+	_dotNewline = [self checkbox:@". matches newline"];
+	_dotNewline.enabled = NO;
 
 	NSView *whatRow = [self labelled:@"Find:" control:_what];
 	_withRow = [self labelled:@"Replace:" control:_with];
 	_filesRow = [self labelled:@"Filters:" control:_filters];
 	_directoryRow = [self row:@[[self labelled:@"Folder:" control:_directory], browse]];
-	NSView *modeRow = [self labelled:@"Mode:" control:_mode];
+	NSView *modeRow = [self row:@[[self labelled:@"Mode:" control:_mode], _dotNewline]];
 	NSView *optionsRow = [self row:@[_matchCase, _wholeWord, _wrap, _backward]];
 	_inSelectionRow = [self row:@[_inSelection]];
 	_filesOptionsRow = [self row:@[_recursive, _hidden]];
@@ -216,6 +220,8 @@
 	if (directory.length) _directory.stringValue = directory;
 }
 
+- (void)modeChanged:(id)sender { _dotNewline.enabled = _mode.indexOfSelectedItem == 2; }
+
 - (omapad::FindOptions)currentOptions {
 	omapad::FindOptions o;
 	o.what = _what.stringValue.UTF8String ?: "";
@@ -226,6 +232,7 @@
 	o.backward = _backward.state == NSControlStateValueOn;
 	o.inSelection = _inSelection.state == NSControlStateValueOn;
 	o.mode = static_cast<omapad::SearchMode>(_mode.indexOfSelectedItem);
+	o.dotMatchesNewline = _dotNewline.state == NSControlStateValueOn;
 	o.directory = _directory.stringValue.stringByExpandingTildeInPath.UTF8String ?: "";
 	o.filters = _filters.stringValue.UTF8String ?: "*";
 	o.recursive = _recursive.state == NSControlStateValueOn;
