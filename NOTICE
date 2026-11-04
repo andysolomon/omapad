@@ -7,7 +7,8 @@ Notepad++ 8.9.8.1 (GPLv3), Copyright (C) Don HO, https://notepad-plus-plus.org/
   resources/langs.model.xml, resources/stylers.model.xml and resources/themes/*.xml are unmodified
   copies from the official release. core/LangTable.inc is generated from the language table in
   PowerEditor/src/ScintillaComponent/ScintillaEditView.cpp at tag v8.9.8.1, commit dd40fe45.
-  This use of GPL data is why omapad as a whole is GPLv3.
+  This use of GPL data is why omapad as a whole is GPLv3. Its license notice is kept in
+  licenses/Notepad++.txt.
 
 Scintilla 5.6.6 and Lexilla 5.5.3, Copyright 1998-2021 Neil Hodgson, https://www.scintilla.org/
   third_party/scintilla and third_party/lexilla, under their own licence (License.txt in each).
