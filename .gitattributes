@@ -1,0 +1,4 @@
+# Bundled files stay byte for byte as they came from upstream.
+/third_party/** -text
+/resources/** -text
+/LICENSE -text
