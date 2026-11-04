@@ -7,6 +7,7 @@
 #include "Workspace.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
@@ -146,6 +147,7 @@ public:
 	SciView &paneView(int pane) override { return panes[pane].sci; }
 	SciView &resultsView() override { return results; }
 	SciView &backgroundView() override { return background; }
+	SciView &printView() override { return printer; }
 	SciView &mapView() override { return map; }
 	int ask(const std::string &title, const std::string &detail, const std::vector<std::string> &buttons) override;
 	bool chooseFilesToOpen(const std::string &start, std::vector<std::string> &out) override;
@@ -174,6 +176,7 @@ public:
 	void themeChanged() override;
 	void menusChanged() override;
 	bool runForm(const std::string &title, std::vector<FormField> &fields) override;
+	bool print(PrintJob &job, const PrintOutput &output, std::string &error) override;
 	void runShortcutMapper() override;
 	void setDocumentMapVisible(bool visible) override;
 	void setFunctionListVisible(bool visible) override;
@@ -240,7 +243,8 @@ private:
 	GtkApplication *application;
 	GtkWidget *window = nullptr;
 	PaneWidgets panes[2];
-	GtkSciView results, background, map;
+	GtkSciView results, background, map, printer;
+	GtkPrintSettings *printSettings = nullptr;
 	GtkWidget *editorPaned = nullptr, *rightPaned = nullptr, *outerPaned = nullptr, *sidePaned = nullptr, *sideBox = nullptr;
 	GtkWidget *menubar = nullptr;
 	GtkAccelGroup *accelGroup = nullptr;
@@ -1299,26 +1303,102 @@ bool App::promptText(const std::string &title, const std::string &label, const s
 	return ok;
 }
 
-bool App::runForm(const std::string &title, std::vector<FormField> &fields) {
-	GtkWidget *dialog = gtk_dialog_new_with_buttons(title.c_str(), GTK_WINDOW(window), GTK_DIALOG_MODAL, "Cancel", GTK_RESPONSE_CANCEL, "OK", GTK_RESPONSE_OK, nullptr);
-	gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_OK);
-	gtk_window_set_default_size(GTK_WINDOW(dialog), 520, 620);
+namespace {
+
+GtkWidget *newFormGrid() {
 	GtkWidget *grid = gtk_grid_new();
 	gtk_grid_set_row_spacing(GTK_GRID(grid), 6);
 	gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
 	gtk_container_set_border_width(GTK_CONTAINER(grid), 14);
+	return grid;
+}
+
+GtkWidget *scrollingForm(GtkWidget *grid) {
+	GtkWidget *scroll = gtk_scrolled_window_new(nullptr, nullptr);
+	gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+	gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(scroll), TRUE);
+	gtk_scrolled_window_set_max_content_height(GTK_SCROLLED_WINDOW(scroll), 620);
+	gtk_container_add(GTK_CONTAINER(scroll), grid);
+	return scroll;
+}
+
+GdkRGBA colourFromHex(const std::string &hex) {
+	const unsigned long value = std::strtoul(hex.c_str(), nullptr, 16);
+	return GdkRGBA{((value >> 16) & 0xFF) / 255.0, ((value >> 8) & 0xFF) / 255.0, (value & 0xFF) / 255.0, 1};
+}
+
+std::string hexFromColour(const GdkRGBA &colour) {
+	char out[8];
+	std::snprintf(out, sizeof out, "%02X%02X%02X", static_cast<int>(colour.red * 255 + 0.5), static_cast<int>(colour.green * 255 + 0.5), static_cast<int>(colour.blue * 255 + 0.5));
+	return out;
+}
+
+struct StyleRowWidgets {
+	GtkWidget *fgOn, *fg, *bgOn, *bg, *bold, *italic, *underline;
+};
+
+GtkWidget *makeColourPair(const char *label, const std::string &hex, GtkWidget *box, GtkWidget *&toggle, GtkWidget *&button) {
+	toggle = gtk_check_button_new_with_label(label);
+	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(toggle), !hex.empty());
+	const GdkRGBA colour = colourFromHex(hex.empty() ? "808080" : hex);
+	button = gtk_color_button_new_with_rgba(&colour);
+	// Picking a colour means using it.
+	g_signal_connect(button, "color-set", G_CALLBACK(+[](GtkColorButton *, gpointer on) { gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(on), TRUE); }), toggle);
+	gtk_box_pack_start(GTK_BOX(box), toggle, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(box), button, FALSE, FALSE, 0);
+	return button;
+}
+
+std::string longTextValue(GtkWidget *view) {
+	GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(view));
+	GtkTextIter start, end;
+	gtk_text_buffer_get_bounds(buffer, &start, &end);
+	char *text = gtk_text_buffer_get_text(buffer, &start, &end, FALSE);
+	std::string out = text;
+	g_free(text);
+	return out;
+}
+
+}  // namespace
+
+bool App::runForm(const std::string &title, std::vector<FormField> &fields) {
+	bool hasPages = false;
+	for (const FormField &field : fields) hasPages = hasPages || field.kind == FormField::Kind::Page;
+	GtkWidget *dialog = gtk_dialog_new_with_buttons(title.c_str(), GTK_WINDOW(window), GTK_DIALOG_MODAL, "Cancel", GTK_RESPONSE_CANCEL, "OK", GTK_RESPONSE_OK, nullptr);
+	gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_OK);
+	// Short forms don't need all the room a long one does.
+	gtk_window_set_default_size(GTK_WINDOW(dialog), hasPages ? 820 : 520, hasPages ? 680 : fields.size() > 8 ? 620 : -1);
+	GtkWidget *notebook = hasPages ? gtk_notebook_new() : nullptr;
+	GtkWidget *grid = newFormGrid();
+	GtkWidget *singleGrid = grid;
+	std::string pageTitle;
+	const auto finishPage = [&]() {
+		GtkWidget *scroll = scrollingForm(grid);
+		gtk_notebook_append_page(GTK_NOTEBOOK(notebook), scroll, gtk_label_new(pageTitle.c_str()));
+	};
 	std::vector<GtkWidget *> controls(fields.size(), nullptr);
+	std::vector<StyleRowWidgets> styleRows(fields.size());
+	std::vector<std::vector<GtkWidget *>> flagBoxes(fields.size());
 	int row = 0;
 	for (size_t i = 0; i < fields.size(); i++) {
 		const FormField &field = fields[i];
 		switch (field.kind) {
+		case FormField::Kind::Page: {
+			if (!pageTitle.empty()) {
+				finishPage();
+				grid = newFormGrid();
+				row = 0;
+			}
+			pageTitle = field.label;
+			break;
+		}
 		case FormField::Kind::Heading: {
 			GtkWidget *heading = gtk_label_new(nullptr);
 			char *markup = g_markup_printf_escaped("<b>%s</b>", field.label.c_str());
 			gtk_label_set_markup(GTK_LABEL(heading), markup);
 			g_free(markup);
 			gtk_label_set_xalign(GTK_LABEL(heading), 0);
-			if (i > 0) gtk_widget_set_margin_top(heading, 12);
+			if (row > 0) gtk_widget_set_margin_top(heading, 12);
 			gtk_grid_attach(GTK_GRID(grid), heading, 0, row++, 2, 1);
 			break;
 		}
@@ -1327,6 +1407,70 @@ bool App::runForm(const std::string &title, std::vector<FormField> &fields) {
 			gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(box), field.value == "1");
 			gtk_grid_attach(GTK_GRID(grid), box, 0, row++, 2, 1);
 			controls[i] = box;
+			break;
+		}
+		case FormField::Kind::LongText: {
+			GtkWidget *label = gtk_label_new(field.label.c_str());
+			gtk_label_set_xalign(GTK_LABEL(label), 0);
+			gtk_grid_attach(GTK_GRID(grid), label, 0, row++, 2, 1);
+			GtkWidget *text = gtk_text_view_new();
+			gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(text), GTK_WRAP_WORD_CHAR);
+			gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(text)), field.value.c_str(), -1);
+			GtkWidget *holder = gtk_scrolled_window_new(nullptr, nullptr);
+			gtk_scrolled_window_set_shadow_type(GTK_SCROLLED_WINDOW(holder), GTK_SHADOW_IN);
+			gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(holder), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+			gtk_widget_set_size_request(holder, -1, 58);
+			gtk_widget_set_hexpand(holder, TRUE);
+			gtk_container_add(GTK_CONTAINER(holder), text);
+			gtk_grid_attach(GTK_GRID(grid), holder, 0, row++, 2, 1);
+			controls[i] = text;
+			break;
+		}
+		case FormField::Kind::StyleRow: {
+			const size_t first = field.value.find(',');
+			const size_t second = first == std::string::npos ? first : field.value.find(',', first + 1);
+			const std::string fg = second == std::string::npos ? "" : field.value.substr(0, first);
+			const std::string bg = second == std::string::npos ? "" : field.value.substr(first + 1, second - first - 1);
+			const int fontStyle = second == std::string::npos ? 0 : std::atoi(field.value.c_str() + second + 1);
+			GtkWidget *label = gtk_label_new(field.label.c_str());
+			gtk_label_set_xalign(GTK_LABEL(label), 0);
+			gtk_grid_attach(GTK_GRID(grid), label, 0, row, 1, 1);
+			GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+			StyleRowWidgets &widgets = styleRows[i];
+			makeColourPair("Text", fg, box, widgets.fgOn, widgets.fg);
+			makeColourPair("Back", bg, box, widgets.bgOn, widgets.bg);
+			const auto fontBox = [&](const char *name, int bit) {
+				GtkWidget *check = gtk_check_button_new_with_label(name);
+				gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(check), (fontStyle & bit) != 0);
+				gtk_box_pack_start(GTK_BOX(box), check, FALSE, FALSE, 0);
+				return check;
+			};
+			widgets.bold = fontBox("Bold", 1);
+			widgets.italic = fontBox("Italic", 2);
+			widgets.underline = fontBox("Underline", 4);
+			gtk_grid_attach(GTK_GRID(grid), box, 1, row++, 1, 1);
+			break;
+		}
+		case FormField::Kind::Flags: {
+			GtkWidget *heading = gtk_label_new(nullptr);
+			char *markup = g_markup_printf_escaped("<b>%s</b>", field.label.c_str());
+			gtk_label_set_markup(GTK_LABEL(heading), markup);
+			g_free(markup);
+			gtk_label_set_xalign(GTK_LABEL(heading), 0);
+			if (row > 0) gtk_widget_set_margin_top(heading, 8);
+			gtk_grid_attach(GTK_GRID(grid), heading, 0, row++, 2, 1);
+			GtkWidget *boxes = gtk_grid_new();
+			gtk_grid_set_column_spacing(GTK_GRID(boxes), 12);
+			const long value = std::strtol(field.value.c_str(), nullptr, 10);
+			int index = 0;
+			for (const auto &choice : field.choices) {
+				GtkWidget *check = gtk_check_button_new_with_label(choice.second.c_str());
+				gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(check), (value & std::strtol(choice.first.c_str(), nullptr, 10)) != 0);
+				gtk_grid_attach(GTK_GRID(boxes), check, index % 5, index / 5, 1, 1);
+				flagBoxes[i].push_back(check);
+				index++;
+			}
+			gtk_grid_attach(GTK_GRID(grid), boxes, 0, row++, 2, 1);
 			break;
 		}
 		default: {
@@ -1361,13 +1505,13 @@ bool App::runForm(const std::string &title, std::vector<FormField> &fields) {
 		}
 		}
 	}
-	GtkWidget *scroll = gtk_scrolled_window_new(nullptr, nullptr);
-	gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
-	gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(scroll), TRUE);
-	gtk_scrolled_window_set_max_content_height(GTK_SCROLLED_WINDOW(scroll), 620);
-	gtk_container_add(GTK_CONTAINER(scroll), grid);
 	GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
-	gtk_box_pack_start(GTK_BOX(content), scroll, TRUE, TRUE, 0);
+	if (hasPages) {
+		if (!pageTitle.empty()) finishPage();
+		gtk_box_pack_start(GTK_BOX(content), notebook, TRUE, TRUE, 0);
+	} else {
+		gtk_box_pack_start(GTK_BOX(content), scrollingForm(singleGrid), TRUE, TRUE, 0);
+	}
 	gtk_widget_show_all(content);
 	dialogDepth++;
 	const bool ok = gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK;
@@ -1377,7 +1521,29 @@ bool App::runForm(const std::string &title, std::vector<FormField> &fields) {
 			FormField &field = fields[i];
 			GtkWidget *control = controls[i];
 			switch (field.kind) {
-			case FormField::Kind::Heading: break;
+			case FormField::Kind::Heading:
+			case FormField::Kind::Page: break;
+			case FormField::Kind::LongText: field.value = longTextValue(control); break;
+			case FormField::Kind::StyleRow: {
+				const StyleRowWidgets &widgets = styleRows[i];
+				const auto colourOf = [](GtkWidget *on, GtkWidget *button) {
+					if (!gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(on))) return std::string();
+					GdkRGBA colour;
+					gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(button), &colour);
+					return hexFromColour(colour);
+				};
+				const auto isOn = [](GtkWidget *check) { return gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(check)) != FALSE; };
+				const int fontStyle = (isOn(widgets.bold) ? 1 : 0) | (isOn(widgets.italic) ? 2 : 0) | (isOn(widgets.underline) ? 4 : 0);
+				field.value = colourOf(widgets.fgOn, widgets.fg) + "," + colourOf(widgets.bgOn, widgets.bg) + "," + std::to_string(fontStyle);
+				break;
+			}
+			case FormField::Kind::Flags: {
+				long value = 0;
+				for (size_t choice = 0; choice < field.choices.size(); choice++)
+					if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(flagBoxes[i][choice]))) value |= std::strtol(field.choices[choice].first.c_str(), nullptr, 10);
+				field.value = std::to_string(value);
+				break;
+			}
 			case FormField::Kind::Bool: field.value = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(control)) ? "1" : "0"; break;
 			case FormField::Kind::Int:
 				gtk_spin_button_update(GTK_SPIN_BUTTON(control));
@@ -1393,6 +1559,98 @@ bool App::runForm(const std::string &title, std::vector<FormField> &fields) {
 		}
 	}
 	gtk_widget_destroy(dialog);
+	return ok;
+}
+
+#pragma mark - Printing
+
+namespace {
+
+struct PrintRun {
+	PrintJob *job;
+	double scale;  // From Scintilla's units to points. Pango sizes fonts for the screen's resolution.
+};
+
+void drawCaption(cairo_t *cr, GtkPrintContext *context, const PrintPageText &text, double y, double width) {
+	PangoLayout *layout = gtk_print_context_create_pango_layout(context);
+	PangoFontDescription *font = pango_font_description_from_string("sans");
+	pango_font_description_set_size(font, PrintJob::kCaptionPoints * PANGO_SCALE);
+	pango_layout_set_font_description(layout, font);
+	pango_font_description_free(font);
+	cairo_set_source_rgb(cr, 0, 0, 0);
+	const auto draw = [&](const std::string &part, double align) {
+		if (part.empty()) return;
+		pango_layout_set_text(layout, part.c_str(), -1);
+		int textWidth = 0;
+		pango_layout_get_size(layout, &textWidth, nullptr);
+		cairo_move_to(cr, (width - textWidth / static_cast<double>(PANGO_SCALE)) * align, y);
+		pango_cairo_show_layout(cr, layout);
+	};
+	draw(text.left, 0);
+	draw(text.middle, 0.5);
+	draw(text.right, 1);
+	g_object_unref(layout);
+}
+
+}  // namespace
+
+bool App::print(PrintJob &job, const PrintOutput &output, std::string &error) {
+	GtkPrintOperation *operation = gtk_print_operation_new();
+	gtk_print_operation_set_unit(operation, GTK_UNIT_POINTS);
+	gtk_print_operation_set_job_name(operation, job.settings().title.c_str());
+	GtkPageSetup *setup = gtk_page_setup_new();
+	const PrintOptions &options = job.settings();
+	gtk_page_setup_set_top_margin(setup, options.marginTop, GTK_UNIT_MM);
+	gtk_page_setup_set_bottom_margin(setup, options.marginBottom, GTK_UNIT_MM);
+	gtk_page_setup_set_left_margin(setup, options.marginLeft, GTK_UNIT_MM);
+	gtk_page_setup_set_right_margin(setup, options.marginRight, GTK_UNIT_MM);
+	gtk_print_operation_set_default_page_setup(operation, setup);
+	g_object_unref(setup);
+	if (printSettings) gtk_print_operation_set_print_settings(operation, printSettings);
+
+	double resolution = gdk_screen_get_resolution(gdk_screen_get_default());
+	if (resolution <= 0) resolution = 96;
+	PrintRun run{&job, 72.0 / resolution};
+	g_signal_connect(operation, "begin-print", G_CALLBACK(+[](GtkPrintOperation *op, GtkPrintContext *context, gpointer data) {
+		auto *r = static_cast<PrintRun *>(data);
+		cairo_t *cr = gtk_print_context_get_cairo_context(context);
+		cairo_save(cr);
+		cairo_scale(cr, r->scale, r->scale);
+		r->job->paginate(cr, static_cast<int>(gtk_print_context_get_width(context) / r->scale), static_cast<int>(gtk_print_context_get_height(context) / r->scale));
+		cairo_restore(cr);
+		gtk_print_operation_set_n_pages(op, r->job->pageCount());
+	}), &run);
+	g_signal_connect(operation, "draw-page", G_CALLBACK(+[](GtkPrintOperation *, GtkPrintContext *context, gint page, gpointer data) {
+		auto *r = static_cast<PrintRun *>(data);
+		cairo_t *cr = gtk_print_context_get_cairo_context(context);
+		const double width = gtk_print_context_get_width(context);
+		const double height = gtk_print_context_get_height(context);
+		cairo_save(cr);
+		cairo_scale(cr, r->scale, r->scale);
+		r->job->drawPage(cr, page, static_cast<int>(width / r->scale), static_cast<int>(height / r->scale));
+		cairo_restore(cr);
+		if (r->job->headerHeight() > 0) drawCaption(cr, context, r->job->header(page), 0, width);
+		if (r->job->footerHeight() > 0) drawCaption(cr, context, r->job->footer(page), height - r->job->footerHeight() * r->scale + 2, width);
+	}), &run);
+
+	const bool toFile = !output.pdfPath.empty();
+	if (toFile) gtk_print_operation_set_export_filename(operation, output.pdfPath.c_str());
+	GError *failure = nullptr;
+	dialogDepth++;
+	const GtkPrintOperationResult result = gtk_print_operation_run(operation,
+		toFile ? GTK_PRINT_OPERATION_ACTION_EXPORT : output.showDialog ? GTK_PRINT_OPERATION_ACTION_PRINT_DIALOG : GTK_PRINT_OPERATION_ACTION_PRINT,
+		GTK_WINDOW(window), &failure);
+	dialogDepth--;
+	bool ok = true;
+	if (result == GTK_PRINT_OPERATION_RESULT_ERROR) {
+		error = failure ? failure->message : "Printing failed.";
+		ok = false;
+	} else if (result == GTK_PRINT_OPERATION_RESULT_APPLY) {
+		if (printSettings) g_object_unref(printSettings);
+		printSettings = GTK_PRINT_SETTINGS(g_object_ref(gtk_print_operation_get_print_settings(operation)));
+	}
+	if (failure) g_error_free(failure);
+	g_object_unref(operation);
 	return ok;
 }
 
@@ -1755,6 +2013,8 @@ void App::build() {
 	}), this);
 	background.widget = scintilla_new();
 	g_object_ref_sink(background.widget);
+	printer.widget = scintilla_new();
+	g_object_ref_sink(printer.widget);
 	buildDocumentMap();
 
 	editorPaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);

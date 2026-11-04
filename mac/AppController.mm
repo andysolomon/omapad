@@ -138,11 +138,12 @@ struct MacSciView : SciView {
 
 struct MacHost : Host {
 	__unsafe_unretained AppController *controller = nil;
-	MacSciView panes[2], results, background, map;
+	MacSciView panes[2], results, background, map, printer;
 
 	SciView &paneView(int pane) override { return panes[pane]; }
 	SciView &resultsView() override { return results; }
 	SciView &backgroundView() override { return background; }
+	SciView &printView() override { return printer; }
 	SciView &mapView() override { return map; }
 
 	int ask(const std::string &title, const std::string &detail, const std::vector<std::string> &buttons) override {
@@ -225,6 +226,7 @@ struct MacHost : Host {
 	void menusChanged() override { [controller buildMenus]; }
 	bool runForm(const std::string &title, std::vector<FormField> &fields) override { return OmaRunForm(toNS(title), fields); }
 	void runShortcutMapper() override { OmaRunShortcutMapper(*[controller workspacePointer]); }
+	bool print(PrintJob &job, const PrintOutput &output, std::string &error) override { return OmaRunPrint(job, output, error); }
 	void setDocumentMapVisible(bool visible) override { [controller hostDocumentMapVisible:visible]; }
 	void setFunctionListVisible(bool visible) override { [controller hostFunctionListVisible:visible]; }
 	void functionListChanged() override { [controller hostFunctionListChanged]; }
@@ -260,6 +262,7 @@ struct MacHost : Host {
 	TabBar *_tabBars[2];
 	ScintillaView *_results;
 	ScintillaView *_background;
+	ScintillaView *_printer;
 	OmaSciDelegate *_delegates[3];
 	NSSplitView *_outer;       // Folder panel on the left, everything else on the right.
 	NSSplitView *_rightSplit;  // Editors above results.
@@ -291,6 +294,7 @@ struct MacHost : Host {
 		_host->panes[1].view = _editors[1];
 		_host->results.view = _results;
 		_host->background.view = _background;
+		_host->printer.view = _printer;
 		_host->map.view = _map;
 		_findPanel = [[FindPanel alloc] initWithWorkspace:_workspace.get()];
 		__weak AppController *weakSelf = self;
@@ -387,6 +391,7 @@ struct MacHost : Host {
 	_delegates[2] = resultsDelegate;
 	_results.delegate = resultsDelegate;
 	_background = [[ScintillaView alloc] initWithFrame:NSMakeRect(0, 0, 100, 100)];
+	_printer = [[ScintillaView alloc] initWithFrame:NSMakeRect(0, 0, 100, 100)];
 
 	_rightSplit = [NSSplitView new];
 	_rightSplit.vertical = NO;

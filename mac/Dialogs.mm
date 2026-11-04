@@ -120,9 +120,153 @@ void OmaApplyShortcut(const std::string &shortcut, NSMenuItem *item) {
 - (BOOL)isFlipped { return YES; }
 @end
 
+static NSColor *colourFromHex(const std::string &hex) {
+	const unsigned long value = std::strtoul(hex.c_str(), nullptr, 16);
+	return [NSColor colorWithSRGBRed:((value >> 16) & 0xFF) / 255.0 green:((value >> 8) & 0xFF) / 255.0 blue:(value & 0xFF) / 255.0 alpha:1];
+}
+
+static std::string hexFromColour(NSColor *colour) {
+	NSColor *rgb = [colour colorUsingColorSpace:NSColorSpace.sRGBColorSpace] ?: NSColor.blackColor;
+	char out[8];
+	snprintf(out, sizeof out, "%02X%02X%02X", static_cast<int>(rgb.redComponent * 255 + 0.5), static_cast<int>(rgb.greenComponent * 255 + 0.5), static_cast<int>(rgb.blueComponent * 255 + 0.5));
+	return out;
+}
+
+// A style's colours and font style on one row.
+@interface OmaStyleRow : NSStackView
+@property(nonatomic, strong) NSButton *fgOn, *bgOn, *bold, *italic, *underline;
+@property(nonatomic, strong) NSColorWell *fg, *bg;
+@end
+@implementation OmaStyleRow
+- (instancetype)initWithLabel:(NSString *)label value:(const std::string &)value {
+	if ((self = [super initWithFrame:NSZeroRect])) {
+		const size_t first = value.find(',');
+		const size_t second = first == std::string::npos ? first : value.find(',', first + 1);
+		const std::string fgHex = second == std::string::npos ? "" : value.substr(0, first);
+		const std::string bgHex = second == std::string::npos ? "" : value.substr(first + 1, second - first - 1);
+		const int fontStyle = second == std::string::npos ? 0 : std::atoi(value.c_str() + second + 1);
+
+		NSTextField *name = [NSTextField labelWithString:label];
+		[name.widthAnchor constraintEqualToConstant:130].active = YES;
+		_fgOn = [NSButton checkboxWithTitle:@"Text" target:nil action:nil];
+		_fgOn.state = fgHex.empty() ? NSControlStateValueOff : NSControlStateValueOn;
+		_fg = [self wellWithHex:fgHex];
+		_bgOn = [NSButton checkboxWithTitle:@"Back" target:nil action:nil];
+		_bgOn.state = bgHex.empty() ? NSControlStateValueOff : NSControlStateValueOn;
+		_bg = [self wellWithHex:bgHex];
+		const auto box = [&](NSString *title, int bit) {
+			NSButton *button = [NSButton checkboxWithTitle:title target:nil action:nil];
+			button.state = (fontStyle & bit) ? NSControlStateValueOn : NSControlStateValueOff;
+			return button;
+		};
+		_bold = box(@"Bold", 1);
+		_italic = box(@"Italic", 2);
+		_underline = box(@"Underline", 4);
+		self.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+		self.alignment = NSLayoutAttributeCenterY;
+		self.spacing = 8;
+		for (NSView *view in @[name, _fgOn, _fg, _bgOn, _bg, _bold, _italic, _underline]) [self addArrangedSubview:view];
+	}
+	return self;
+}
+- (NSColorWell *)wellWithHex:(const std::string &)hex {
+	NSColorWell *well = [NSColorWell new];
+	well.color = hex.empty() ? NSColor.grayColor : colourFromHex(hex);
+	well.target = self;
+	well.action = @selector(picked:);
+	[well.widthAnchor constraintEqualToConstant:38].active = YES;
+	[well.heightAnchor constraintEqualToConstant:20].active = YES;
+	return well;
+}
+// Picking a colour means using it.
+- (void)picked:(NSColorWell *)well { (well == _fg ? _fgOn : _bgOn).state = NSControlStateValueOn; }
+- (std::string)value {
+	const int fontStyle = (_bold.state == NSControlStateValueOn ? 1 : 0) | (_italic.state == NSControlStateValueOn ? 2 : 0) | (_underline.state == NSControlStateValueOn ? 4 : 0);
+	return (_fgOn.state == NSControlStateValueOn ? hexFromColour(_fg.color) : std::string()) + "," + (_bgOn.state == NSControlStateValueOn ? hexFromColour(_bg.color) : std::string()) + "," + std::to_string(fontStyle);
+}
+@end
+
+// A heading over a grid of checkboxes, one per choice.
+@interface OmaFlagsGrid : NSStackView
+@property(nonatomic, strong) NSMutableArray<NSButton *> *boxes;
+@end
+@implementation OmaFlagsGrid
+- (instancetype)initWithField:(const FormField &)field {
+	if ((self = [super initWithFrame:NSZeroRect])) {
+		self.orientation = NSUserInterfaceLayoutOrientationVertical;
+		self.alignment = NSLayoutAttributeLeading;
+		self.spacing = 4;
+		NSTextField *title = [NSTextField labelWithString:toNS(field.label)];
+		title.font = [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
+		[self addArrangedSubview:title];
+		_boxes = [NSMutableArray array];
+		const long value = std::strtol(field.value.c_str(), nullptr, 10);
+		const NSUInteger columns = 5;
+		NSMutableArray<NSArray<NSView *> *> *rows = [NSMutableArray array];
+		NSMutableArray<NSView *> *row = nil;
+		for (const auto &choice : field.choices) {
+			NSButton *box = [NSButton checkboxWithTitle:toNS(choice.second) target:nil action:nil];
+			box.state = (value & std::strtol(choice.first.c_str(), nullptr, 10)) ? NSControlStateValueOn : NSControlStateValueOff;
+			[_boxes addObject:box];
+			if (!row || row.count == columns) {
+				row = [NSMutableArray array];
+				[rows addObject:row];
+			}
+			[row addObject:box];
+		}
+		while (row && row.count < columns) [row addObject:[NSGridCell emptyContentView]];
+		[self addArrangedSubview:[NSGridView gridViewWithViews:rows]];
+	}
+	return self;
+}
+- (std::string)valueForField:(const FormField &)field {
+	long value = 0;
+	for (size_t i = 0; i < field.choices.size(); i++)
+		if (_boxes[i].state == NSControlStateValueOn) value |= std::strtol(field.choices[i].first.c_str(), nullptr, 10);
+	return std::to_string(value);
+}
+@end
+
+// Puts a column of rows in a scrolling view that fills whatever holds it.
+static NSScrollView *OmaScrollingRows(NSStackView *rows) {
+	OmaFlippedView *document = [OmaFlippedView new];
+	document.translatesAutoresizingMaskIntoConstraints = NO;
+	[document addSubview:rows];
+	NSScrollView *scroll = [NSScrollView new];
+	scroll.documentView = document;
+	scroll.hasVerticalScroller = YES;
+	scroll.autohidesScrollers = YES;
+	scroll.borderType = NSNoBorder;
+	scroll.drawsBackground = NO;
+	scroll.translatesAutoresizingMaskIntoConstraints = NO;
+	[NSLayoutConstraint activateConstraints:@[
+		[document.topAnchor constraintEqualToAnchor:scroll.contentView.topAnchor],
+		[document.leadingAnchor constraintEqualToAnchor:scroll.contentView.leadingAnchor],
+		[document.trailingAnchor constraintEqualToAnchor:scroll.contentView.trailingAnchor],
+		[rows.topAnchor constraintEqualToAnchor:document.topAnchor],
+		[rows.leadingAnchor constraintEqualToAnchor:document.leadingAnchor],
+		[rows.trailingAnchor constraintLessThanOrEqualToAnchor:document.trailingAnchor],
+		[rows.bottomAnchor constraintEqualToAnchor:document.bottomAnchor],
+	]];
+	return scroll;
+}
+
+static NSStackView *OmaNewFormRows() {
+	NSStackView *rows = [NSStackView new];
+	rows.orientation = NSUserInterfaceLayoutOrientationVertical;
+	rows.alignment = NSLayoutAttributeLeading;
+	rows.spacing = 8;
+	rows.edgeInsets = NSEdgeInsetsMake(14, 18, 14, 18);
+	rows.translatesAutoresizingMaskIntoConstraints = NO;
+	return rows;
+}
+
 BOOL OmaRunForm(NSString *title, std::vector<FormField> &fields) {
+	bool hasPages = false;
+	for (const FormField &field : fields) hasPages = hasPages || field.kind == FormField::Kind::Page;
+	const CGFloat formWidth = hasPages ? 780 : 520;
 	OmaFormDelegate *delegate = [OmaFormDelegate new];
-	NSPanel *window = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 520, 580)
+	NSPanel *window = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, formWidth, 580)
 	                                             styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
 	                                               backing:NSBackingStoreBuffered
 	                                                 defer:NO];
@@ -132,12 +276,24 @@ BOOL OmaRunForm(NSString *title, std::vector<FormField> &fields) {
 	window.minSize = NSMakeSize(420, 240);
 
 	NSMutableArray<NSView *> *controls = [NSMutableArray array];  // One per field, or NSNull's stand-in.
-	NSStackView *rows = [NSStackView new];
-	rows.orientation = NSUserInterfaceLayoutOrientationVertical;
-	rows.alignment = NSLayoutAttributeLeading;
-	rows.spacing = 8;
-	rows.edgeInsets = NSEdgeInsetsMake(14, 18, 14, 18);
-	rows.translatesAutoresizingMaskIntoConstraints = NO;
+	NSStackView *rows = OmaNewFormRows();
+	NSTabView *tabs = hasPages ? [NSTabView new] : nil;
+	const auto addPage = [&](NSString *label, NSStackView *pageRows) {
+		NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:label];
+		item.label = label;
+		NSView *holder = [NSView new];
+		NSScrollView *pageScroll = OmaScrollingRows(pageRows);
+		[holder addSubview:pageScroll];
+		[NSLayoutConstraint activateConstraints:@[
+			[pageScroll.topAnchor constraintEqualToAnchor:holder.topAnchor],
+			[pageScroll.leadingAnchor constraintEqualToAnchor:holder.leadingAnchor],
+			[pageScroll.trailingAnchor constraintEqualToAnchor:holder.trailingAnchor],
+			[pageScroll.bottomAnchor constraintEqualToAnchor:holder.bottomAnchor],
+		]];
+		item.view = holder;
+		[tabs addTabViewItem:item];
+	};
+	NSString *pageTitle = nil;
 
 	const auto labelled = [](NSString *text, NSView *control) {
 		NSTextField *label = [NSTextField labelWithString:text];
@@ -157,7 +313,7 @@ BOOL OmaRunForm(NSString *title, std::vector<FormField> &fields) {
 		case FormField::Kind::Heading: {
 			NSTextField *heading = [NSTextField labelWithString:toNS(field.label)];
 			heading.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
-			if (i > 0) [rows setCustomSpacing:18 afterView:rows.arrangedSubviews.lastObject];
+			if (rows.arrangedSubviews.count > 0) [rows setCustomSpacing:18 afterView:rows.arrangedSubviews.lastObject];
 			[rows addArrangedSubview:heading];
 			break;
 		}
@@ -202,6 +358,55 @@ BOOL OmaRunForm(NSString *title, std::vector<FormField> &fields) {
 			control = text;
 			break;
 		}
+		case FormField::Kind::Page: {
+			// The rows so far belong to the page before.
+			if (pageTitle) {
+				addPage(pageTitle, rows);
+				rows = OmaNewFormRows();
+			}
+			pageTitle = toNS(field.label);
+			break;
+		}
+		case FormField::Kind::LongText: {
+			NSTextField *label = [NSTextField labelWithString:toNS(field.label)];
+			NSTextView *text = [NSTextView new];
+			text.string = toNS(field.value);
+			text.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
+			text.richText = NO;
+			text.automaticQuoteSubstitutionEnabled = NO;
+			text.automaticDashSubstitutionEnabled = NO;
+			text.automaticTextReplacementEnabled = NO;
+			text.automaticSpellingCorrectionEnabled = NO;
+			text.verticallyResizable = YES;
+			text.textContainer.widthTracksTextView = YES;
+			text.autoresizingMask = NSViewWidthSizable;
+			NSScrollView *holder = [NSScrollView new];
+			holder.documentView = text;
+			holder.hasVerticalScroller = YES;
+			holder.autohidesScrollers = YES;
+			holder.borderType = NSBezelBorder;
+			[holder.widthAnchor constraintEqualToConstant:formWidth - 60].active = YES;
+			[holder.heightAnchor constraintEqualToConstant:58].active = YES;
+			NSStackView *column = [NSStackView stackViewWithViews:@[label, holder]];
+			column.orientation = NSUserInterfaceLayoutOrientationVertical;
+			column.alignment = NSLayoutAttributeLeading;
+			column.spacing = 3;
+			[rows addArrangedSubview:column];
+			control = text;
+			break;
+		}
+		case FormField::Kind::StyleRow: {
+			OmaStyleRow *row = [[OmaStyleRow alloc] initWithLabel:toNS(field.label) value:field.value];
+			[rows addArrangedSubview:row];
+			control = row;
+			break;
+		}
+		case FormField::Kind::Flags: {
+			OmaFlagsGrid *grid = [[OmaFlagsGrid alloc] initWithField:field];
+			[rows addArrangedSubview:grid];
+			control = grid;
+			break;
+		}
 		case FormField::Kind::Choice: {
 			NSPopUpButton *popup = [NSPopUpButton new];
 			for (const auto &choice : field.choices) {
@@ -216,16 +421,14 @@ BOOL OmaRunForm(NSString *title, std::vector<FormField> &fields) {
 		[controls addObject:control];
 	}
 
-	OmaFlippedView *document = [OmaFlippedView new];
-	document.translatesAutoresizingMaskIntoConstraints = NO;
-	[document addSubview:rows];
-	NSScrollView *scroll = [NSScrollView new];
-	scroll.documentView = document;
-	scroll.hasVerticalScroller = YES;
-	scroll.autohidesScrollers = YES;
-	scroll.borderType = NSNoBorder;
-	scroll.drawsBackground = NO;
-	scroll.translatesAutoresizingMaskIntoConstraints = NO;
+	NSView *main;
+	if (hasPages) {
+		if (pageTitle) addPage(pageTitle, rows);
+		tabs.translatesAutoresizingMaskIntoConstraints = NO;
+		main = tabs;
+	} else {
+		main = OmaScrollingRows(rows);
+	}
 
 	NSButton *ok = [NSButton buttonWithTitle:@"OK" target:delegate action:@selector(accept:)];
 	ok.keyEquivalent = @"\r";
@@ -236,28 +439,22 @@ BOOL OmaRunForm(NSString *title, std::vector<FormField> &fields) {
 	buttons.translatesAutoresizingMaskIntoConstraints = NO;
 
 	NSView *content = window.contentView;
-	[content addSubview:scroll];
+	[content addSubview:main];
 	[content addSubview:buttons];
+	const CGFloat inset = hasPages ? 12 : 0;
 	[NSLayoutConstraint activateConstraints:@[
-		[scroll.topAnchor constraintEqualToAnchor:content.topAnchor],
-		[scroll.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
-		[scroll.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
-		[scroll.bottomAnchor constraintEqualToAnchor:buttons.topAnchor constant:-10],
+		[main.topAnchor constraintEqualToAnchor:content.topAnchor constant:inset],
+		[main.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:inset],
+		[main.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-inset],
+		[main.bottomAnchor constraintEqualToAnchor:buttons.topAnchor constant:-10],
 		[buttons.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-14],
 		[buttons.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-12],
-		[document.topAnchor constraintEqualToAnchor:scroll.contentView.topAnchor],
-		[document.leadingAnchor constraintEqualToAnchor:scroll.contentView.leadingAnchor],
-		[document.trailingAnchor constraintEqualToAnchor:scroll.contentView.trailingAnchor],
-		[rows.topAnchor constraintEqualToAnchor:document.topAnchor],
-		[rows.leadingAnchor constraintEqualToAnchor:document.leadingAnchor],
-		[rows.trailingAnchor constraintLessThanOrEqualToAnchor:document.trailingAnchor],
-		[rows.bottomAnchor constraintEqualToAnchor:document.bottomAnchor],
 	]];
 
 	// Short forms don't need all the room a long one does.
 	[content layoutSubtreeIfNeeded];
-	const CGFloat wanted = std::min<CGFloat>(rows.fittingSize.height + 54, 620);
-	[window setContentSize:NSMakeSize(520, wanted)];
+	const CGFloat wanted = hasPages ? 640 : std::min<CGFloat>(rows.fittingSize.height + 54, 620);
+	[window setContentSize:NSMakeSize(formWidth, wanted)];
 	[window center];
 
 	const NSInteger response = [NSApp runModalForWindow:window];
@@ -270,7 +467,11 @@ BOOL OmaRunForm(NSString *title, std::vector<FormField> &fields) {
 		FormField &field = fields[i];
 		NSView *control = controls[i];
 		switch (field.kind) {
-		case FormField::Kind::Heading: break;
+		case FormField::Kind::Heading:
+		case FormField::Kind::Page: break;
+		case FormField::Kind::LongText: field.value = toStd(((NSTextView *)control).string); break;
+		case FormField::Kind::StyleRow: field.value = [(OmaStyleRow *)control value]; break;
+		case FormField::Kind::Flags: field.value = [(OmaFlagsGrid *)control valueForField:field]; break;
 		case FormField::Kind::Bool: field.value = ((NSButton *)control).state == NSControlStateValueOn ? "1" : "0"; break;
 		case FormField::Kind::Int: {
 			const NSInteger value = std::min<NSInteger>(std::max<NSInteger>(((NSTextField *)control).integerValue, field.minimum), field.maximum);
@@ -548,4 +749,106 @@ BOOL OmaRunForm(NSString *title, std::vector<FormField> &fields) {
 void OmaRunShortcutMapper(Workspace &workspace) {
 	OmaShortcutMapper *mapper = [[OmaShortcutMapper alloc] initWithWorkspace:&workspace];
 	[mapper run];
+}
+
+#pragma mark - Printing
+
+// One tall view with each page below the last, as AppKit's printing expects.
+@interface OmaPrintView : NSView
+- (instancetype)initWithJob:(omapad::PrintJob *)job;
+@end
+
+@implementation OmaPrintView {
+	omapad::PrintJob *_job;
+	NSSize _paper;
+}
+
+- (instancetype)initWithJob:(omapad::PrintJob *)job {
+	if ((self = [super initWithFrame:NSMakeRect(0, 0, 612, 792)])) _job = job;
+	return self;
+}
+
+- (BOOL)isFlipped { return YES; }
+
+static const CGFloat kPointsPerMillimetre = 72.0 / 25.4;
+
+- (int)bodyWidth {
+	const omapad::PrintOptions &o = _job->settings();
+	return std::max(36, static_cast<int>(_paper.width - (o.marginLeft + o.marginRight) * kPointsPerMillimetre));
+}
+
+- (int)bodyHeight {
+	const omapad::PrintOptions &o = _job->settings();
+	return std::max(36, static_cast<int>(_paper.height - (o.marginTop + o.marginBottom) * kPointsPerMillimetre));
+}
+
+- (BOOL)knowsPageRange:(NSRangePointer)range {
+	_paper = NSPrintOperation.currentOperation.printInfo.paperSize;
+	// Pages are worked out on a throwaway surface, because there's nothing to draw on yet.
+	CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+	CGContextRef measuring = CGBitmapContextCreate(nullptr, 16, 16, 8, 0, space, kCGImageAlphaPremultipliedLast);
+	CGColorSpaceRelease(space);
+	_job->paginate(measuring, [self bodyWidth], [self bodyHeight]);
+	CGContextRelease(measuring);
+	range->location = 1;
+	range->length = _job->pageCount();
+	[self setFrameSize:NSMakeSize(_paper.width, _paper.height * _job->pageCount())];
+	return YES;
+}
+
+- (NSRect)rectForPage:(NSInteger)page { return NSMakeRect(0, _paper.height * (page - 1), _paper.width, _paper.height); }
+
+- (void)drawCaption:(const omapad::PrintPageText &)text atY:(CGFloat)y width:(CGFloat)width {
+	NSDictionary *attributes = @{
+		NSFontAttributeName: [NSFont systemFontOfSize:omapad::PrintJob::kCaptionPoints],
+		NSForegroundColorAttributeName: NSColor.blackColor,
+	};
+	NSString *left = toNS(text.left), *middle = toNS(text.middle), *right = toNS(text.right);
+	[left drawAtPoint:NSMakePoint(0, y) withAttributes:attributes];
+	[middle drawAtPoint:NSMakePoint((width - [middle sizeWithAttributes:attributes].width) / 2, y) withAttributes:attributes];
+	[right drawAtPoint:NSMakePoint(width - [right sizeWithAttributes:attributes].width, y) withAttributes:attributes];
+}
+
+- (void)drawRect:(NSRect)dirty {
+	const NSInteger page = NSPrintOperation.currentOperation.currentPage - 1;
+	if (page < 0 || page >= _job->pageCount()) return;
+	const omapad::PrintOptions &o = _job->settings();
+	const int width = [self bodyWidth], height = [self bodyHeight];
+	CGContextRef context = NSGraphicsContext.currentContext.CGContext;
+	CGContextSaveGState(context);
+	CGContextTranslateCTM(context, o.marginLeft * kPointsPerMillimetre, _paper.height * page + o.marginTop * kPointsPerMillimetre);
+	_job->drawPage(context, static_cast<int>(page), width, height);
+	if (_job->headerHeight() > 0) [self drawCaption:_job->header(static_cast<int>(page)) atY:0 width:width];
+	if (_job->footerHeight() > 0) [self drawCaption:_job->footer(static_cast<int>(page)) atY:height - _job->footerHeight() + 6 width:width];
+	CGContextRestoreGState(context);
+}
+
+@end
+
+BOOL OmaRunPrint(omapad::PrintJob &job, const omapad::PrintOutput &output, std::string &error) {
+	NSPrintInfo *info = [NSPrintInfo.sharedPrintInfo copy];
+	// The view lays out its own margins, since they come from the preferences.
+	info.leftMargin = info.rightMargin = info.topMargin = info.bottomMargin = 0;
+	info.horizontalPagination = NSPrintingPaginationModeClip;
+	info.verticalPagination = NSPrintingPaginationModeClip;
+	info.horizontallyCentered = NO;
+	info.verticallyCentered = NO;
+	const bool toFile = !output.pdfPath.empty();
+	if (toFile) {
+		info.jobDisposition = NSPrintSaveJob;
+		info.dictionary[NSPrintJobSavingURL] = [NSURL fileURLWithPath:toNS(output.pdfPath)];
+	}
+	OmaPrintView *view = [[OmaPrintView alloc] initWithJob:&job];
+	NSPrintOperation *operation = [NSPrintOperation printOperationWithView:view printInfo:info];
+	operation.jobTitle = toNS(job.settings().title);
+	operation.showsPrintPanel = output.showDialog;
+	operation.showsProgressPanel = !toFile;
+	operation.printPanel.options |= NSPrintPanelShowsPaperSize | NSPrintPanelShowsOrientation | NSPrintPanelShowsScaling;
+	const BOOL done = [operation runOperation];
+	// The only way to tell a failure from cancelling is that a file was asked for and isn't there.
+	if (toFile && (!done || ![NSFileManager.defaultManager fileExistsAtPath:toNS(output.pdfPath)])) {
+		error = "The PDF wasn't written.";
+		return NO;
+	}
+	return YES;
 }

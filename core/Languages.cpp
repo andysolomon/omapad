@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <set>
 #include <sstream>
 
@@ -188,12 +190,95 @@ LanguageCatalog::LanguageCatalog(const std::string &resourceDirectory) : directo
 	std::sort(menuLanguages.begin(), menuLanguages.end(), [](const Language *a, const Language *b) {
 		return lowercase(a->displayName) < lowercase(b->displayName);
 	});
+	builtinExtensions = languagesByExtension;
+	loadUserLanguages(std::string());
 
 	defaultTheme = loadThemeFile((fs::path(directory) / "stylers.model.xml").string());
 	std::error_code error;
 	for (const auto &entry : fs::directory_iterator(fs::path(directory) / "themes", error))
 		if (entry.path().extension() == ".xml") themes.push_back(entry.path().stem().string());
 	std::sort(themes.begin(), themes.end(), [](const std::string &a, const std::string &b) { return lowercase(a) < lowercase(b); });
+}
+
+void LanguageCatalog::loadUserLanguages(const std::string &personalDirectory) {
+	struct Found {
+		std::shared_ptr<const UserLanguage> light, dark;
+		std::string file;
+	};
+	std::map<std::string, Found> found;
+	const auto readFolder = [&](const fs::path &folder, bool personal) {
+		std::error_code error;
+		std::vector<fs::path> files;
+		for (fs::directory_iterator it(folder, error), end; !error && it != end; it.increment(error))
+			if (it->path().extension() == ".xml") files.push_back(it->path());
+		std::sort(files.begin(), files.end());
+		for (const fs::path &file : files) {
+			std::vector<UserLanguage> languages = loadUserLanguageFile(file.string());
+			// A dark variant goes with the language that covers the same files, if there is one.
+			std::map<std::string, std::string> lightByExtensions;
+			for (const UserLanguage &language : languages)
+				if (!language.darkModeTheme) lightByExtensions[language.extensions] = language.name;
+			for (UserLanguage &language : languages) {
+				const bool dark = language.darkModeTheme;
+				auto data = std::make_shared<const UserLanguage>(std::move(language));
+				std::string name = data->name;
+				if (dark) {
+					auto partner = lightByExtensions.find(data->extensions);
+					if (partner == lightByExtensions.end()) {
+						for (const auto &entry : found)
+							if (entry.second.light && entry.second.light->extensions == data->extensions) name = entry.first;
+					} else {
+						name = partner->second;
+					}
+				}
+				Found &slot = found[name];
+				if (dark && name != data->name) slot.dark = data;
+				else slot.light = data;
+				if (personal) slot.file = file.string();
+			}
+		}
+	};
+	readFolder(fs::path(directory) / "userDefineLangs", false);
+	if (!personalDirectory.empty()) readFolder(personalDirectory, true);
+
+	// Anything still here at the end has gone. Its object stays, in case a document points at it.
+	std::map<std::string, const Language *> gone;
+	for (const Language *language : menuUserLanguages) gone[language->name] = language;
+	menuUserLanguages.clear();
+	languagesByExtension = builtinExtensions;
+	for (const auto &entry : found) {
+		const std::string name = "udl:" + entry.first;
+		Language *language = nullptr;
+		for (const std::unique_ptr<Language> &candidate : owned)
+			if (candidate->name == name) language = candidate.get();
+		if (!language) {
+			owned.push_back(std::make_unique<Language>());
+			language = owned.back().get();
+			language->name = name;
+		}
+		gone.erase(name);
+		const std::shared_ptr<const UserLanguage> &data = entry.second.light ? entry.second.light : entry.second.dark;
+		language->displayName = entry.first;
+		language->lexerName = "user";
+		language->user = data;
+		language->userDark = entry.second.light ? entry.second.dark : nullptr;
+		language->userFile = entry.second.file;
+		language->extensions.clear();
+		userCommentTokens(*data, language->commentLine, language->commentStart, language->commentEnd);
+		std::istringstream extensions(lowercase(data->extensions));
+		std::string extension;
+		while (extensions >> extension) {
+			language->extensions.push_back(extension);
+			// Like Notepad++, a user language comes before a built-in one.
+			languagesByExtension[extension] = language;
+		}
+		languagesByName[name] = language;
+		menuUserLanguages.push_back(language);
+	}
+	for (const auto &entry : gone) languagesByName.erase(entry.first);
+	std::sort(menuUserLanguages.begin(), menuUserLanguages.end(), [](const Language *a, const Language *b) {
+		return lowercase(a->displayName) < lowercase(b->displayName);
+	});
 }
 
 const Language *LanguageCatalog::languageNamed(const std::string &name) const {
@@ -213,6 +298,9 @@ const Language *LanguageCatalog::languageForPath(const std::string &path) const 
 	};
 	const auto exact = exactNames.find(file);
 	if (exact != exactNames.end() && languagesByName.count(exact->second)) return languagesByName.at(exact->second);
+	// A user language can name a whole file instead of an extension.
+	const auto wholeName = languagesByExtension.find(file);
+	if (wholeName != languagesByExtension.end() && wholeName->second->user) return wholeName->second;
 	std::string extension = p.extension().string();
 	if (!extension.empty() && extension[0] == '.') extension = lowercase(extension.substr(1));
 	const auto found = languagesByExtension.find(extension);
@@ -356,6 +444,13 @@ void LanguageCatalog::apply(const Language &language, SciView &view, const std::
 	view.send(SCI_STYLESETSIZEFRACTIONAL, STYLE_DEFAULT, static_cast<intptr_t>(fontSize * SC_FONT_SIZE_MULTIPLIER));
 	view.send(SCI_STYLECLEARALL);
 
+	if (language.user) {
+		const bool dark = language.userDark && themeIsDark(themeName);
+		applyUserLanguage(dark ? *language.userDark : *language.user, view);
+		applyChrome(theme, view);
+		return;
+	}
+
 	Scintilla::ILexer5 *lexer = CreateLexer(language.lexerName.c_str());
 	if (!lexer) lexer = CreateLexer("null");
 	view.send(SCI_SETILEXER, 0, reinterpret_cast<intptr_t>(lexer));
@@ -412,6 +507,49 @@ void LanguageCatalog::apply(const Language &language, SciView &view, const std::
 	setProperty("fold.compact", "0");
 
 	applyChrome(theme, view);
+}
+
+void LanguageCatalog::applyUserLanguage(const UserLanguage &language, SciView &view) const {
+	view.send(SCI_SETILEXER, 0, reinterpret_cast<intptr_t>(CreateLexer("user")));
+	const auto setProperty = [&](const std::string &key, const std::string &value) {
+		view.send(SCI_SETPROPERTY, reinterpret_cast<uintptr_t>(key.c_str()), reinterpret_cast<intptr_t>(value.c_str()));
+	};
+	setProperty("fold", "1");
+	setProperty("userDefine.isCaseIgnored", language.caseIgnored ? "1" : "0");
+	setProperty("userDefine.allowFoldOfComments", language.allowFoldOfComments ? "1" : "0");
+	setProperty("userDefine.foldCompact", language.foldCompact ? "1" : "0");
+	for (int i = 0; i < kUserKeywordGroups; i++) setProperty("userDefine.prefixKeywords" + std::to_string(i + 1), language.prefix[i] ? "1" : "0");
+	int keywordSet = 0;
+	for (int i = 0; i < kUserKeywordLists; i++) {
+		if (const char *property = lexerPropertyForKeywordList(i)) {
+			setProperty(property, language.keywords[i]);
+		} else {
+			const std::string words = lexerKeywords(language.keywords[i]);
+			view.send(SCI_SETKEYWORDS, keywordSet++, reinterpret_cast<intptr_t>(words.c_str()));
+		}
+	}
+	setProperty("userDefine.forcePureLC", std::to_string(language.forcePureLC));
+	setProperty("userDefine.decimalSeparator", std::to_string(language.decimalSeparator));
+	// The lexer keeps parsed keywords per language and nesting per document. It reads these as int, so they
+	// can't be pointers on a 64-bit system, unlike in Notepad++.
+	const auto smallId = [](size_t value) { return std::to_string(value & 0x7FFFFFFF); };
+	setProperty("userDefine.udlName", smallId(std::hash<std::string>()(language.name)));
+	setProperty("userDefine.currentBufferID", smallId(static_cast<size_t>(view.send(SCI_GETDOCPOINTER))));
+
+	for (int id = 0; id < kUserStyles; id++) {
+		const UserStyle &style = language.styles[id];
+		char nestingKey[32];
+		std::snprintf(nestingKey, sizeof nestingKey, "userDefine.nesting.%02d", id);
+		setProperty(nestingKey, std::to_string(style.nesting));
+		int colour = 0;
+		if ((style.colorStyle & 1) && parseColour(style.fg, &colour)) view.send(SCI_STYLESETFORE, id, colour);
+		if ((style.colorStyle & 2) && parseColour(style.bg, &colour)) view.send(SCI_STYLESETBACK, id, colour);
+		if (!style.fontName.empty()) view.send(SCI_STYLESETFONT, id, reinterpret_cast<intptr_t>(style.fontName.c_str()));
+		view.send(SCI_STYLESETBOLD, id, (style.fontStyle & 1) != 0);
+		view.send(SCI_STYLESETITALIC, id, (style.fontStyle & 2) != 0);
+		view.send(SCI_STYLESETUNDERLINE, id, (style.fontStyle & 4) != 0);
+		if (style.fontSize > 0) view.send(SCI_STYLESETSIZE, id, style.fontSize);
+	}
 }
 
 // Everything in a theme that isn't a language colour: caret, selection, margins, markers.

@@ -166,6 +166,7 @@ extern const LexerModule lmTeX;
 extern const LexerModule lmTOML;
 extern const LexerModule lmTroff;
 extern const LexerModule lmTxt2tags;
+extern const LexerModule lmUserDefine;
 extern const LexerModule lmVB;
 extern const LexerModule lmVBScript;
 extern const LexerModule lmVerilog;
@@ -323,6 +324,7 @@ void AddEachLexer() {
 		&lmTOML,
 		&lmTroff,
 		&lmTxt2tags,
+		&lmUserDefine,
 		&lmVB,
 		&lmVBScript,
 		&lmVerilog,

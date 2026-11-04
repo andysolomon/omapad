@@ -6,7 +6,7 @@ Both share the same C++ document, search, split-view, folder-workspace and sessi
 
 omapad is an independent project, formerly called Folio. It is not affiliated with or endorsed
 by Notepad++. It uses Scintilla 5.6.6, Lexilla 5.5.3, and the language data and themes bundled
-with Notepad++ 8.9.8.1. This is version 0.3.0 of our own editor, not a Notepad++ release.
+with Notepad++ 8.9.8.1. This is version 0.4.0 of our own editor, not a Notepad++ release.
 
 ## Build and install
 
@@ -87,16 +87,44 @@ window. On macOS, use `open -a omapad notes.txt` or `open -a omapad ~/my-project
 - **Settings → Preferences** and **Settings → Shortcut Mapper** cover editor settings and let you
   change any menu command's shortcut.
 
+## Printing
+
+**File → Print** (Mod+P) uses the system's print dialog. **Print Now** skips the dialog,
+**Print Selection** prints only what's selected, and **Save as PDF** writes a PDF directly.
+
+The printout has the document's syntax colours on white. If you're using a dark theme, it switches
+to the default light theme for the printout, so the text stays readable on paper. The editor
+itself doesn't change. Search and smart highlights don't print; token styles do.
+
+**Settings → Preferences** sets line numbers, colours, margins, and the header and footer. Headers
+and footers can use `$(FILE_NAME)`, `$(FULL_CURRENT_PATH)`, `$(SHORT_DATE)`, `$(LONG_DATE)`,
+`$(TIME)`, `$(CURRENT_PRINTING_PAGE)` and `$(TOTAL_PAGES)`.
+
+## User-defined languages
+
+**Language → User Defined Language → Define Your Language** creates or changes a language: its
+file extensions, keywords, comments, numbers, operators, delimiters, folding, colours and nesting.
+**Import** and **Export** read and write Notepad++'s `.udl.xml` files, including ones from before
+UDL 2.0. Exports are written as UDL 2.1.
+
+Languages are stored in the `userDefineLangs` folder next to your settings. Like Notepad++, a user
+language takes priority over a built-in one for the same extension. It also supplies the markers for
+the comment commands, and an extension field can name a whole file, like `Fresh.conf`.
+
+omapad comes with Notepad++'s Markdown language, so `.md` and `.markdown` files are highlighted,
+using its dark variant on dark themes. Defining a language with the same name overrides it, and
+removing yours brings the original back.
+
 ## Included
 
 | Area | Features |
 | --- | --- |
-| Documents | Tabs, recent files, reload, rename, read-only mode, Save All, Save a Copy, close to the left or right, file drag and drop |
+| Documents | Tabs, recent files, reload, rename, read-only mode, Save All, Save a Copy, close to the left or right, file drag and drop, printing, Save as PDF |
 | Editing | Line operations, sorting, case conversion, comments, column and multiple selection, multi-select commands, Column Editor, auto-indent, auto-completion, function hints |
 | Search | Find, Replace, Count, Mark All, Find All, Find in Files, replace across open documents, next and previous result; normal, extended and PCRE2 regex modes |
 | View | Split panes, Function List, Document Map, change history, five-colour token styles, wrap, whitespace symbols, indent guides, zoom, folding, bookmarks, brace matching |
 | Settings | Preferences window, Shortcut Mapper, column guide, default line ending and encoding |
-| Languages | Notepad++ language list and syntax highlighting; detection by filename, extension or first line |
+| Languages | Notepad++ language list and syntax highlighting; detection by filename, extension or first line; user-defined languages with Notepad++ file import and export |
 | Encoding | UTF-8, UTF-16, Windows-1252, Latin-1 and others; convert or reopen with an encoding |
 | Themes | 22 bundled Notepad++ themes and automatic appearance; Linux follows Omarchy's palette live |
 | Tools | MD5, SHA-1, SHA-256 and SHA-512 hashes; in-memory macro recording and playback |
@@ -118,6 +146,7 @@ window colors. An explicitly selected theme overrides automatic following.
 | Move to other view | Cmd+Option+Right | Ctrl+Alt+Right |
 | Clone to other view | Cmd+Option+Shift+Right | Ctrl+Alt+Shift+Right |
 | Focus other view | F8 | F8 |
+| Print | Cmd+P | Ctrl+P |
 | Preferences | Cmd+, | Ctrl+, |
 | Function completion | Ctrl+Space | Ctrl+Space |
 | Word completion | Ctrl+Shift+Space | Ctrl+Shift+Space |
@@ -142,6 +171,11 @@ The previous Folio application's data is separate and is not automatically migra
   that hits PCRE2's step limit stops and says so.
 - On Linux, changing a standard editing shortcut such as Undo adds the new key, but the editor's
   built-in key keeps working in the editor.
+- The language editor is an ordinary dialog, so changes appear when you press OK. Notepad++'s stays
+  open and updates the document as you edit.
+- User languages get word completion but not function completion, hints or a Function List, which
+  Notepad++ can add with extra files. A style's font name and size are kept from imported files
+  and applied, but the editor doesn't offer them.
 
 ### Not in omapad yet
 
@@ -149,11 +183,10 @@ The full Notepad++ menu has more than this. These are the commands and features 
 
 | Area | Missing |
 | --- | --- |
-| Files and tabs | Printing, Load and Save Session, pinned tabs, tab colours, sorting tabs, the Windows dialog, Document List, Open in a new instance, read-only for all documents |
+| Files and tabs | Load and Save Session, pinned tabs, tab colours, sorting tabs, the Windows dialog, Document List, Open in a new instance, read-only for all documents |
 | Editing | Begin/End Select, Paste HTML, RTF or Binary content, Character Panel, Clipboard History, Hide Lines, right-to-left text, customized date and time, locale-order sorting, Redact Selection, Search on Internet |
 | Search | Volatile Find, Incremental Search, Find Characters in Range, Cut and Paste to Bookmarked Lines |
 | View | Project Panels, Post-It, Distraction Free mode, monitoring (`tail -f`), browser preview, control character display |
-| Languages | User-defined languages |
 | Encodings | About half of Notepad++'s character sets, including Arabic, Greek, Hebrew, Thai, Turkish and the OEM code pages |
 | Settings | Style Configurator, theme import, context menu editing, many of Notepad++'s individual preferences |
 | Macros and tools | Saved macros, Run a Macro Multiple Times, Run menu, Generate-to-file hash dialogs |

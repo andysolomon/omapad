@@ -1,5 +1,6 @@
 #include "Workspace.h"
 
+#include "SciLexer.h"
 #include "Scintilla.h"
 #include "json.hpp"
 
@@ -265,6 +266,7 @@ Workspace::Workspace(Host &h, const std::string &resources, const std::string &s
 	chmod(stateDir.c_str(), 0700);
 	chmod((fs::path(stateDir) / "backup").c_str(), 0700);
 	loadSettings();
+	catalog.loadUserLanguages(userLanguageFolder());
 }
 
 Workspace::~Workspace() {
@@ -371,6 +373,23 @@ void Workspace::loadSettings() {
 	settings.restoreSessionOnStart = jsonBool(j, "restoreSessionOnStart", settings.restoreSessionOnStart);
 	const long backup = jsonLong(j, "backupSeconds", settings.backupSeconds);
 	if (backup >= 0 && backup <= 3600) settings.backupSeconds = static_cast<int>(backup);
+	settings.printLineNumbers = jsonBool(j, "printLineNumbers", settings.printLineNumbers);
+	const std::string printColours = jsonString(j, "printColours", settings.printColours);
+	if (printColours == "auto" || printColours == "invert" || printColours == "black" || printColours == "colour" || printColours == "screen") settings.printColours = printColours;
+	settings.printHeaderLeft = jsonString(j, "printHeaderLeft", settings.printHeaderLeft);
+	settings.printHeaderMiddle = jsonString(j, "printHeaderMiddle", settings.printHeaderMiddle);
+	settings.printHeaderRight = jsonString(j, "printHeaderRight", settings.printHeaderRight);
+	settings.printFooterLeft = jsonString(j, "printFooterLeft", settings.printFooterLeft);
+	settings.printFooterMiddle = jsonString(j, "printFooterMiddle", settings.printFooterMiddle);
+	settings.printFooterRight = jsonString(j, "printFooterRight", settings.printFooterRight);
+	const auto printMargin = [&](const char *key, int &value) {
+		const long margin = jsonLong(j, key, value);
+		if (margin >= 0 && margin <= 100) value = static_cast<int>(margin);
+	};
+	printMargin("printMarginTop", settings.printMarginTop);
+	printMargin("printMarginBottom", settings.printMarginBottom);
+	printMargin("printMarginLeft", settings.printMarginLeft);
+	printMargin("printMarginRight", settings.printMarginRight);
 }
 
 void Workspace::saveSettings() const {
@@ -408,6 +427,18 @@ void Workspace::saveSettings() const {
 	j["completeThreshold"] = settings.completeThreshold;
 	j["restoreSessionOnStart"] = settings.restoreSessionOnStart;
 	j["backupSeconds"] = settings.backupSeconds;
+	j["printLineNumbers"] = settings.printLineNumbers;
+	j["printColours"] = settings.printColours;
+	j["printHeaderLeft"] = settings.printHeaderLeft;
+	j["printHeaderMiddle"] = settings.printHeaderMiddle;
+	j["printHeaderRight"] = settings.printHeaderRight;
+	j["printFooterLeft"] = settings.printFooterLeft;
+	j["printFooterMiddle"] = settings.printFooterMiddle;
+	j["printFooterRight"] = settings.printFooterRight;
+	j["printMarginTop"] = settings.printMarginTop;
+	j["printMarginBottom"] = settings.printMarginBottom;
+	j["printMarginLeft"] = settings.printMarginLeft;
+	j["printMarginRight"] = settings.printMarginRight;
 	std::string error;
 	atomicWrite(j.dump(1, '\t', false, json::error_handler_t::replace), (fs::path(settingsDir) / "settings.json").string(), 0600, error);
 }
@@ -2617,6 +2648,222 @@ void Workspace::setActiveLanguage(const std::string &name) {
 	refreshChrome();
 }
 
+#pragma mark - Printing
+
+void Workspace::printActive(bool selectionOnly, const PrintOutput &output) {
+	const Document *document = activeDocument();
+	if (!document) return;
+	PrintOptions options;
+	options.start = selectionOnly ? s(SCI_GETSELECTIONSTART) : 0;
+	options.end = selectionOnly ? s(SCI_GETSELECTIONEND) : s(SCI_GETLENGTH);
+	if (selectionOnly && options.start == options.end) {
+		host.flash("Nothing is selected");
+		return;
+	}
+	const std::string &colours = settings.printColours;
+	options.colourMode = colours == "invert" ? SC_PRINT_INVERTLIGHT
+		: colours == "black" ? SC_PRINT_BLACKONWHITE
+		: colours == "screen" ? SC_PRINT_NORMAL
+		: SC_PRINT_COLOURONWHITE;
+	// Paper is light, and a dark theme's pale colours are hard to read on it.
+	const bool useLightTheme = colours == "auto" && catalog.themeIsDark(effectiveTheme());
+	const std::string theme = useLightTheme ? "Default" : effectiveTheme();
+	options.lineNumbers = settings.printLineNumbers;
+	options.header = {settings.printHeaderLeft, settings.printHeaderMiddle, settings.printHeaderRight};
+	options.footer = {settings.printFooterLeft, settings.printFooterMiddle, settings.printFooterRight};
+	options.title = document->title();
+	options.path = document->path;
+	options.marginTop = settings.printMarginTop;
+	options.marginBottom = settings.printMarginBottom;
+	options.marginLeft = settings.printMarginLeft;
+	options.marginRight = settings.printMarginRight;
+
+	SciView &printer = host.printView();
+	printer.send(SCI_SETDOCPOINTER, 0, document->sciDoc);
+	catalog.apply(*document->language, printer, theme, settings.fontName, settings.fontSize);
+	printer.send(SCI_SETTABWIDTH, s(SCI_GETTABWIDTH));
+	// Token styles are part of the text. Search and smart highlights aren't.
+	for (const int indicator : {kIndicatorSmart, kIndicatorMark, kIndicatorMap}) printer.send(SCI_INDICSETSTYLE, indicator, INDIC_HIDDEN);
+	for (const int indicator : {25, 24, 23, 22, 21}) {
+		printer.send(SCI_INDICSETSTYLE, indicator, s(SCI_INDICGETSTYLE, indicator));
+		printer.send(SCI_INDICSETFORE, indicator, s(SCI_INDICGETFORE, indicator));
+		printer.send(SCI_INDICSETALPHA, indicator, s(SCI_INDICGETALPHA, indicator));
+		printer.send(SCI_INDICSETOUTLINEALPHA, indicator, s(SCI_INDICGETOUTLINEALPHA, indicator));
+		printer.send(SCI_INDICSETUNDER, indicator, s(SCI_INDICGETUNDER, indicator));
+	}
+	printer.send(SCI_COLOURISE, 0, -1);
+	std::string error;
+	bool printed = false;
+	{
+		PrintJob job(printer, options);
+		printed = host.print(job, output, error);
+	}
+	printer.send(SCI_SETDOCPOINTER, 0, 0);
+	// The lexer belongs to the document, so give it back what the panes expect.
+	applyLanguageTo(0);
+	applyLanguageTo(1);
+	if (!printed) host.ask("The document could not be printed.", error, {"OK"});
+}
+
+#pragma mark - User-defined languages
+
+std::string Workspace::userLanguageFolder() const { return (fs::path(settingsDir) / "userDefineLangs").string(); }
+
+bool Workspace::chooseUserLanguage(const std::string &title, bool offerNew, bool personalOnly, std::string &outName) {
+	FormField field;
+	field.key = "language";
+	field.label = "Language";
+	field.kind = FormField::Kind::Choice;
+	if (offerNew) field.choices.emplace_back("", "New language");
+	for (const Language *language : catalog.userLanguages()) {
+		if (personalOnly && language->userFile.empty()) continue;
+		field.choices.emplace_back(language->displayName, language->displayName);
+	}
+	if (field.choices.empty()) {
+		host.flash("There are no user-defined languages to choose from");
+		return false;
+	}
+	field.value = field.choices.front().first;
+	const Document *document = activeDocument();
+	if (document && document->language->user) {
+		for (const auto &choice : field.choices)
+			if (choice.first == document->language->displayName) field.value = choice.first;
+	}
+	std::vector<FormField> fields = {field};
+	if (!host.runForm(title, fields)) return false;
+	outName = fields[0].value;
+	return true;
+}
+
+void Workspace::removeUserLanguageFromFolder(const std::string &name, std::string &error) {
+	std::error_code fsError;
+	for (fs::directory_iterator it(userLanguageFolder(), fsError), end; !fsError && it != end; it.increment(fsError)) {
+		if (it->path().extension() != ".xml") continue;
+		std::vector<UserLanguage> languages = loadUserLanguageFile(it->path().string());
+		const auto gone = std::remove_if(languages.begin(), languages.end(), [&](const UserLanguage &l) { return l.name == name; });
+		if (gone == languages.end()) continue;
+		languages.erase(gone, languages.end());
+		if (languages.empty()) {
+			std::error_code removeError;
+			fs::remove(it->path(), removeError);
+			if (removeError) error = removeError.message();
+		} else {
+			atomicWrite(writeUserLanguages(languages), it->path().string(), 0644, error);
+		}
+	}
+}
+
+bool Workspace::storeUserLanguage(const UserLanguage &language, const std::string &previousName, std::string &error) {
+	std::error_code fsError;
+	fs::create_directories(userLanguageFolder(), fsError);
+	if (fsError) {
+		error = fsError.message();
+		return false;
+	}
+	removeUserLanguageFromFolder(language.name, error);
+	if (!previousName.empty() && previousName != language.name) removeUserLanguageFromFolder(previousName, error);
+	if (!error.empty()) return false;
+	// A file can hold several languages, so one that happens to share the file name stays.
+	const std::string path = (fs::path(userLanguageFolder()) / userLanguageFileName(language.name)).string();
+	std::vector<UserLanguage> languages = loadUserLanguageFile(path);
+	languages.push_back(language);
+	return atomicWrite(writeUserLanguages(languages), path, 0644, error);
+}
+
+void Workspace::userLanguagesChanged(const std::string &renamedFrom, const std::string &renamedTo) {
+	catalog.loadUserLanguages(userLanguageFolder());
+	for (const auto &document : documents) {
+		std::string name = document->language->name;
+		if (!renamedFrom.empty() && name == "udl:" + renamedFrom) name = "udl:" + renamedTo;
+		document->language = catalog.languageNamed(name);
+	}
+	applyThemeEverywhere();
+	host.menusChanged();
+	refreshChrome();
+}
+
+void Workspace::defineUserLanguage() {
+	std::string name;
+	if (!chooseUserLanguage("Define Your Language", true, false, name)) return;
+	UserLanguage edited;
+	if (!name.empty()) {
+		const Language *language = catalog.languageNamed("udl:" + name);
+		const bool dark = language->userDark && catalog.themeIsDark(effectiveTheme());
+		edited = dark ? *language->userDark : *language->user;
+	} else {
+		// Colours depend on the theme, but keywords and comments should stand out on any of them.
+		for (int style = SCE_USER_STYLE_KEYWORD1; style <= SCE_USER_STYLE_KEYWORD8; style++) edited.styles[style].fontStyle = 1;
+		edited.styles[SCE_USER_STYLE_COMMENT].fontStyle = 2;
+		edited.styles[SCE_USER_STYLE_COMMENTLINE].fontStyle = 2;
+	}
+	const std::string originalName = edited.name;
+	std::vector<FormField> fields = userLanguageFields(edited);
+	if (!host.runForm(originalName.empty() ? "New Language" : "Define " + originalName, fields)) return;
+	if (!applyUserLanguageFields(fields, edited)) {
+		host.ask("The language needs a name.", "Nothing was saved.", {"OK"});
+		return;
+	}
+	if (edited.name != originalName && catalog.languageNamed("udl:" + edited.name) != catalog.plainText()
+	    && host.ask("Replace the language “" + edited.name + "”?", "There's already a language with that name.", {"Cancel", "Replace"}) != 1)
+		return;
+	std::string error;
+	if (!storeUserLanguage(edited, originalName, error)) {
+		host.ask("The language could not be saved.", error, {"OK"});
+		return;
+	}
+	const bool isNew = originalName.empty();
+	userLanguagesChanged(originalName, edited.name);
+	if (isNew) setActiveLanguage("udl:" + edited.name);
+}
+
+void Workspace::importUserLanguages() {
+	std::vector<std::string> paths;
+	if (!host.chooseFilesToOpen(std::string(), paths)) return;
+	int imported = 0;
+	for (const std::string &path : paths) {
+		const std::vector<UserLanguage> languages = loadUserLanguageFile(path);
+		if (languages.empty()) {
+			host.ask("“" + baseName(path) + "” has no languages in it.", "It needs to be a Notepad++ user-defined language file.", {"OK"});
+			continue;
+		}
+		for (const UserLanguage &language : languages) {
+			if (catalog.languageNamed("udl:" + language.name) != catalog.plainText()
+			    && host.ask("Replace the language “" + language.name + "”?", "There's already a language with that name.", {"Keep It", "Replace"}) != 1)
+				continue;
+			std::string error;
+			if (storeUserLanguage(language, std::string(), error)) imported++;
+			else host.ask("“" + language.name + "” could not be saved.", error, {"OK"});
+		}
+	}
+	if (imported > 0) {
+		userLanguagesChanged();
+		host.flash(imported == 1 ? "Imported 1 language" : "Imported " + std::to_string(imported) + " languages");
+	}
+}
+
+void Workspace::exportUserLanguage() {
+	std::string name, path;
+	if (!chooseUserLanguage("Export Language", false, false, name)) return;
+	const Language *language = catalog.languageNamed("udl:" + name);
+	if (!language->user || !host.chooseSavePath(userLanguageFileName(name), std::string(), path)) return;
+	std::vector<UserLanguage> languages = {*language->user};
+	if (language->userDark) languages.push_back(*language->userDark);
+	std::string error;
+	if (!writeFileAtomically(writeUserLanguages(languages), path, error)) host.ask("The language could not be exported.", error, {"OK"});
+}
+
+void Workspace::removeUserLanguage() {
+	std::string name;
+	if (!chooseUserLanguage("Remove Language", false, true, name)) return;
+	const Language *language = catalog.languageNamed("udl:" + name);
+	if (host.ask("Remove the language “" + name + "”?", "Tabs using it go back to normal text, or to the version that comes with omapad if there is one.", {"Cancel", "Remove"}) != 1) return;
+	std::string error;
+	removeUserLanguageFromFolder(name, error);
+	if (language->userDark) removeUserLanguageFromFolder(language->userDark->name, error);
+	if (!error.empty()) host.ask("The language could not be removed.", error, {"OK"});
+	userLanguagesChanged();
+}
+
 #pragma mark - Folder as Workspace
 
 bool Workspace::addFolder(const std::string &rawPath) {
@@ -3102,6 +3349,34 @@ std::vector<FormField> Workspace::preferenceFields() const {
 	heading("Session");
 	toggle("restoreSessionOnStart", "Reopen the last session at launch", settings.restoreSessionOnStart);
 	number("backupSeconds", "Back up unsaved work every (seconds, 0 for only on quit)", settings.backupSeconds, 0, 3600);
+
+	heading("Printing");
+	toggle("printLineNumbers", "Print line numbers", settings.printLineNumbers);
+	FormField colours;
+	colours.key = "printColours";
+	colours.label = "Colours";
+	colours.kind = FormField::Kind::Choice;
+	colours.value = settings.printColours;
+	colours.choices = {{"auto", "Automatic"}, {"invert", "Inverted, for dark themes"}, {"colour", "Syntax colours on white"}, {"black", "Black on white"}, {"screen", "Same as the screen"}};
+	fields.push_back(colours);
+	const auto line = [&](const char *key, const char *label, const std::string &value) {
+		FormField field;
+		field.key = key;
+		field.label = label;
+		field.kind = FormField::Kind::Text;
+		field.value = value;
+		fields.push_back(field);
+	};
+	line("printHeaderLeft", "Header, left", settings.printHeaderLeft);
+	line("printHeaderMiddle", "Header, middle", settings.printHeaderMiddle);
+	line("printHeaderRight", "Header, right", settings.printHeaderRight);
+	line("printFooterLeft", "Footer, left", settings.printFooterLeft);
+	line("printFooterMiddle", "Footer, middle", settings.printFooterMiddle);
+	line("printFooterRight", "Footer, right", settings.printFooterRight);
+	number("printMarginTop", "Top margin (mm)", settings.printMarginTop, 0, 100);
+	number("printMarginBottom", "Bottom margin (mm)", settings.printMarginBottom, 0, 100);
+	number("printMarginLeft", "Left margin (mm)", settings.printMarginLeft, 0, 100);
+	number("printMarginRight", "Right margin (mm)", settings.printMarginRight, 0, 100);
 	return fields;
 }
 
@@ -3139,6 +3414,18 @@ void Workspace::applyPreferenceFields(const std::vector<FormField> &fields) {
 		else if (key == "functionHints") settings.functionHints = on;
 		else if (key == "restoreSessionOnStart") settings.restoreSessionOnStart = on;
 		else if (key == "backupSeconds") settings.backupSeconds = clamped(field);
+		else if (key == "printLineNumbers") settings.printLineNumbers = on;
+		else if (key == "printColours") settings.printColours = field.value;
+		else if (key == "printHeaderLeft") settings.printHeaderLeft = field.value;
+		else if (key == "printHeaderMiddle") settings.printHeaderMiddle = field.value;
+		else if (key == "printHeaderRight") settings.printHeaderRight = field.value;
+		else if (key == "printFooterLeft") settings.printFooterLeft = field.value;
+		else if (key == "printFooterMiddle") settings.printFooterMiddle = field.value;
+		else if (key == "printFooterRight") settings.printFooterRight = field.value;
+		else if (key == "printMarginTop") settings.printMarginTop = clamped(field);
+		else if (key == "printMarginBottom") settings.printMarginBottom = clamped(field);
+		else if (key == "printMarginLeft") settings.printMarginLeft = clamped(field);
+		else if (key == "printMarginRight") settings.printMarginRight = clamped(field);
 	}
 	applyPreferencesEverywhere();
 	applyThemeEverywhere();
@@ -3956,6 +4243,32 @@ void Workspace::run(Cmd cmd, int arg, const std::string &argument) {
 	}
 	case Cmd::ShowShortcutMapper: host.runShortcutMapper(); break;
 
+	case Cmd::Print: printActive(false, PrintOutput()); break;
+	case Cmd::PrintNow: {
+		PrintOutput output;
+		output.showDialog = false;
+		printActive(false, output);
+		break;
+	}
+	case Cmd::PrintSelection: printActive(true, PrintOutput()); break;
+	case Cmd::SaveAsPdf: {
+		PrintOutput output;
+		output.showDialog = false;
+		const std::string suggested = fs::path(document->title()).replace_extension(".pdf").string();
+		if (host.chooseSavePath(suggested, document->path.empty() ? std::string() : directoryOf(document->path), output.pdfPath)) printActive(false, output);
+		break;
+	}
+	case Cmd::DefineLanguage: defineUserLanguage(); break;
+	case Cmd::ImportLanguage: importUserLanguages(); break;
+	case Cmd::ExportLanguage: exportUserLanguage(); break;
+	case Cmd::RemoveLanguage: removeUserLanguage(); break;
+	case Cmd::OpenLanguageFolder: {
+		std::error_code error;
+		fs::create_directories(userLanguageFolder(), error);
+		host.reveal(userLanguageFolder());
+		break;
+	}
+
 	case Cmd::CompleteFunction: showCompletion(true, false, true); break;
 	case Cmd::CompleteWord: showCompletion(false, true, true); break;
 	case Cmd::ParameterHint: showParameterHint(true); break;
@@ -4089,6 +4402,13 @@ MenuState Workspace::stateOf(const MenuItem &item) {
 	case Cmd::ToggleDocumentMap: state.checked = mapVisible; break;
 	case Cmd::ToggleReadOnly: state.checked = s(SCI_GETREADONLY) != 0; break;
 	case Cmd::Rename: state.enabled = saved; break;
+	case Cmd::PrintSelection: state.enabled = s(SCI_GETSELECTIONSTART) != s(SCI_GETSELECTIONEND); break;
+	case Cmd::RemoveLanguage: {
+		state.enabled = false;
+		for (const Language *language : catalog.userLanguages())
+			if (!language->userFile.empty()) state.enabled = true;
+		break;
+	}
 	case Cmd::ToggleHiddenInFolders: state.checked = settings.showHiddenInFolders; break;
 	case Cmd::CloseAllFolders:
 	case Cmd::RefreshFolders: state.enabled = !folderRoots.empty(); break;
@@ -4273,6 +4593,11 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 		item("Save As…", Cmd::SaveAs, key("Mod+Shift+S", "Mod+Alt+S")),
 		item("Save a Copy As…", Cmd::SaveCopy),
 		item("Save All", Cmd::SaveAll, key("Mod+Alt+S", "Mod+Shift+S")),
+		separator(),
+		item("Print…", Cmd::Print, "Mod+P"),
+		item("Print Now", Cmd::PrintNow),
+		item("Print Selection…", Cmd::PrintSelection),
+		item("Save as PDF…", Cmd::SaveAsPdf),
 		separator(),
 		item("Close", Cmd::Close, "Mod+W"),
 		item("Close All", Cmd::CloseAll, "Mod+Shift+W"),
@@ -4534,6 +4859,15 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 		}
 		languageMenu.back().children.push_back(textItem(language->displayName, Cmd::SetLanguage, language->name));
 	}
+	languageMenu.push_back(separator());
+	languageMenu.push_back(sub("User Defined Language", {
+		item("Define Your Language…", Cmd::DefineLanguage),
+		item("Import…", Cmd::ImportLanguage),
+		item("Export…", Cmd::ExportLanguage),
+		item("Remove…", Cmd::RemoveLanguage),
+		item("Open User Defined Language Folder", Cmd::OpenLanguageFolder),
+	}));
+	for (const Language *language : catalog.userLanguages()) languageMenu.push_back(textItem(language->displayName, Cmd::SetLanguage, language->name));
 
 	std::vector<MenuItem> themeMenu;
 	themeMenu.push_back(textItem(catalog.hasOmarchyTheme() ? "Automatic (Follow Omarchy)" : "Automatic (Follow System)", Cmd::SetTheme, "Auto"));

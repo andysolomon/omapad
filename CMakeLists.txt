@@ -2,7 +2,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum macOS version")
-project(omapad VERSION 0.3.0 LANGUAGES C CXX OBJC OBJCXX)
+project(omapad VERSION 0.4.0 LANGUAGES C CXX OBJC OBJCXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,7 +19,6 @@ set(LEX ${CMAKE_SOURCE_DIR}/third_party/lexilla)
 file(GLOB SCI_SOURCES CONFIGURE_DEPENDS ${SCI}/src/*.cxx)
 file(GLOB LEX_SOURCES CONFIGURE_DEPENDS ${LEX}/src/*.cxx ${LEX}/lexlib/*.cxx ${LEX}/lexers/*.cxx)
 # Notepad++'s user-defined language lexer depends on Windows. omapad doesn't support those yet.
-list(FILTER LEX_SOURCES EXCLUDE REGEX "LexUser\\.cxx$")
 set(SCI_COCOA_SOURCES
   ${SCI}/cocoa/InfoBar.mm
   ${SCI}/cocoa/PlatCocoa.mm
@@ -41,7 +40,7 @@ target_compile_options(pcre2 PRIVATE -w)
 
 # --- The shared core.
 add_library(omapad_core STATIC
-  core/TextCore.cpp core/Languages.cpp core/Workspace.cpp core/Regex.cpp core/Completion.cpp core/FunctionList.cpp
+  core/TextCore.cpp core/Languages.cpp core/Workspace.cpp core/Regex.cpp core/Completion.cpp core/FunctionList.cpp core/UserLanguage.cpp core/Print.cpp
   third_party/pugixml/pugixml.cpp)
 target_link_libraries(omapad_core PUBLIC engine pcre2 iconv)
 target_include_directories(omapad_core PUBLIC core third_party/json third_party/pugixml third_party/pcre2)
@@ -51,6 +50,7 @@ target_compile_options(omapad_core PRIVATE -Wall -Wextra -Wno-unused-parameter -
 file(GLOB THEME_FILES CONFIGURE_DEPENDS resources/themes/*.xml)
 file(GLOB COMPLETION_FILES CONFIGURE_DEPENDS resources/autoCompletion/*.xml)
 file(GLOB FUNCTION_FILES CONFIGURE_DEPENDS resources/functionList/*.xml)
+file(GLOB USER_LANGUAGE_FILES CONFIGURE_DEPENDS resources/userDefineLangs/*.xml)
 file(GLOB LICENSE_FILES CONFIGURE_DEPENDS licenses/*.txt)
 set(DATA_FILES resources/langs.model.xml resources/stylers.model.xml resources/omapad.icns LICENSE NOTICE)
 # Scintilla loads its cursors as TIFF. Its Xcode project makes these from the PNGs in cocoa/res.
@@ -60,7 +60,7 @@ set(SCI_RES_FILES
 
 add_executable(omapad MACOSX_BUNDLE
   mac/main.mm mac/AppController.mm mac/TabBar.mm mac/FindPanel.mm mac/FolderPanel.mm mac/FunctionPanel.mm mac/Dialogs.mm
-  ${DATA_FILES} ${THEME_FILES} ${COMPLETION_FILES} ${FUNCTION_FILES} ${SCI_RES_FILES} ${LICENSE_FILES})
+  ${DATA_FILES} ${THEME_FILES} ${COMPLETION_FILES} ${FUNCTION_FILES} ${USER_LANGUAGE_FILES} ${SCI_RES_FILES} ${LICENSE_FILES})
 target_link_libraries(omapad PRIVATE omapad_core "-framework Cocoa" "-framework QuartzCore")
 target_include_directories(omapad PRIVATE mac)
 target_compile_options(omapad PRIVATE -fobjc-arc -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations)
@@ -72,13 +72,14 @@ set_source_files_properties(${DATA_FILES} ${SCI_RES_FILES} PROPERTIES MACOSX_PAC
 set_source_files_properties(${THEME_FILES} PROPERTIES MACOSX_PACKAGE_LOCATION Resources/themes)
 set_source_files_properties(${COMPLETION_FILES} PROPERTIES MACOSX_PACKAGE_LOCATION Resources/autoCompletion)
 set_source_files_properties(${FUNCTION_FILES} PROPERTIES MACOSX_PACKAGE_LOCATION Resources/functionList)
+set_source_files_properties(${USER_LANGUAGE_FILES} PROPERTIES MACOSX_PACKAGE_LOCATION Resources/userDefineLangs)
 set_source_files_properties(${LICENSE_FILES} PROPERTIES MACOSX_PACKAGE_LOCATION Resources/licenses)
 
 # --- Tests: pure logic plus the real Workspace with real, hidden editor views.
 enable_testing()
-add_executable(omapad_tests tests/core_tests.cpp tests/TestViews_mac.mm)
+add_executable(omapad_tests tests/core_tests.cpp tests/TestViews_mac.mm mac/Dialogs.mm)
 target_link_libraries(omapad_tests PRIVATE omapad_core "-framework Cocoa" "-framework QuartzCore")
-target_include_directories(omapad_tests PRIVATE tests)
-set_source_files_properties(tests/TestViews_mac.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+target_include_directories(omapad_tests PRIVATE tests mac)
+set_source_files_properties(tests/TestViews_mac.mm mac/Dialogs.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 target_compile_definitions(omapad_tests PRIVATE OMAPAD_RESOURCES="${CMAKE_SOURCE_DIR}/resources")
 add_test(NAME omapad_tests COMMAND omapad_tests)

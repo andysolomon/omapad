@@ -32,3 +32,15 @@ std::unique_ptr<omapad::SciView> makeHiddenSciView(std::function<void(const SCNo
 	g_signal_connect(out->widget, SCINTILLA_NOTIFY, G_CALLBACK(onNotify), out.get());
 	return out;
 }
+
+void *makeTestSurface() {
+	cairo_surface_t *image = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 600, 800);
+	cairo_t *context = cairo_create(image);
+	cairo_surface_destroy(image);
+	return context;
+}
+
+void freeTestSurface(void *surface) { cairo_destroy(static_cast<cairo_t *>(surface)); }
+
+// GtkPrintOperation needs the application's window, so the Linux PDF is checked by driving the app.
+bool writeTestPdf(omapad::PrintJob &, const omapad::PrintOutput &, std::string &) { return false; }

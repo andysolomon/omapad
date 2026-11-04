@@ -2,6 +2,7 @@
 // Tests pure logic directly, then drives the real Workspace with real Scintilla views,
 // against real files in a temporary folder. Runs the same on macOS and Linux.
 #include "TestViews.h"
+#include "SciLexer.h"
 #include "Scintilla.h"
 #include "TextCore.h"
 #include "Workspace.h"
@@ -57,7 +58,7 @@ static void sleepForMtime() { usleep(1100 * 1000); }
 // A host with real editor views and no windows. Questions get canned answers.
 struct TestHost : Host {
 	Workspace *workspace = nullptr;
-	std::unique_ptr<SciView> panes[2], results, background, map;
+	std::unique_ptr<SciView> panes[2], results, background, map, printer;
 	std::deque<std::function<void()>> queue;
 	std::mutex queueLock;
 	int answer = 0;
@@ -82,18 +83,29 @@ struct TestHost : Host {
 		results = makeHiddenSciView([this](const SCNotification &n) { if (workspace) workspace->resultsNotification(n); });
 		background = makeHiddenSciView(nullptr);
 		map = makeHiddenSciView(nullptr);
+		printer = makeHiddenSciView(nullptr);
 	}
 	SciView &paneView(int pane) override { return *panes[pane]; }
 	SciView &resultsView() override { return *results; }
 	SciView &backgroundView() override { return *background; }
+	SciView &printView() override { return *printer; }
 	SciView &mapView() override { return *map; }
 	int ask(const std::string &title, const std::string &, const std::vector<std::string> &) override {
 		prompts++;
 		lastTitle = title;
 		return answer;
 	}
-	bool chooseFilesToOpen(const std::string &, std::vector<std::string> &) override { return false; }
-	bool chooseSavePath(const std::string &, const std::string &, std::string &) override { return false; }
+	std::vector<std::string> filesToOpen;
+	std::string savePath, savePathSuggested;
+	bool chooseFilesToOpen(const std::string &, std::vector<std::string> &out) override {
+		out = filesToOpen;
+		return !out.empty();
+	}
+	bool chooseSavePath(const std::string &name, const std::string &, std::string &out) override {
+		savePathSuggested = name;
+		out = savePath;
+		return !out.empty();
+	}
 	bool chooseFolder(const std::string &, std::string &) override { return false; }
 	bool chooseFont(std::string &, double &) override { return false; }
 	bool promptText(const std::string &, const std::string &, const std::string &, std::string &out) override {
@@ -124,6 +136,29 @@ struct TestHost : Host {
 		return formAnswer ? formAnswer(fields) : false;
 	}
 	void runShortcutMapper() override { mapperRuns++; }
+	bool print(PrintJob &job, const PrintOutput &output, std::string &error) override {
+		printRuns++;
+		if (duringPrint) duringPrint();
+		lastPrintOutput = output;
+		lastPrintStart = job.settings().start;
+		lastPrintEnd = job.settings().end;
+		lastPrintColourMode = job.settings().colourMode;
+		lastPrintPageCount = 0;
+		if (void *surface = makeTestSurface()) {
+			job.paginate(surface, 500, 700);
+			lastPrintPageCount = job.pageCount();
+			job.drawPage(surface, 0, 500, 700);
+			lastPrintFooter = job.footer(0).middle;
+			lastPrintHeader = job.header(0).left;
+			freeTestSurface(surface);
+		}
+		if (!printError.empty()) {
+			error = printError;
+			return false;
+		}
+		if (!output.pdfPath.empty()) pdfWritten = writeTestPdf(job, output, error);
+		return true;
+	}
 	void setDocumentMapVisible(bool visible) override { mapVisible = visible; }
 	void setFunctionListVisible(bool visible) override { functionVisible = visible; }
 	void functionListChanged() override { functionListChangedCount++; }
@@ -139,6 +174,12 @@ struct TestHost : Host {
 		std::lock_guard<std::mutex> lock(queueLock);
 		queue.push_back(std::move(work));
 	}
+	int printRuns = 0, lastPrintPageCount = 0, lastPrintColourMode = -1;
+	intptr_t lastPrintStart = 0, lastPrintEnd = 0;
+	PrintOutput lastPrintOutput;
+	std::string lastPrintFooter, lastPrintHeader, printError;
+	std::function<void()> duringPrint;
+	bool pdfWritten = false;
 	void quit() override {}
 	void drain() {
 		for (;;) {
@@ -1866,6 +1907,457 @@ static void testChangeHistoryAndStyles(const std::string &tmp, const std::string
 	w.run(Cmd::CloseAll);
 }
 
+static const char *kTestLanguage = R"(<?xml version="1.0" encoding="UTF-8" ?>
+<NotepadPlus>
+    <UserLang name="Zed" ext="zed zdl" udlVersion="2.1">
+        <Settings>
+            <Global caseIgnored="yes" allowFoldOfComments="no" foldCompact="no" forcePureLC="0" decimalSeparator="0" />
+            <Prefix Keywords1="no" Keywords2="yes" Keywords3="no" Keywords4="no" Keywords5="no" Keywords6="no" Keywords7="no" Keywords8="no" />
+        </Settings>
+        <KeywordLists>
+            <Keywords name="Comments">00// 01 02((EOL)) 03/* 04*/</Keywords>
+            <Keywords name="Numbers, prefix1">0x</Keywords>
+            <Keywords name="Operators1">+ - =</Keywords>
+            <Keywords name="Folders in code1, open">begin</Keywords>
+            <Keywords name="Folders in code1, close">finish</Keywords>
+            <Keywords name="Keywords1">alpha &quot;else if&quot;</Keywords>
+            <Keywords name="Keywords2">pre</Keywords>
+            <Keywords name="Delimiters">00&quot; 01\ 02&quot; 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21 22 23</Keywords>
+        </KeywordLists>
+        <Styles>
+            <WordsStyle name="DEFAULT" fgColor="111111" bgColor="FFFFFF" colorStyle="0" fontName="" fontStyle="0" nesting="0" />
+            <WordsStyle name="COMMENTS" fgColor="00FF00" bgColor="FFFFFF" colorStyle="1" fontName="" fontStyle="2" nesting="0" />
+            <WordsStyle name="KEYWORDS1" fgColor="FF0000" bgColor="000000" colorStyle="3" fontName="" fontStyle="1" nesting="0" />
+            <WordsStyle name="DELIMITERS1" fgColor="0000FF" bgColor="FFFFFF" colorStyle="1" fontName="" fontStyle="0" nesting="1024" />
+        </Styles>
+    </UserLang>
+</NotepadPlus>
+)";
+
+static void testUserLanguageFormat() {
+	const std::vector<UserLanguage> parsed = parseUserLanguages(kTestLanguage);
+	check(parsed.size() == 1, "the language is read");
+	if (parsed.size() != 1) return;
+	const UserLanguage &zed = parsed[0];
+	check(zed.name == "Zed" && zed.extensions == "zed zdl", "name and extensions");
+	check(zed.caseIgnored && !zed.foldCompact, "global settings");
+	check(!zed.prefix[0] && zed.prefix[1], "keyword prefix settings");
+	check(zed.keywords[SCE_USER_KWLIST_KEYWORDS1] == "alpha \"else if\"", "a keyword list");
+	check(zed.styles[SCE_USER_STYLE_KEYWORD1].fg == "FF0000" && zed.styles[SCE_USER_STYLE_KEYWORD1].colorStyle == 3, "a style's colours");
+	check(zed.styles[SCE_USER_STYLE_DELIMITER1].nesting == 1024, "a style's nesting");
+
+	// Groups, including an alternative with a space in it.
+	const std::vector<std::string> groups = userGroups("00# 00// 01 02((EOL)) 03/* 05((EOL `)) 05~~~", 6);
+	check(groups[0] == "# //" && groups[1].empty() && groups[2] == "((EOL))" && groups[3] == "/*", "groups are split");
+	check(groups[5] == "((EOL `)) ~~~", "a group can have spaces inside double parentheses");
+	check(userGroupTokens(groups[5]).size() == 2, "double parentheses count as one alternative");
+	check(encodeUserGroups(groups) == "00# 00// 01 02((EOL)) 03/* 04 05((EOL `)) 05~~~", "groups are written back");
+
+	std::string line, open, close;
+	userCommentTokens(zed, line, open, close);
+	check(line == "//" && open == "/*" && close == "*/", "comment markers for the comment commands");
+
+	check(lexerKeywords("one \"else if\" 'a b'") == "one else\vif a\bb", "quoted phrases get the lexer's markers");
+	check(lexerKeywords("a\\\"b") == "a\"b", "an escaped quote stays");
+
+	check(userLanguageFileName("My Lang/../x") == "My_Lang____x.udl.xml", "a file name can't leave the folder");
+	check(userLanguageFileName("") == "language.udl.xml", "an empty name still gets a file name");
+
+	// Writing and reading again keeps everything.
+	const std::vector<UserLanguage> again = parseUserLanguages(writeUserLanguages(parsed));
+	check(again.size() == 1, "the written language reads back");
+	if (again.size() == 1) {
+		bool same = again[0].name == zed.name && again[0].extensions == zed.extensions && again[0].caseIgnored == zed.caseIgnored;
+		for (int i = 0; i < kUserKeywordLists; i++) same = same && again[0].keywords[i] == zed.keywords[i];
+		for (int i = 0; i < kUserStyles; i++) {
+			const UserStyle &a = again[0].styles[i], &b = zed.styles[i];
+			same = same && a.fg == b.fg && a.bg == b.bg && a.colorStyle == b.colorStyle && a.fontStyle == b.fontStyle && a.nesting == b.nesting;
+		}
+		check(same, "writing loses nothing");
+	}
+
+	// The form doesn't change anything unless it's changed.
+	UserLanguage edited = zed;
+	std::vector<FormField> fields = userLanguageFields(edited);
+	check(applyUserLanguageFields(fields, edited), "the form applies");
+	bool formSame = edited.name == zed.name;
+	for (int i = 0; i < kUserKeywordLists; i++) {
+		if (i == SCE_USER_KWLIST_COMMENTS || i == SCE_USER_KWLIST_DELIMITERS) continue;
+		formSame = formSame && edited.keywords[i] == zed.keywords[i];
+	}
+	for (int i = 0; i < kUserStyles; i++) {
+		const UserStyle &a = edited.styles[i], &b = zed.styles[i];
+		formSame = formSame && a.fg == b.fg && a.bg == b.bg && a.colorStyle == b.colorStyle && a.fontStyle == b.fontStyle;
+	}
+	check(formSame, "an untouched form keeps keywords and styles");
+	check(edited.keywords[SCE_USER_KWLIST_COMMENTS] == zed.keywords[SCE_USER_KWLIST_COMMENTS], "an untouched form keeps the comments");
+	check(edited.keywords[SCE_USER_KWLIST_DELIMITERS] == zed.keywords[SCE_USER_KWLIST_DELIMITERS], "an untouched form keeps the delimiters");
+	check(edited.styles[SCE_USER_STYLE_DELIMITER1].nesting == 1024, "an untouched form keeps nesting");
+	// Turning a colour off keeps it stored.
+	for (FormField &field : fields) {
+		if (field.key == "style" + std::to_string(SCE_USER_STYLE_KEYWORD1)) field.value = ",000000,5";
+		if (field.key == "name") field.value = "";
+	}
+	check(!applyUserLanguageFields(fields, edited), "a language needs a name");
+	check(edited.styles[SCE_USER_STYLE_KEYWORD1].colorStyle == 2 && edited.styles[SCE_USER_STYLE_KEYWORD1].fg == "FF0000", "a colour turned off stays stored");
+	check(edited.styles[SCE_USER_STYLE_KEYWORD1].fontStyle == 5, "font style bits apply");
+
+	// The files that come with omapad, which also show the real format.
+	const std::vector<UserLanguage> markdown = loadUserLanguageFile(std::string(OMAPAD_RESOURCES) + "/userDefineLangs/markdown._preinstalled.udl.xml");
+	check(markdown.size() == 1 && markdown[0].name == "Markdown (preinstalled)", "the shipped language is read");
+	if (markdown.size() == 1) {
+		check(userGroups(markdown[0].keywords[SCE_USER_KWLIST_DELIMITERS], 24)[5] == "``` ((EOL `)) ~~~", "the shipped delimiters are understood");
+		UserLanguage copy = markdown[0];
+		std::vector<FormField> form = userLanguageFields(copy);
+		applyUserLanguageFields(form, copy);
+		check(copy.keywords[SCE_USER_KWLIST_DELIMITERS] == markdown[0].keywords[SCE_USER_KWLIST_DELIMITERS], "the shipped delimiters survive the form");
+		check(copy.keywords[SCE_USER_KWLIST_COMMENTS] == markdown[0].keywords[SCE_USER_KWLIST_COMMENTS], "the shipped comments survive the form");
+	}
+
+	// Formats from before 2.0.
+	const std::vector<UserLanguage> old = parseUserLanguages(R"(<NotepadPlus><UserLang name="Old" ext="old">
+		<Settings><Global caseIgnored="no" /><TreatAsSymbol comment="no" /><Prefix words1="yes" words2="no" words3="no" words4="no" /></Settings>
+		<KeywordLists>
+			<Keywords name="Delimiters">"'0"'0</Keywords>
+			<Keywords name="Folder+">begin</Keywords><Keywords name="Words1">one two</Keywords>
+			<Keywords name="Comment">0# 1/* 2*/</Keywords>
+		</KeywordLists>
+		<Styles><WordsStyle name="KEYWORD1" fgColor="123456" bgColor="FFFFFF" /></Styles>
+	</UserLang></NotepadPlus>)");
+	check(old.size() == 1, "an old language is read");
+	if (old.size() == 1) {
+		check(old[0].prefix[0], "old prefix settings");
+		check(old[0].keywords[SCE_USER_KWLIST_KEYWORDS1] == "one two", "old keyword names");
+		check(old[0].keywords[SCE_USER_KWLIST_FOLDERS_IN_CODE1_OPEN] == "begin", "old folding names");
+		const std::vector<std::string> oldComments = userGroups(old[0].keywords[SCE_USER_KWLIST_COMMENTS], 5);
+		check(oldComments[0] == "#" && oldComments[3] == "/*" && oldComments[4] == "*/", "old comments convert");
+		const std::vector<std::string> oldDelimiters = userGroups(old[0].keywords[SCE_USER_KWLIST_DELIMITERS], 24);
+		check(oldDelimiters[0] == "\"" && oldDelimiters[2] == "\"" && oldDelimiters[3] == "'" && oldDelimiters[5] == "'", "old delimiters convert");
+		check(old[0].styles[SCE_USER_STYLE_KEYWORD1].fg == "123456" && old[0].styles[SCE_USER_STYLE_KEYWORD1].colorStyle == 3, "old styles, whose colours count as on");
+	}
+	check(parseUserLanguages("not xml").empty(), "a bad file has no languages");
+}
+
+static void testUserLanguageCommands(const std::string &tmp, const std::string &support) {
+	const std::string definition = writeFile(tmp, "zed.udl.xml", kTestLanguage);
+	const std::string source = "alpha other // note\n\"str alpha\" 0x1F\nbegin\n  prefixed\nfinish\nALPHA\n";
+	{
+		Fixture f(support);
+		Workspace &e = f.w;
+		// Importing.
+		f.host.filesToOpen = {definition};
+		const int menus = f.host.menusChangedCount;
+		e.run(Cmd::ImportLanguage);
+		check(f.host.flashed == "Imported 1 language", "importing says what it did");
+		check(f.host.menusChangedCount > menus, "the menus change after an import");
+		std::vector<MenuItem> menu = e.mainMenu();
+		const MenuItem *languages = nullptr;
+		for (const MenuItem &top : menu)
+			if (top.title == "Language") languages = &top;
+		bool listed = false;
+		if (languages)
+			for (const MenuItem &entry : languages->children) listed = listed || entry.text == "udl:Zed";
+		check(listed, "the language is in the Language menu");
+
+		// Files with its extension use it, and it colours them.
+		const std::string path = writeFile(tmp, "code.ZED", source);
+		check(e.openPath(path), "open a file in the language");
+		check(e.activeLanguageName() == "udl:Zed", "the extension picks the language, whatever its case");
+		SciView &v = f.v();
+		v.send(SCI_COLOURISE, 0, -1);
+		const auto styleOf = [&](const std::string &needle, int from = 0) {
+			const size_t at = source.find(needle, from);
+			return static_cast<int>(v.send(SCI_GETSTYLEAT, at));
+		};
+		check(styleOf("alpha") == SCE_USER_STYLE_KEYWORD1, "a keyword gets its style");
+		check(styleOf("other") == SCE_USER_STYLE_DEFAULT, "other text stays default");
+		check(styleOf("// note") == SCE_USER_STYLE_COMMENTLINE, "a line comment gets its style");
+		check(styleOf("\"str") == SCE_USER_STYLE_DELIMITER1, "a delimiter gets its style");
+		check(styleOf("0x1F") == SCE_USER_STYLE_NUMBER, "a prefixed number gets its style");
+		check(styleOf("ALPHA") == SCE_USER_STYLE_KEYWORD1, "ignoring case works");
+		check(styleOf("begin") == SCE_USER_STYLE_FOLDER_IN_CODE1, "a fold word gets its style");
+		check(styleOf("prefixed") == SCE_USER_STYLE_KEYWORD2, "a prefix keyword matches the start of a word");
+		// Nesting: keyword 1 inside delimiter 1.
+		check(static_cast<int>(v.send(SCI_GETSTYLEAT, source.find("alpha", source.find("str")))) == SCE_USER_STYLE_KEYWORD1, "nesting lets a keyword show in a string");
+		check((v.send(SCI_GETFOLDLEVEL, 2) & SC_FOLDLEVELHEADERFLAG) != 0, "fold words make a fold");
+		// Whatever comes before it, the fold is on the line with the word.
+		for (const char *before : {"x\n", "x // c\n", "// c\n\n", "x // a\n// b\n", "\"a\"\n", "0x1F\n", "/* a\nb */\n", "x // c\r\n", "x\r\n"}) {
+			const std::string sample = std::string(before) + "begin\ny\nfinish\nz\n";
+			v.send(SCI_SETTEXT, 0, reinterpret_cast<intptr_t>(sample.c_str()));
+			v.send(SCI_COLOURISE, 0, -1);
+			const intptr_t line = v.send(SCI_LINEFROMPOSITION, sample.find("begin"));
+			check((v.send(SCI_GETFOLDLEVEL, line) & SC_FOLDLEVELHEADERFLAG) != 0, "the fold is on its own line", before);
+			if (line > 0) check((v.send(SCI_GETFOLDLEVEL, line - 1) & SC_FOLDLEVELHEADERFLAG) == 0, "the line before isn't a fold", before);
+			check((v.send(SCI_GETFOLDLEVEL, line + 3) & SC_FOLDLEVELNUMBERMASK) == (v.send(SCI_GETFOLDLEVEL, line) & SC_FOLDLEVELNUMBERMASK), "the fold closes on time", before);
+		}
+		v.send(SCI_SETTEXT, 0, reinterpret_cast<intptr_t>(source.c_str()));
+		v.send(SCI_COLOURISE, 0, -1);
+		check(v.send(SCI_STYLEGETBOLD, SCE_USER_STYLE_KEYWORD1) != 0, "styles apply bold");
+		check(v.send(SCI_STYLEGETFORE, SCE_USER_STYLE_KEYWORD1) == 0x0000FF, "styles apply the colour");
+		check(v.send(SCI_STYLEGETFORE, SCE_USER_STYLE_DEFAULT) != 0x111111, "a colour that's off leaves the theme's");
+
+		// The comment commands use its markers.
+		v.send(SCI_GOTOLINE, 3);
+		e.run(Cmd::Comment);
+		v.send(SCI_GOTOLINE, 3);
+		check(v.send(SCI_POSITIONFROMLINE, 3) >= 0 && e.text().find("// ") != std::string::npos, "commenting uses the language's marker");
+		e.run(Cmd::Comment);
+
+		// Redefining it through the form changes open tabs.
+		f.host.formAnswer = [&](std::vector<FormField> &form) {
+			for (FormField &field : form) {
+				if (field.key == "language") field.value = "Zed";
+				if (field.key == "list" + std::to_string(SCE_USER_KWLIST_KEYWORDS1)) field.value = "other";
+			}
+			return true;
+		};
+		e.run(Cmd::DefineLanguage);
+		v.send(SCI_COLOURISE, 0, -1);
+		check(styleOf("other") == SCE_USER_STYLE_KEYWORD1, "new keywords apply to the open tab");
+		check(styleOf("alpha") == SCE_USER_STYLE_DEFAULT, "old keywords stop applying");
+
+		// Renaming keeps the tab on it, and leaves one file behind.
+		f.host.formAnswer = [&](std::vector<FormField> &form) {
+			for (FormField &field : form) {
+				if (field.key == "language") field.value = "Zed";
+				if (field.key == "name") field.value = "Zed Two";
+			}
+			return true;
+		};
+		e.run(Cmd::DefineLanguage);
+		check(e.activeLanguageName() == "udl:Zed Two", "a renamed language stays on its tabs");
+		check(!fs::exists(support + "/settings/userDefineLangs/Zed.udl.xml"), "renaming removes the old file");
+		check(fs::exists(support + "/settings/userDefineLangs/Zed_Two.udl.xml"), "renaming writes the new file");
+
+		// A new language needs a name, and becomes the tab's.
+		f.host.formAnswer = [&](std::vector<FormField> &form) {
+			for (FormField &field : form)
+				if (field.key == "name") field.value = "";
+			return true;
+		};
+		f.host.answer = 0;
+		e.run(Cmd::DefineLanguage);
+		check(!fs::exists(support + "/settings/userDefineLangs/language.udl.xml"), "no name, no language");
+		f.host.formAnswer = [&](std::vector<FormField> &form) {
+			for (FormField &field : form) {
+				if (field.key == "name") field.value = "Fresh";
+				if (field.key == "extensions") field.value = "fresh Fresh.conf";
+			}
+			return true;
+		};
+		e.run(Cmd::DefineLanguage);
+		check(e.activeLanguageName() == "udl:Fresh", "a new language applies to the tab");
+		const std::string whole = writeFile(tmp, "fresh.conf", "x");
+		check(e.openPath(whole) && e.activeLanguageName() == "udl:Fresh", "a language can claim a whole file name");
+		e.run(Cmd::Close);
+
+		// Export writes a file that imports.
+		f.host.savePath = tmp + "/exported.xml";
+		f.host.formAnswer = [&](std::vector<FormField> &form) {
+			for (FormField &field : form)
+				if (field.key == "language") field.value = "Fresh";
+			return true;
+		};
+		e.run(Cmd::ExportLanguage);
+		check(f.host.savePathSuggested == "Fresh.udl.xml", "export suggests a name");
+		check(loadUserLanguageFile(tmp + "/exported.xml").size() == 1, "the export reads back");
+		check(e.writeSession(), "the session saves");
+	}
+	{
+		// A new run still has them, and restores the tab's language.
+		Fixture f(support);
+		Workspace &e = f.w;
+		check(e.restoreSession(), "the session comes back");
+		bool found = false;
+		for (const TabInfo &tab : e.tabs(0)) found = found || tab.title == "code.ZED";
+		check(found, "the tab comes back");
+		check(e.openPath(tmp + "/code.ZED") && e.activeLanguageName() == "udl:Fresh", "its language is remembered over a restart");
+
+		// Removing puts tabs on normal text and takes the file away.
+		f.host.answer = 1;
+		f.host.formAnswer = [&](std::vector<FormField> &form) {
+			for (FormField &field : form)
+				if (field.key == "language") field.value = "Fresh";
+			return true;
+		};
+		e.run(Cmd::RemoveLanguage);
+		check(e.activeLanguageName() == "normal", "a removed language leaves normal text");
+		check(!fs::exists(support + "/settings/userDefineLangs/Fresh.udl.xml"), "removing takes the file away");
+
+		// Importing something else says so.
+		f.host.answer = 0;
+		f.host.filesToOpen = {writeFile(tmp, "notalang.xml", "<NotepadPlus></NotepadPlus>")};
+		const std::string before = f.host.flashed;
+		e.run(Cmd::ImportLanguage);
+		check(f.host.flashed == before, "a file without languages imports nothing");
+
+		// What ships can't be removed but works, in the variant for the theme.
+		const std::string md = writeFile(tmp, "notes.md", "# Title\n\nSome **bold** text\n");
+		check(e.openPath(md) && e.activeLanguageName() == "udl:Markdown (preinstalled)", "Markdown works out of the box");
+		f.v().send(SCI_COLOURISE, 0, -1);
+		check(f.v().send(SCI_GETSTYLEAT, 0) == SCE_USER_STYLE_COMMENTLINE, "a Markdown heading is coloured");
+		const intptr_t lightColour = f.v().send(SCI_STYLEGETFORE, SCE_USER_STYLE_COMMENTLINE);
+		e.run(Cmd::SetTheme, 0, "DarkModeDefault");
+		check(f.v().send(SCI_STYLEGETFORE, SCE_USER_STYLE_COMMENTLINE) != lightColour, "a dark theme uses the dark variant");
+		e.run(Cmd::SetTheme, 0, "Default");
+
+		// Changing it makes a personal copy that wins, and removing that brings the original back.
+		const auto colouredFor = [&](const char *word) {
+			f.v().send(SCI_COLOURISE, 0, -1);
+			return static_cast<int>(f.v().send(SCI_GETSTYLEAT, e.text().find(word)));
+		};
+		check(colouredFor("Some") == SCE_USER_STYLE_DEFAULT, "before overriding, the word is plain");
+		MenuItem remove;
+		remove.cmd = Cmd::RemoveLanguage;
+		check(!e.stateOf(remove).enabled, "what ships can't be removed");
+		f.host.formAnswer = [&](std::vector<FormField> &form) {
+			for (FormField &field : form) {
+				if (field.key == "language") field.value = "Markdown (preinstalled)";
+				if (field.key == "list" + std::to_string(SCE_USER_KWLIST_KEYWORDS8)) field.value = "Some";
+			}
+			return true;
+		};
+		e.run(Cmd::DefineLanguage);
+		check(e.activeLanguageName() == "udl:Markdown (preinstalled)", "the override keeps the name");
+		check(colouredFor("Some") == SCE_USER_STYLE_KEYWORD8, "the override applies");
+		check(e.stateOf(remove).enabled, "an override can be removed");
+		f.host.answer = 1;
+		f.host.formAnswer = [&](std::vector<FormField> &form) {
+			for (FormField &field : form)
+				if (field.key == "language") field.value = "Markdown (preinstalled)";
+			return true;
+		};
+		e.run(Cmd::RemoveLanguage);
+		check(e.activeLanguageName() == "udl:Markdown (preinstalled)", "removing an override goes back to the original");
+		check(colouredFor("Some") == SCE_USER_STYLE_DEFAULT, "the original's keywords are back");
+		check(!e.stateOf(remove).enabled, "nothing is left to remove");
+	}
+}
+
+static void testPrinting(const std::string &tmp, const std::string &support) {
+	Fixture f(support);
+	Workspace &e = f.w;
+	std::string many;
+	for (int i = 0; i < 600; i++) many += "line number " + std::to_string(i) + "\n";
+	const std::string path = writeFile(tmp, "print.txt", many);
+	check(e.openPath(path), "open a long file");
+	SciView &v = f.v();
+	const intptr_t margin = v.send(SCI_GETMARGINWIDTHN, 0);
+	const intptr_t editorColour = v.send(SCI_STYLEGETBACK, STYLE_DEFAULT);
+
+	// While printing, the editor is left alone and a hidden view does the work.
+	f.host.duringPrint = [&]() {
+		check(f.host.printer->send(SCI_GETDOCPOINTER) == v.send(SCI_GETDOCPOINTER), "the print view shows the document");
+		check(v.send(SCI_STYLEGETBACK, STYLE_DEFAULT) == editorColour, "the editor keeps its colours while printing");
+		check(f.host.printer->send(SCI_GETMARGINWIDTHN, 0) > 0, "line numbers are on for the printout");
+		check(f.host.printer->send(SCI_INDICGETSTYLE, 30) == INDIC_HIDDEN, "smart highlights don't print");
+		check(f.host.printer->send(SCI_INDICGETSTYLE, 25) == v.send(SCI_INDICGETSTYLE, 25), "token styles print as they look");
+	};
+	e.run(Cmd::Print);
+	f.host.duringPrint = nullptr;
+	check(f.host.printer->send(SCI_GETDOCPOINTER) != v.send(SCI_GETDOCPOINTER), "the print view lets go of the document");
+	check(f.host.printRuns == 1, "printing reaches the platform");
+	check(f.host.lastPrintOutput.showDialog && f.host.lastPrintOutput.pdfPath.empty(), "Print shows the dialog");
+	check(f.host.lastPrintStart == 0 && f.host.lastPrintEnd == v.send(SCI_GETLENGTH), "Print covers the document");
+	check(f.host.lastPrintPageCount > 3, "a long file takes several pages");
+	check(f.host.lastPrintHeader == "print.txt", "the header says which file");
+	check(f.host.lastPrintFooter == "1 / " + std::to_string(f.host.lastPrintPageCount), "the footer numbers the page");
+	check(v.send(SCI_GETMARGINWIDTHN, 0) == margin, "the editor's margin is unchanged");
+
+	e.run(Cmd::PrintNow);
+	check(!f.host.lastPrintOutput.showDialog, "Print Now skips the dialog");
+
+	// A selection.
+	MenuItem selection;
+	selection.cmd = Cmd::PrintSelection;
+	v.send(SCI_SETEMPTYSELECTION, 0);
+	check(!e.stateOf(selection).enabled, "Print Selection needs a selection");
+	const int runs = f.host.printRuns;
+	e.run(Cmd::PrintSelection);
+	check(f.host.printRuns == runs && f.host.flashed == "Nothing is selected", "an empty selection doesn't print");
+	v.send(SCI_SETSEL, 10, 30);
+	check(e.stateOf(selection).enabled, "Print Selection is on with a selection");
+	e.run(Cmd::PrintSelection);
+	check(f.host.lastPrintStart == 10 && f.host.lastPrintEnd == 30 && f.host.lastPrintPageCount == 1, "only the selection prints");
+	v.send(SCI_SETEMPTYSELECTION, 0);
+
+	// A PDF.
+	f.host.savePath.clear();
+	const int beforePdf = f.host.printRuns;
+	e.run(Cmd::SaveAsPdf);
+	check(f.host.printRuns == beforePdf, "cancelling the save doesn't print");
+	check(f.host.savePathSuggested == "print.pdf", "the PDF is named after the file");
+	f.host.savePath = tmp + "/out.pdf";
+	e.run(Cmd::SaveAsPdf);
+	check(f.host.lastPrintOutput.pdfPath == tmp + "/out.pdf" && !f.host.lastPrintOutput.showDialog, "Save as PDF asks for a file");
+	if (f.host.pdfWritten) {
+		std::ifstream pdf(tmp + "/out.pdf", std::ios::binary);
+		std::string start(5, '\0');
+		pdf.read(&start[0], 5);
+		check(start == "%PDF-", "Save as PDF writes a PDF");
+		// The same again from a dark theme, for looking at by hand.
+		if (const char *keep = std::getenv("OMAPAD_KEEP_PDF")) {
+			e.run(Cmd::SetTheme, 0, "DarkModeDefault");
+			f.host.savePath = keep;
+			e.run(Cmd::SaveAsPdf);
+			e.run(Cmd::SetTheme, 0, "Default");
+		}
+	}
+	f.host.savePath.clear();
+
+	// Colours.
+	e.run(Cmd::SetTheme, 0, "Default");
+	e.run(Cmd::Print);
+	check(f.host.lastPrintColourMode == SC_PRINT_COLOURONWHITE, "a light theme prints its colours on white");
+	e.run(Cmd::SetTheme, 0, "DarkModeDefault");
+	e.run(Cmd::Print);
+	check(f.host.lastPrintColourMode == SC_PRINT_COLOURONWHITE, "a dark theme prints on white too");
+	const intptr_t darkEditor = v.send(SCI_STYLEGETFORE, STYLE_DEFAULT);
+	f.host.duringPrint = [&]() {
+		check(f.host.printer->send(SCI_STYLEGETFORE, STYLE_DEFAULT) != darkEditor, "a dark theme's text isn't what's printed");
+	};
+	e.run(Cmd::Print);
+	f.host.duringPrint = nullptr;
+	check(v.send(SCI_STYLEGETFORE, STYLE_DEFAULT) == darkEditor, "the editor stays dark");
+	e.run(Cmd::SetTheme, 0, "Default");
+
+	// Preferences.
+	f.host.formAnswer = [&](std::vector<FormField> &form) {
+		for (FormField &field : form) {
+			if (field.key == "printColours") field.value = "black";
+			if (field.key == "printFooterMiddle") field.value = "Page $(CURRENT_PRINTING_PAGE)";
+			if (field.key == "printHeaderLeft") field.value = "$(FULL_CURRENT_PATH)";
+			if (field.key == "printLineNumbers") field.value = "0";
+			if (field.key == "printMarginTop") field.value = "500";
+		}
+		return true;
+	};
+	e.run(Cmd::ShowPreferences);
+	e.run(Cmd::Print);
+	check(f.host.lastPrintColourMode == SC_PRINT_BLACKONWHITE, "the colour preference applies");
+	check(f.host.lastPrintFooter == "Page 1", "footer preference applies");
+	check(f.host.lastPrintHeader == path, "header preference applies");
+	int marginShown = 0;
+	f.host.formAnswer = [&](std::vector<FormField> &form) {
+		for (const FormField &field : form)
+			if (field.key == "printMarginTop") marginShown = std::atoi(field.value.c_str());
+		return false;
+	};
+	e.run(Cmd::ShowPreferences);
+	check(marginShown == 100, "a margin is limited");
+
+	// A failure says so.
+	f.host.printError = "No printer";
+	e.run(Cmd::Print);
+	check(f.host.lastTitle == "The document could not be printed.", "a failed print says so");
+	f.host.printError.clear();
+
+	// An empty document is one blank page rather than none.
+	e.run(Cmd::New);
+	e.run(Cmd::Print);
+	check(f.host.lastPrintPageCount == 1, "an empty document prints one page");
+}
+
 static void testDocumentMapAndMisc(const std::string &tmp, const std::string &support) {
 	Fixture f(support);
 	Workspace &e = f.w;
@@ -2018,6 +2510,12 @@ int main() {
 	testChangeHistoryAndStyles(tmp, support);
 	printf("== testDocumentMapAndMisc\n");
 	testDocumentMapAndMisc(tmp, support);
+	printf("== testUserLanguageFormat\n");
+	testUserLanguageFormat();
+	printf("== testUserLanguageCommands\n");
+	testUserLanguageCommands(tmp, support + "-udl");
+	printf("== testPrinting\n");
+	testPrinting(tmp, support + "-print");
 
 	std::error_code error;
 	chmod((tmp + "/locked").c_str(), 0700);

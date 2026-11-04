@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "UserLanguage.h"
+
 namespace omapad {
 
 // One Scintilla view. Each platform wraps its own widget in this.
@@ -25,6 +27,9 @@ struct Language {
 	std::map<std::string, std::string> keywords;
 	int tabSize = 0;  // 0 means use the editor's setting.
 	bool tabsToSpaces = false;
+	// Set for a user-defined language. Dark is the variant for dark themes, if it has one.
+	std::shared_ptr<const UserLanguage> user, userDark;
+	std::string userFile;  // The file in the person's folder. Empty for one shipped with the app.
 };
 
 // One style row from a theme: colours and bold/italic/underline.
@@ -57,12 +62,17 @@ public:
 
 	const std::vector<const Language *> &languages() const { return menuLanguages; }  // Sorted for menus.
 	const Language *plainText() const { return plain; }
+	const std::vector<const Language *> &userLanguages() const { return menuUserLanguages; }  // Sorted for menus.
 	const std::vector<std::string> &themeNames() const { return themes; }
 	const Language *languageNamed(const std::string &name) const;  // Falls back to plain text.
 	// Matches by exact file name, then extension. Never returns null.
 	const Language *languageForPath(const std::string &path) const;
 	// Matches a shebang or XML/PHP header. Returns null if the line says nothing.
 	const Language *languageForFirstLine(const std::string &line) const;
+
+	// Reads user languages from the app's folder, then the person's, which win on a clash.
+	// A language object stays valid afterwards, even if it has gone: check with languageNamed.
+	void loadUserLanguages(const std::string &personalDirectory);
 
 	// Builds the theme named "Omarchy" from a palette, replacing any earlier one.
 	void setOmarchyPalette(const Palette &palette);
@@ -80,12 +90,15 @@ private:
 	void applyStyle(const ThemeStyle &style, SciView &view) const;
 	void applyLexerStyles(const std::string &lexer, const Theme &theme, SciView &view) const;
 	void applyChrome(const Theme &theme, SciView &view) const;
+	void applyUserLanguage(const UserLanguage &language, SciView &view) const;
 
 	std::string directory;
 	std::vector<std::unique_ptr<Language>> owned;
 	std::map<std::string, const Language *> languagesByName;
 	std::map<std::string, const Language *> languagesByExtension;
 	std::vector<const Language *> menuLanguages;
+	std::vector<const Language *> menuUserLanguages;
+	std::map<std::string, const Language *> builtinExtensions;
 	const Language *plain = nullptr;
 	std::vector<std::string> themes;
 	std::unique_ptr<Theme> defaultTheme;
