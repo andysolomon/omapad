@@ -4,6 +4,7 @@
 #import "FindPanel.h"
 #import "FolderPanel.h"
 #import "FunctionPanel.h"
+#import "NotesPanel.h"
 #import "TabBar.h"
 #import "ScintillaView.h"
 #import "Scintilla.h"
@@ -117,6 +118,7 @@ struct MacSciView : SciView {
 
 @interface AppController () <TabBarDelegate, NSWindowDelegate, NSMenuDelegate>
 - (void)hostTabsChanged;
+- (void)hostNotesChanged:(const NotesState &)state;
 - (void)hostSplitChanged:(BOOL)visible stacked:(BOOL)stacked;
 - (void)hostResultsVisible:(BOOL)visible;
 - (void)hostFolderVisible:(BOOL)visible;
@@ -300,6 +302,7 @@ struct MacHost : Host {
 		return false;
 	}
 	void tabsChanged() override { [controller hostTabsChanged]; }
+	void notesChanged(const NotesState &state) override { [controller hostNotesChanged:state]; }
 	void statusChanged(const std::string &left, const std::string &right) override { [controller hostStatusLeft:toNS(left) right:toNS(right)]; }
 	void flash(const std::string &message) override { [controller hostFlash:toNS(message)]; }
 	void splitChanged(bool visible, bool stacked) override { [controller hostSplitChanged:visible stacked:stacked]; }
@@ -344,6 +347,12 @@ struct MacHost : Host {
 	NSWindow *_window;
 	OmaEditorView *_editors[2];
 	NSView *_paneBoxes[2];
+	NotesPanel *_notesPanel;
+	BOOL _notesEnabled, _notesActive, _normalToolbarVisible, _normalStatusVisible, _normalIncrementalVisible;
+	int _notesView;
+	std::string _notesSelectedPath;
+	CGFloat _notesSavedDivider;
+	BOOL _notesSavedStacked;
 	TabBar *_tabBars[2];
 	ScintillaView *_results;
 	ScintillaView *_background;
@@ -727,9 +736,10 @@ struct MacHost : Host {
 - (void)incrementalClose:(id)sender { _workspace->closeIncrementalSearch(); }
 
 - (void)hostIncrementalBar:(BOOL)visible {
-	_incrementalBar.hidden = !visible;
+	_normalIncrementalVisible = visible;
+	_incrementalBar.hidden = !visible || _notesEnabled;
 	_incrementalHeight.constant = visible ? 34 : 0;
-	if (visible) [_window makeFirstResponder:_incrementalField];
+	if (visible && !_notesEnabled) [_window makeFirstResponder:_incrementalField];
 }
 
 #pragma mark Panels and modes
@@ -761,7 +771,9 @@ struct MacHost : Host {
 }
 
 - (void)hostChrome:(const ChromeState &)chrome {
-	_toolbar.hidden = !chrome.toolbar;
+	_normalToolbarVisible = chrome.toolbar;
+	_normalStatusVisible = chrome.status;
+	_toolbar.hidden = !chrome.toolbar || _notesEnabled;
 	_toolbarHeight.constant = chrome.toolbar ? (chrome.largeToolbar ? 38 : 30) : 0;
 	for (NSView *view in _toolbar.arrangedSubviews) {
 		if (![view isKindOfClass:NSButton.class]) continue;
@@ -780,7 +792,7 @@ struct MacHost : Host {
 			if (_paneInsets[pane][side]) _paneInsets[pane][side].constant = side < 4 ? chrome.borderWidth : -chrome.borderWidth;
 		}
 	}
-	_statusBar.hidden = !chrome.status;
+	_statusBar.hidden = !chrome.status || _notesEnabled;
 	_statusHeight.constant = chrome.status ? 22 : 0;
 	_tabsShown = chrome.tabs;
 	[self hostTabStyle:_tabStyle];
@@ -803,6 +815,7 @@ struct MacHost : Host {
 
 - (void)hostTabStyle:(const TabStyle &)style {
 	_tabStyle = style;
+	const BOOL showTabs = _tabsShown && !_notesEnabled;
 	for (int pane = 0; pane < 2; pane++) {
 		TabBar *bar = _tabBars[pane];
 		bar.vertical = style.vertical;
@@ -818,9 +831,9 @@ struct MacHost : Host {
 		[NSLayoutConstraint deactivateConstraints:_barTop[pane]];
 		[NSLayoutConstraint deactivateConstraints:_barSide[pane]];
 		[NSLayoutConstraint activateConstraints:style.vertical ? _barSide[pane] : _barTop[pane]];
-		bar.hidden = !_tabsShown;
-		_barWidth[pane].constant = _tabsShown ? 170 : 0;
-		_barHeight[pane].constant = !_tabsShown ? 0 : [bar heightForWidth:MAX(NSWidth(_paneBoxes[pane].bounds), 400)];
+		bar.hidden = !showTabs;
+		_barWidth[pane].constant = showTabs ? 170 : 0;
+		_barHeight[pane].constant = !showTabs ? 0 : [bar heightForWidth:MAX(NSWidth(_paneBoxes[pane].bounds), 400)];
 		bar.needsDisplay = YES;
 	}
 }
@@ -840,7 +853,7 @@ struct MacHost : Host {
 			item.display = toNS(tabDisplayTitle(info, _tabStyle));
 			[items addObject:item];
 		}
-		if (_tabStyle.multiLine && _tabsShown) _barHeight[pane].constant = [_tabBars[pane] heightForWidth:MAX(NSWidth(_paneBoxes[pane].bounds), 400)];
+		if (_tabStyle.multiLine && _tabsShown && !_notesEnabled) _barHeight[pane].constant = [_tabBars[pane] heightForWidth:MAX(NSWidth(_paneBoxes[pane].bounds), 400)];
 		[_tabBars[pane] setItems:items activeIndex:_workspace->activeTab(pane) focused:_workspace->focusedPane() == pane];
 	}
 	const std::string path = _workspace->windowPath();
@@ -848,6 +861,59 @@ struct MacHost : Host {
 	_window.title = title.empty() ? @"omapad" : toNS(title);
 	_window.representedURL = path.empty() ? nil : [NSURL fileURLWithPath:toNS(path)];
 	_window.documentEdited = _workspace->windowDirty();
+}
+
+- (void)hostNotesChanged:(const NotesState &)state {
+	const BOOL entering = state.enabled && !_notesEnabled;
+	const BOOL leaving = !state.enabled && _notesEnabled;
+	const BOOL viewChanged = state.viewMode != _notesView;
+	const BOOL selectionChanged = state.selectedPath != _notesSelectedPath || (state.activeNote && !_notesActive);
+	_notesSelectedPath = state.selectedPath;
+	_notesActive = state.activeNote;
+	_notesView = state.viewMode;
+	if (entering) {
+		_notesSavedStacked = !_editorSplit.vertical;
+		_notesSavedDivider = _editorSplit.arrangedSubviews.count > 1
+			? (_editorSplit.vertical ? NSWidth(_paneBoxes[0].frame) : NSHeight(_paneBoxes[0].frame)) : -1;
+		_notesEnabled = YES;
+		if (!_notesPanel) {
+			_notesPanel = [[NotesPanel alloc] initWithWorkspace:_workspace.get()];
+			NSView *root = _window.contentView;
+			[root addSubview:_notesPanel];
+			[NSLayoutConstraint activateConstraints:@[
+				[_notesPanel.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
+				[_notesPanel.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
+				[_notesPanel.topAnchor constraintEqualToAnchor:root.topAnchor],
+				[_notesPanel.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
+			]];
+		}
+		[_paneBoxes[0] removeFromSuperview];
+		[_notesPanel setSourceView:_paneBoxes[0]];
+		_outer.hidden = YES;
+		_toolbar.hidden = YES;
+		_statusBar.hidden = YES;
+		_incrementalBar.hidden = YES;
+		[self hostTabStyle:_tabStyle];
+	}
+	[_notesPanel updateState:state];
+	if (leaving) {
+		[_notesPanel detachSourceView];
+		_notesEnabled = NO;
+		[_editorSplit insertArrangedSubview:_paneBoxes[0] atIndex:0];
+		_outer.hidden = NO;
+		_toolbar.hidden = !_normalToolbarVisible;
+		_statusBar.hidden = !_normalStatusVisible;
+		_incrementalBar.hidden = !_normalIncrementalVisible;
+		[self hostTabStyle:_tabStyle];
+		[self hostSplitChanged:_workspace->splitVisible() stacked:_workspace->splitStacked()];
+		if (_notesSavedDivider >= 0 && _workspace->splitVisible() && _notesSavedStacked == _workspace->splitStacked()) {
+			[_editorSplit setPosition:_notesSavedDivider ofDividerAtIndex:0];
+		}
+		[self hostFocusPane:_workspace->focusedPane()];
+	} else if (state.enabled && state.activeNote && (viewChanged || selectionChanged || entering)) {
+		if (state.viewMode == 2) [_notesPanel focusPreview];
+		else [self hostFocusPane:0];
+	}
 }
 
 - (void)hostStatusLeft:(NSString *)left right:(NSString *)right {
@@ -864,6 +930,7 @@ struct MacHost : Host {
 - (void)clearFlash { _statusMessage.stringValue = @""; }
 
 - (void)hostSplitChanged:(BOOL)visible stacked:(BOOL)stacked {
+	if (_notesEnabled) return;
 	const BOOL shown = _paneBoxes[1].superview != nil;
 	_editorSplit.vertical = !stacked;
 	if (visible && !shown) [_editorSplit addArrangedSubview:_paneBoxes[1]];
@@ -940,6 +1007,7 @@ struct MacHost : Host {
 }
 
 - (void)hostFocusPane:(int)pane {
+	if (_notesEnabled && (!_notesActive || _notesView == 2 || pane != 0)) return;
 	if (_window.isVisible) [_window makeFirstResponder:_editors[pane].content];
 }
 

@@ -185,6 +185,9 @@ struct TestHost : Host {
 	void focusPane(int) override {}
 	void themeChanged() override {}
 	void menusChanged() override { menusChangedCount++; }
+	NotesState lastNotesState;
+	int notesChanges = 0;
+	void notesChanged(const NotesState &state) override { lastNotesState = state; notesChanges++; }
 	bool runForm(const std::string &title, std::vector<FormField> &fields) override {
 		lastFormTitle = title;
 		return formAnswer ? formAnswer(fields) : false;
@@ -3727,12 +3730,257 @@ static void testDocumentMapAndMisc(const std::string &tmp, const std::string &su
 	e.run(Cmd::CloseAll);
 }
 
+// Notes regression failure modes: derived metadata mistakes code/headings/URL fragments for tags;
+// filtering opens the wrong row; note creation/import overwrites an unrelated dirty buffer;
+// delayed saves target whichever note is active rather than the edited document; external writes
+// (even with an unchanged mtime) are silently clobbered; an unavailable library loses dirty text;
+// symlinks escape the selected library; switching modes alters code preferences or loses tabs;
+// restart forgets the library or unsaved work. These exercise real documents and filesystem writes.
+static void testNotesMetadataAndPreview() {
+	const NoteSummary note = describeNote("/notes/stable-id.md",
+	    "\n# Daily Plan\n\nShip simple notes.\n#Work/Ideas #work/ideas #Personal\n"
+	    "`#inline` https://example.com/page#fragment\n```md\n#fenced\n```\n", 42);
+	checkEq(note.title, "Daily Plan", "notes derive title from first heading, not the stable filename");
+	checkEq(note.preview, "Ship simple notes.", "notes derive a preview from the next meaningful line");
+	check(note.tags.size() == 2, "notes ignore code and URL fragments while deduplicating tags", std::to_string(note.tags.size()));
+	check(std::find(note.tags.begin(), note.tags.end(), "work/ideas") != note.tags.end(), "notes keep hierarchical hashtags");
+	check(std::find(note.tags.begin(), note.tags.end(), "personal") != note.tags.end(), "notes normalize tag case");
+	check(noteMatches(note, "DAILY simple", ""), "notes search combines case-insensitive terms across title and body");
+	check(!noteMatches(note, "daily missing", ""), "notes search requires every term");
+	check(noteMatches(note, "ship", "work"), "parent tag includes a hierarchical child");
+	check(noteMatches(note, "", "work/ideas"), "exact hierarchical tag matches");
+	check(!noteMatches(note, "", "workshop"), "tag matching does not confuse a prefix with a hierarchy");
+	check(!noteMatches(note, "", "absent"), "nonmatching tag filters the note out");
+	checkEq(describeNote("/notes/a.md", "Plain title\nDetails").title, "Plain title", "a plain first line can title a note");
+	check(!describeNote("/notes/a.md", " \n\t").title.empty(), "an empty note has a usable list title");
+	check(noteWordCount("one  two\nthree\t四") == 4, "word count handles whitespace and non-ASCII text");
+	check(noteWordCount(" \n\t") == 0, "blank notes report zero words");
+
+	const auto blocks = renderNote("# Heading\n\nA **bold** and *soft* phrase.\n\n- [ ] pending\n- [x] done\n\n```cpp\n<unsafe> & literal\n```\n");
+	bool heading = false, bold = false, italic = false, pending = false, done = false, literal = false;
+	for (const NoteBlock &block : blocks) {
+		if (block.kind == NoteBlock::Kind::Heading && block.level == 1) heading = true;
+		if (block.kind == NoteBlock::Kind::Task) { pending |= !block.checked; done |= block.checked; }
+		for (const NoteSpan &span : block.spans) {
+			bold |= span.text.find("bold") != std::string::npos && (span.style & 1);
+			italic |= span.text.find("soft") != std::string::npos && (span.style & 2);
+			literal |= block.kind == NoteBlock::Kind::Code && span.text.find("<unsafe> & literal") != std::string::npos;
+		}
+	}
+	check(heading && bold && italic, "native preview carries heading and emphasis styling");
+	check(pending && done, "native preview distinguishes unfinished and finished tasks");
+	check(literal, "native preview preserves code as inert literal text");
+}
+
+static void testNotesWorkflow(const std::string &tmp) {
+	const std::string root = tmp + "/notes-workflow", library = root + "/library";
+	fs::create_directories(library);
+	const std::string existing = writeFile(library, "stable.md", "# Existing\nUseful details. #work/ideas\n");
+	writeFile(library, "README.txt", "Not a Markdown note");
+	fs::create_directories(library + "/nested");
+	writeFile(library + "/nested", "hidden.md", "Not in this flat library");
+	const std::string outside = writeFile(root, "outside.md", "Outside must never be touched\n");
+	std::error_code linkError;
+	fs::create_symlink(outside, library + "/escape.md", linkError);
+	check(!linkError, "note symlink safety fixture created", linkError.message());
+	const std::string code = writeFile(root, "code.cpp", "int saved = 1;\n");
+	Fixture f(root + "/support");
+	Workspace &e = f.w;
+	check(e.openPath(code), "open code before entering Notes mode");
+	e.setText("int unsaved = 2;\n");
+	e.settings.wordWrap = false;
+	e.settings.lineNumbers = true;
+	check(e.setNotesFolder(library), "choose an existing Markdown library");
+	check(e.setNotesMode(true), "enter Notes mode with an unsaved code document");
+	e.refreshNotes();
+	NotesState state = e.notesState();
+	check(state.enabled && state.folder == library, "Notes state identifies the selected library");
+	check(state.total == 1, "library scan excludes non-Markdown, nested files and symlinks", std::to_string(state.total));
+	check(!e.openNote(outside), "Notes opener refuses a path outside the selected library");
+	check(!e.openNote(library + "/escape.md"), "Notes opener refuses a symlink to an outside document");
+	checkEq(readAll(outside), "Outside must never be touched\n", "outside file remains intact");
+	check(!e.settings.wordWrap && e.settings.lineNumbers, "Notes presentation does not overwrite code editor preferences");
+
+	check(e.newNote("# First capture\nA thought #personal\n"), "new note needs no name or Save As dialog");
+	const std::string first = e.activePath();
+	check(fs::path(first).parent_path() == fs::path(library) && fs::path(first).extension() == ".md", "new note gets a stable Markdown file in the library", first);
+	checkEq(readAll(first), "# First capture\nA thought #personal\n", "new note is immediately persisted");
+	e.setText("# Renamed in text\nEdited thought #work/ideas\n");
+	e.refreshNotes();
+	state = e.notesState();
+	checkEq(state.title, "Renamed in text", "active note title tracks its content before saving");
+	checkEq(e.activePath(), first, "editing a heading does not rename the stable note file");
+	check(e.openNote(existing), "switch notes while the previous note has edits");
+	checkEq(readAll(first), "# Renamed in text\nEdited thought #work/ideas\n", "note switch flushes the previous document, not the new selection");
+	checkEq(e.text(), "# Existing\nUseful details. #work/ideas\n", "switch leaves target content intact");
+	check(e.newNote("# Second capture\nFresh #personal\n"), "create another note");
+	const std::string second = e.activePath();
+	check(second != first && second != existing, "new notes never reuse an existing filename");
+	checkEq(readAll(first), "# Renamed in text\nEdited thought #work/ideas\n", "new note creation cannot replace the previous note");
+
+	e.setNotesQuery("RENAMED thought");
+	state = e.notesState();
+	check(state.notes.size() == 1 && state.notes[0].path == first, "library search returns the note's stable identity");
+	e.setNotesTag("personal");
+	check(e.notesState().notes.empty(), "search and tag filters combine");
+	e.setNotesQuery("");
+	state = e.notesState();
+	check(state.notes.size() == 1 && state.notes[0].path == second, "clearing query retains the selected tag filter");
+	e.setNotesTag("work");
+	check(e.notesState().notes.size() == 2, "parent tag filters include child tags across notes");
+	e.setNotesTag("");
+
+	check(e.openNote(first), "open note for formatting");
+	e.setText("word\n");
+	e.setSelection(0, 4);
+	e.run(Cmd::NotesFormat, 0, "bold");
+	checkEq(e.text(), "**word**\n", "Notes Bold wraps only the selection");
+	e.run(Cmd::Undo);
+	checkEq(e.text(), "word\n", "formatting is one undoable editor operation");
+	e.setSelection(0, 4);
+	e.run(Cmd::NotesFormat, 0, "link");
+	check(e.text().rfind("[word](", 0) == 0, "Notes Link keeps the selected label");
+	check(!e.selectedText().empty(), "Notes Link selects an editable URL placeholder");
+	check(e.flushNotes(), "flush formatted note");
+	check(!e.activeIsDirty(), "successful note flush sets the editor save point");
+
+	e.run(Cmd::NotesView, 1);
+	e.run(Cmd::NotesFocus);
+	state = e.notesState();
+	check(state.viewMode == 1 && state.focus, "preview and writing-focus controls reach Notes state");
+	const std::string beforeInvalidFolder = state.folder;
+	check(!e.setNotesFolder(outside), "a regular file cannot become the Notes library");
+	checkEq(e.notesState().folder, beforeInvalidFolder, "failed library selection leaves the working library selected");
+	check(e.setNotesMode(false), "exit Notes mode after saving");
+	checkEq(e.activePath(), code, "exit Notes mode returns to the previous code document");
+	checkEq(e.text(), "int unsaved = 2;\n", "entering and leaving Notes never replaces a dirty code buffer");
+	check(e.activeIsDirty(), "unsaved code remains unsaved");
+	checkEq(readAll(code), "int saved = 1;\n", "Notes autosave never saves unrelated code documents");
+	check(!e.settings.wordWrap && e.settings.lineNumbers, "code preferences survive mode exit");
+	check(!f.host.lastNotesState.enabled && f.host.notesChanges > 0, "native hosts receive the final disabled Notes state");
+}
+
+static void testNotesSaveFailuresAndRestore(const std::string &tmp) {
+	const std::string root = tmp + "/notes-failures", library = root + "/library";
+	fs::create_directories(library);
+	const std::string note = writeFile(library, "note.md", "# Original\n");
+	const std::string support = root + "/support";
+	{
+		Fixture f(support);
+		Workspace &e = f.w;
+		check(e.setNotesFolder(library) && e.setNotesMode(true) && e.openNote(note), "open note for autosave conflict testing");
+		e.setText("# My unsaved changes\n");
+		const auto oldTime = fs::last_write_time(note);
+		writeFile(library, "note.md", "# External changes\n");
+		fs::last_write_time(note, oldTime);
+		check(!e.flushNotes(), "autosave detects external changes even when file mtime is unchanged");
+		checkEq(readAll(note), "# External changes\n", "autosave conflict preserves the external version");
+		checkEq(e.text(), "# My unsaved changes\n", "autosave conflict preserves the editor version");
+		check(e.activeIsDirty() && e.notesState().saveError, "conflict is visible and remains unsaved");
+		check(!e.setNotesMode(false) && e.notesMode(), "mode exit cannot silently abandon a failed note save");
+		fs::create_directories(root + "/other");
+		check(!e.setNotesFolder(root + "/other"), "changing libraries cannot abandon a failed note save");
+		checkEq(e.notesState().folder, library, "failed library change keeps the original library");
+
+		// Restore the exact expected base, then retry the still-dirty editor content.
+		writeFile(library, "note.md", "# Original\n");
+		e.run(Cmd::NotesRetry);
+		checkEq(readAll(note), "# My unsaved changes\n", "retry persists the retained edit once the conflict is resolved");
+		check(!e.activeIsDirty() && !e.notesState().saveError, "successful retry clears the failure state");
+
+		e.setText("# Save when folder returns\n");
+		fs::rename(library, root + "/parked-library");
+		writeFile(root, "library", "A file blocks the missing folder");
+		check(!e.flushNotes(), "a missing or blocked library cannot report a successful save");
+		checkEq(e.text(), "# Save when folder returns\n", "failed filesystem write keeps the full editor text");
+		check(e.activeIsDirty(), "filesystem failure keeps dirty state for recovery");
+		fs::remove(library);
+		fs::rename(root + "/parked-library", library);
+		check(e.flushNotes(), "save can recover after the library becomes writable again");
+		checkEq(readAll(note), "# Save when folder returns\n", "recovered save writes retained contents");
+		e.run(Cmd::NotesView, 2);
+		check(e.writeSession(), "write a Notes session for restart");
+		check(e.prepareToQuit(), "normal quit completes Notes persistence");
+	}
+	{
+		Fixture f(support);
+		f.w.restoreSession();
+		f.w.afterStartup();
+		check(f.w.notesMode(), "restart restores Notes mode");
+		checkEq(f.w.notesState().folder, library, "restart remembers the chosen library");
+		checkEq(f.w.activePath(), note, "restart restores the selected note");
+		checkEq(f.w.text(), "# Save when folder returns\n", "restart reads the successfully saved note content");
+		check(f.w.notesState().viewMode == 2, "restart restores preview choice");
+	}
+}
+
+static void testNotesRecoveryAndImport(const std::string &tmp) {
+    const std::string root = tmp + "/notes-recovery", library = root + "/library", support = root + "/support";
+    fs::create_directories(library);
+    const std::string note = writeFile(library, "note.md", "# Disk baseline\n");
+    {
+        Fixture f(support);
+        check(f.w.setNotesFolder(library) && f.w.setNotesMode(true), "start a recoverable Notes session");
+        check(f.w.openNote(note), "select recovery fixture");
+        f.w.setText("# Recovered unsaved note\n");
+        check(f.w.writeSession(), "snapshot note text and its original disk hash");
+        writeFile(library, "note.md", "# External version while closed\n");
+    }
+    {
+        Fixture f(support);
+        check(f.w.restoreSession(), "restore dirty note snapshot");
+        f.w.afterStartup();
+        checkEq(f.w.text(), "# Recovered unsaved note\n", "restart keeps the unsaved note buffer");
+        check(!f.w.flushNotes(), "restored baseline catches disk changes across restart");
+        checkEq(readAll(note), "# External version while closed\n", "recovery cannot overwrite an external revision");
+        check(!f.w.prepareToQuit(), "failed save keeps the application open with a recoverable snapshot");
+        f.host.answer = 1;
+        f.w.run(Cmd::Reload);
+        checkEq(f.w.text(), "# External version while closed\n", "explicit reload resolves a note conflict");
+        f.w.setText("# After reload\n");
+        f.w.tick(); f.w.tick();
+        checkEq(readAll(note), "# After reload\n", "idle autosave persists edits after reload");
+        const std::string imported = writeFile(root, "import.md", "# Imported\nBody #travel\n");
+        f.w.setText("# Current unsaved note\n");
+        f.host.filesToOpen = {imported};
+        f.w.run(Cmd::Open);
+        check(f.w.activePath() != imported && f.w.activePath() != note, "Notes Open imports into a new stable file");
+        checkEq(readAll(imported), "# Imported\nBody #travel\n", "import leaves its source untouched");
+        checkEq(readAll(note), "# Current unsaved note\n", "import saves the old note before selecting the copy");
+        checkEq(f.w.text(), readAll(imported), "import selects the imported contents");
+        f.w.setText("# Export <title>\n<script>alert(1)</script>\n[unsafe](javascript:alert)\n");
+        f.host.savePath = root + "/note.html";
+        f.w.run(Cmd::NotesExportHtml);
+        const std::string html = readAll(f.host.savePath);
+        check(html.find("&lt;script&gt;") != std::string::npos && html.find("<script>") == std::string::npos, "HTML export escapes raw markup");
+        check(html.find("href=\"javascript:") == std::string::npos, "HTML export excludes active unsafe links");
+        check(f.w.flushNotes(), "save imported note before testing cached reopen");
+        check(f.w.openNote(note), "return to cached original note");
+        const std::string other = f.w.activePath();
+        writeFile(library, "note.md", "# Changed outside\n");
+        check(f.w.openNote(other), "reopen a clean cached tab after external changes");
+        checkEq(f.w.text(), "# Changed outside\n", "cached note refreshes content before accepting a new disk baseline");
+        f.w.setText("# Do not follow a replacement symlink\n");
+        fs::remove(note); fs::create_symlink(imported, note);
+        f.w.run(Cmd::Save);
+        checkEq(readAll(imported), "# Imported\nBody #travel\n", "manual Save cannot bypass autosave protection on a replaced symlink");
+        check(f.w.activeIsDirty() && f.w.notesState().saveError, "replaced-symlink save keeps edits and reports failure");
+        fs::remove(note); writeFile(library, "note.md", "# Changed outside\n");
+        check(f.w.flushNotes(), "retained edits save after restoring the baseline file");
+        f.w.run(Cmd::NotesView, 2);
+        check(f.w.newNote(), "new note from Read mode succeeds");
+        check(f.w.notesState().viewMode == 0, "new note leaves Read mode ready for immediate typing");
+    }
+}
+
+
 int main() {
 	setvbuf(stdout, nullptr, _IONBF, 0);
 	initTestToolkit();
 	setenv("OMAPAD_OMARCHY_THEME", "/nonexistent/colors.toml", 1);
 	std::string tmp = (fs::temp_directory_path() / ("omapad-tests-" + std::to_string(getpid()))).string();
 	fs::create_directories(tmp);
+	tmp = fs::canonical(tmp).string();
 	const std::string support = tmp + "/support";
 
 	printf("== testEncodings\n");
@@ -3796,6 +4044,14 @@ int main() {
 	testEverythingInFeatures(tmp, support + "-features");
 	printf("== testInstallerAuditGaps\n");
 	testInstallerAuditGaps(tmp, support + "-gaps");
+	printf("== testNotesMetadataAndPreview\n");
+	testNotesMetadataAndPreview();
+	printf("== testNotesWorkflow\n");
+	testNotesWorkflow(tmp);
+	printf("== testNotesSaveFailuresAndRestore\n");
+	testNotesSaveFailuresAndRestore(tmp);
+	printf("== testNotesRecoveryAndImport\n");
+	testNotesRecoveryAndImport(tmp);
 
 	std::error_code error;
 	chmod((tmp + "/locked").c_str(), 0700);

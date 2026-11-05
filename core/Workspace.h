@@ -2,6 +2,7 @@
 // search, sessions and commands. Each platform supplies a Host and draws what this says.
 #pragma once
 #include "Completion.h"
+#include "Notes.h"
 #include "FunctionList.h"
 #include "Languages.h"
 #include "Print.h"
@@ -81,6 +82,8 @@ enum class Cmd {
 	ToggleOvertype, ResultsAction, TabAction, FindInProjects,
 	RestoreClosed, FocusPanel, FolderExpandAll, FolderCollapseAll, FolderLocate, FolderOpen, FolderRunBySystem, FolderCopyName, FolderTerminal, FolderRemoveAll,
 	FileAssociation,
+	NotesMode, NotesNew, NotesFolder, NotesReveal, NotesRefresh, NotesImport, NotesTrash, NotesRetry,
+	NotesView, NotesFocus, NotesFormat, NotesExportHtml,
 };
 
 enum PanelId { kPanelClipboard = 0, kPanelCharacters, kPanelDocuments, kPanelProject1, kPanelProject2, kPanelProject3, kPanelCount };
@@ -246,6 +249,7 @@ struct Host {
 	virtual void foldersChanged() = 0;
 	virtual void focusPane(int pane) = 0;
 	virtual void themeChanged() = 0;
+	virtual void notesChanged(const NotesState &state) {}
 	virtual void menusChanged() = 0;   // Shortcuts changed, so menus need building again.
 	virtual bool runForm(const std::string &title, std::vector<FormField> &fields) = 0;
 	virtual void runShortcutMapper() = 0;
@@ -372,6 +376,18 @@ public:
 	std::string windowPath() const;
 	void prepareCommandLine(const CommandLine &line);  // What has to happen before the session comes back.
 	void applyCommandLine(const CommandLine &line);
+
+	// Notes mode: callbacks take paths, never row indices, so filtering cannot retarget an action.
+	bool notesMode() const { return notesEnabled; }
+	NotesState notesState() const;
+	bool setNotesMode(bool enabled);
+	bool setNotesFolder(const std::string &path);
+	void setNotesQuery(const std::string &query);
+	void setNotesTag(const std::string &tag);
+	bool openNote(std::string path);
+	bool newNote(const std::string &initial = std::string());
+	bool flushNotes();
+	void refreshNotes();
 
 	// Side panels.
 	bool panelVisible(int panel) const;
@@ -753,6 +769,25 @@ private:
 	void fileAssociationDialog();
 	void applyDocumentReadOnlyToOpen();
 	std::vector<ToolItem> configuredToolbar(std::vector<ToolItem> items) const;
+
+	bool runNotesCommand(Cmd cmd, int arg, const std::string &text);
+	bool isNotePath(const std::string &path) const;
+	bool isNoteLocation(const std::string &path) const;
+	void notesTick();
+	void notifyNotes();
+	void formatNote(const std::string &action);
+	bool saveNote(Document &document);
+	void rememberNoteBaseline(const Document &document);
+	void applyNotesPreferences(int pane);
+	void restoreNotesMode();
+	bool notesEnabled = false, notesFocus = false, notesNotifying = false;
+	int notesViewMode = 0;
+	std::string notesFolderPath, notesQuery, notesTag, notesError, notesLastPath;
+	std::vector<NoteSummary> noteIndex;
+	std::map<std::string, std::string> noteBaselines;
+	std::map<std::string, unsigned long> noteSeenGeneration;
+	std::weak_ptr<Document> notesPreviousDocument;
+	int notesPreviousPane = 0;
 
 	LanguageCatalog catalog;
 	CompletionCatalog completion;
