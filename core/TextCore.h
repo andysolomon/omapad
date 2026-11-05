@@ -38,7 +38,7 @@ bool isValidUtf8(const char *bytes, size_t length);
 
 enum class LineOp {
 	SortLexAsc, SortLexDesc, SortFoldAsc, SortFoldDesc,
-	SortIntAsc, SortIntDesc, SortDecimalAsc, SortDecimalDesc,
+	SortIntAsc, SortIntDesc, SortDecimalAsc, SortDecimalDesc, SortDecimalCommaAsc, SortDecimalCommaDesc,
 	SortLengthAsc, SortLengthDesc,
 	Reverse, Randomize,
 	RemoveDuplicates, RemoveConsecutiveDuplicates,
@@ -59,9 +59,6 @@ std::string convertCase(const std::string &text, CaseOp op);
 // search mode. Invalid or incomplete sequences stay literal.
 std::string unescapeExtended(const std::string &text);
 
-// Regex replacements accept both \1 and $1. Scintilla itself only knows \1.
-std::string normalizeRegexReplacement(const std::string &text);
-
 // Comments or uncomments lines. If every non-blank line is already commented it
 // uncomments them, otherwise it comments them. Blank lines are left alone.
 enum class CommentMode { Toggle, Comment, Uncomment };
@@ -69,6 +66,11 @@ std::vector<std::string> commentLines(const std::vector<std::string> &lines, con
 
 enum class HashKind { MD5, SHA1, SHA256, SHA512 };
 std::string hashHex(const void *bytes, size_t length, HashKind kind);
+
+// Puts a shortcut in the one form stored and compared: Mod, Ctrl, Alt, Shift, then the key.
+std::string normalizeShortcut(const std::string &shortcut);
+// A number for the Column Editor. `base` is 2, 8, 10 or 16, and `width` pads with zeros.
+std::string formatNumber(long value, int base, size_t width);
 
 // UTF-8 helpers shared with Find in Files. Invalid bytes decode to U+FFFD.
 std::u32string utf8ToCodePoints(const std::string &text);

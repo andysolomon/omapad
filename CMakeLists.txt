@@ -2,7 +2,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum macOS version")
-project(omapad VERSION 0.2.0 LANGUAGES C CXX OBJC OBJCXX)
+project(omapad VERSION 0.3.0 LANGUAGES C CXX OBJC OBJCXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -32,15 +32,25 @@ target_include_directories(engine PUBLIC
 target_compile_options(engine PRIVATE -w)
 set_source_files_properties(${SCI_COCOA_SOURCES} PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 
+# --- PCRE2, the regular expression engine.
+file(GLOB PCRE2_SOURCES CONFIGURE_DEPENDS third_party/pcre2/*.c)
+add_library(pcre2 STATIC ${PCRE2_SOURCES})
+target_compile_definitions(pcre2 PRIVATE HAVE_CONFIG_H PCRE2_CODE_UNIT_WIDTH=8 PCRE2_STATIC SUPPORT_UNICODE)
+target_include_directories(pcre2 PRIVATE third_party/pcre2)
+target_compile_options(pcre2 PRIVATE -w)
+
 # --- The shared core.
 add_library(omapad_core STATIC
-  core/TextCore.cpp core/Languages.cpp core/Workspace.cpp third_party/pugixml/pugixml.cpp)
-target_link_libraries(omapad_core PUBLIC engine iconv)
-target_include_directories(omapad_core PUBLIC core third_party/json third_party/pugixml)
+  core/TextCore.cpp core/Languages.cpp core/Workspace.cpp core/Regex.cpp core/Completion.cpp core/FunctionList.cpp
+  third_party/pugixml/pugixml.cpp)
+target_link_libraries(omapad_core PUBLIC engine pcre2 iconv)
+target_include_directories(omapad_core PUBLIC core third_party/json third_party/pugixml third_party/pcre2)
 target_compile_options(omapad_core PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations)
 
 # --- The Mac interface.
 file(GLOB THEME_FILES CONFIGURE_DEPENDS resources/themes/*.xml)
+file(GLOB COMPLETION_FILES CONFIGURE_DEPENDS resources/autoCompletion/*.xml)
+file(GLOB FUNCTION_FILES CONFIGURE_DEPENDS resources/functionList/*.xml)
 file(GLOB LICENSE_FILES CONFIGURE_DEPENDS licenses/*.txt)
 set(DATA_FILES resources/langs.model.xml resources/stylers.model.xml resources/omapad.icns LICENSE NOTICE)
 # Scintilla loads its cursors as TIFF. Its Xcode project makes these from the PNGs in cocoa/res.
@@ -49,8 +59,8 @@ set(SCI_RES_FILES
   resources/mac_cursor_busy.tiff resources/mac_cursor_flipped.tiff)
 
 add_executable(omapad MACOSX_BUNDLE
-  mac/main.mm mac/AppController.mm mac/TabBar.mm mac/FindPanel.mm mac/FolderPanel.mm
-  ${DATA_FILES} ${THEME_FILES} ${SCI_RES_FILES} ${LICENSE_FILES})
+  mac/main.mm mac/AppController.mm mac/TabBar.mm mac/FindPanel.mm mac/FolderPanel.mm mac/FunctionPanel.mm mac/Dialogs.mm
+  ${DATA_FILES} ${THEME_FILES} ${COMPLETION_FILES} ${FUNCTION_FILES} ${SCI_RES_FILES} ${LICENSE_FILES})
 target_link_libraries(omapad PRIVATE omapad_core "-framework Cocoa" "-framework QuartzCore")
 target_include_directories(omapad PRIVATE mac)
 target_compile_options(omapad PRIVATE -fobjc-arc -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations)
@@ -60,6 +70,8 @@ set_target_properties(omapad PROPERTIES
   MACOSX_BUNDLE_SHORT_VERSION_STRING ${PROJECT_VERSION})
 set_source_files_properties(${DATA_FILES} ${SCI_RES_FILES} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
 set_source_files_properties(${THEME_FILES} PROPERTIES MACOSX_PACKAGE_LOCATION Resources/themes)
+set_source_files_properties(${COMPLETION_FILES} PROPERTIES MACOSX_PACKAGE_LOCATION Resources/autoCompletion)
+set_source_files_properties(${FUNCTION_FILES} PROPERTIES MACOSX_PACKAGE_LOCATION Resources/functionList)
 set_source_files_properties(${LICENSE_FILES} PROPERTIES MACOSX_PACKAGE_LOCATION Resources/licenses)
 
 # --- Tests: pure logic plus the real Workspace with real, hidden editor views.

@@ -6,11 +6,13 @@
 #include "TextCore.h"
 #include "Workspace.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -55,7 +57,7 @@ static void sleepForMtime() { usleep(1100 * 1000); }
 // A host with real editor views and no windows. Questions get canned answers.
 struct TestHost : Host {
 	Workspace *workspace = nullptr;
-	std::unique_ptr<SciView> panes[2], results, background;
+	std::unique_ptr<SciView> panes[2], results, background, map;
 	std::deque<std::function<void()>> queue;
 	std::mutex queueLock;
 	int answer = 0;
@@ -69,16 +71,22 @@ struct TestHost : Host {
 	std::string left, right, flashed, trashError;
 	std::vector<std::string> trashed;
 	FindOptions find;
+	int menusChangedCount = 0, functionListChangedCount = 0, mapperRuns = 0;
+	bool mapVisible = false, functionVisible = false;
+	std::function<bool(std::vector<FormField> &)> formAnswer;
+	std::string lastFormTitle;
 
 	TestHost() {
 		for (int i = 0; i < 2; i++)
 			panes[i] = makeHiddenSciView([this, i](const SCNotification &n) { if (workspace) workspace->editorNotification(i, n); });
 		results = makeHiddenSciView([this](const SCNotification &n) { if (workspace) workspace->resultsNotification(n); });
 		background = makeHiddenSciView(nullptr);
+		map = makeHiddenSciView(nullptr);
 	}
 	SciView &paneView(int pane) override { return *panes[pane]; }
 	SciView &resultsView() override { return *results; }
 	SciView &backgroundView() override { return *background; }
+	SciView &mapView() override { return *map; }
 	int ask(const std::string &title, const std::string &, const std::vector<std::string> &) override {
 		prompts++;
 		lastTitle = title;
@@ -110,6 +118,15 @@ struct TestHost : Host {
 	void foldersChanged() override { foldersChangedCount++; }
 	void focusPane(int) override {}
 	void themeChanged() override {}
+	void menusChanged() override { menusChangedCount++; }
+	bool runForm(const std::string &title, std::vector<FormField> &fields) override {
+		lastFormTitle = title;
+		return formAnswer ? formAnswer(fields) : false;
+	}
+	void runShortcutMapper() override { mapperRuns++; }
+	void setDocumentMapVisible(bool visible) override { mapVisible = visible; }
+	void setFunctionListVisible(bool visible) override { functionVisible = visible; }
+	void functionListChanged() override { functionListChangedCount++; }
 	void showFind(FindTab, const std::string &, const std::string &) override {}
 	void setFindText(const std::string &text) override { find.what = text; }
 	FindOptions currentFindOptions() override { return find; }
@@ -1290,6 +1307,658 @@ static void testHighlighting(const std::string &tmp, const std::string &support)
 	check(withoutLexer == 0, "every language has a real lexer", std::to_string(withoutLexer));
 }
 
+static void testRegexEngine() {
+	Regex bad("(unclosed", Regex::Options{});
+	check(!bad.valid() && !bad.error().empty(), "a bad pattern reports its error");
+
+	const std::string subject = "alpha\nbeta\ngamma";
+	Regex::Match m;
+	Regex lookbehind("(?<=alpha\\n)beta", Regex::Options{});
+	check(lookbehind.search(subject.data(), subject.size(), 0, m) == Regex::Result::Found && m.start == 6 && m.end == 10, "lookbehind");
+	Regex keep("alpha\\n\\Kbeta", Regex::Options{});
+	check(keep.search(subject.data(), subject.size(), 0, m) == Regex::Result::Found && m.start == 6, "\\K resets the match start");
+	Regex across("alpha\\nbeta", Regex::Options{});
+	check(across.search(subject.data(), subject.size(), 0, m) == Regex::Result::Found, "a pattern can cross lines");
+	Regex dotStops("alpha.beta", Regex::Options{});
+	check(dotStops.search(subject.data(), subject.size(), 0, m) == Regex::Result::NotFound, ". stops at a newline by default");
+	Regex::Options dotAll;
+	dotAll.dotMatchesNewline = true;
+	Regex dotCrosses("alpha.beta", dotAll);
+	check(dotCrosses.search(subject.data(), subject.size(), 0, m) == Regex::Result::Found, ". crosses a newline when asked");
+	Regex anchors("^beta$", Regex::Options{});
+	check(anchors.search(subject.data(), subject.size(), 0, m) == Regex::Result::Found, "^ and $ match at line boundaries");
+
+	Regex::Options fold;
+	fold.ignoreCase = true;
+	const std::string accented = "ÉCOLE école";
+	Regex unicode("école", fold);
+	check(unicode.search(accented.data(), accented.size(), 0, m) == Regex::Result::Found && m.start == 0, "ignoring case works on accents");
+
+	// A very long line used to overflow the stack with the C++ regex library.
+	const std::string longLine(4 * 1024 * 1024, 'a');
+	Regex star("(a|b)*c", Regex::Options{});
+	check(star.search(longLine.data(), longLine.size(), 0, m) != Regex::Result::Found, "a huge line doesn't crash");
+	const std::string invalid = std::string("ok \xFF\xFE bad needle");
+	Regex needle("needle", Regex::Options{});
+	check(needle.search(invalid.data(), invalid.size(), 0, m) == Regex::Result::Found, "invalid UTF-8 doesn't stop a search");
+
+	const std::string text = "John Smith";
+	Regex names("(\\w+) (\\w+)", Regex::Options{});
+	check(names.search(text.data(), text.size(), 0, m) == Regex::Result::Found, "groups match");
+	checkEq(expandReplacement("\\2, \\1", text.data(), m), "Smith, John", "backslash groups");
+	checkEq(expandReplacement("$2 ${1}x", text.data(), m), "Smith Johnx", "dollar groups");
+	checkEq(expandReplacement("\\U\\1\\E \\L\\2", text.data(), m), "JOHN smith", "case changes");
+	checkEq(expandReplacement("a\\tb\\nc\\\\", text.data(), m), "a\tb\nc\\", "escapes");
+}
+
+static void testRegexInDocument(const std::string &support) {
+	Fixture f(support);
+	Workspace &e = f.w;
+	e.setText("one\ntwo\nthree\n");
+	FindOptions o = findOptions("one\\ntwo", "joined", SearchMode::Regex);
+	check(e.countMatches(o) == 1, "multi-line pattern counts");
+	check(e.replaceAll(o) == 1, "multi-line pattern replaces");
+	checkEq(e.text(), "joined\nthree\n", "multi-line replacement");
+
+	e.setText("key=value\nname=omapad\n");
+	o = findOptions("(\\w+)=(\\w+)", "\\2:\\1", SearchMode::Regex);
+	check(e.replaceAll(o) == 2, "group replace all");
+	checkEq(e.text(), "value:key\nomapad:name\n", "group replacement");
+
+	// A zero-length match must not loop forever.
+	e.setText("abc");
+	o = findOptions("x*", "-", SearchMode::Regex);
+	check(e.replaceAll(o) == 4, "empty matches advance", std::to_string(e.replaceAll(findOptions("nomatch", "", SearchMode::Regex))));
+	checkEq(e.text(), "-a-b-c-", "empty match replacement");
+
+	e.setText("price 10\nprice 20\n");
+	o = findOptions("(?<=price )\\d+", "N", SearchMode::Regex);
+	check(e.replaceAll(o) == 2, "lookbehind in a document");
+	checkEq(e.text(), "price N\nprice N\n", "lookbehind replacement");
+
+	e.setText("start\nmiddle\nend\n");
+	o = findOptions("start.*end", "X", SearchMode::Regex);
+	check(e.countMatches(o) == 0, "dot stays on its line");
+	o.dotMatchesNewline = true;
+	check(e.countMatches(o) == 1, ". matches newline option");
+
+	o = findOptions("(bad", "", SearchMode::Regex);
+	check(e.findNext(o) == SearchResult::InvalidPattern, "bad pattern reported by find");
+	check(e.countMatches(o) == -1, "bad pattern reported by count");
+	check(e.replaceAll(o) == -1, "bad pattern reported by replace");
+
+	e.setText("héllo wörld\n");
+	e.setSelection(0, 0);
+	o = findOptions("w.rld", "", SearchMode::Regex);
+	check(e.findNext(o) == SearchResult::Found, "regex finds across multi-byte text");
+	checkEq(e.selectedText(), "wörld", "the regex match is whole characters");
+	f.host.answer = 0;
+	e.run(Cmd::CloseAll);
+}
+
+static void testPreferences(const std::string &tmp) {
+	const std::string support = tmp + "/prefs";
+	{
+		Fixture f(support);
+		std::vector<FormField> fields = f.w.preferenceFields();
+		const auto set = [&](const char *key, const std::string &value) {
+			for (FormField &field : fields) if (field.key == key) { field.value = value; return; }
+			check(false, "preference field exists", key);
+		};
+		check(f.v().send(SCI_GETMARGINWIDTHN, 0) > 0, "line numbers start on");
+		set("lineNumbers", "0");
+		set("edgeColumn", "80");
+		set("caretWidth", "3");
+		set("tabWidth", "999");  // Past the limit, so it's clamped.
+		set("tabsToSpaces", "1");
+		set("scrollBeyondEnd", "1");
+		set("highlightCurrentLine", "0");
+		set("defaultEol", "crlf");
+		set("autoComplete", "0");
+		set("backupSeconds", "120");
+		f.w.applyPreferenceFields(fields);
+		check(f.v().send(SCI_GETMARGINWIDTHN, 0) == 0, "line numbers turn off");
+		check(f.v().send(SCI_GETEDGECOLUMN) == 80 && f.v().send(SCI_GETEDGEMODE) == EDGE_LINE, "column guide shows");
+		check(f.v().send(SCI_GETCARETWIDTH) == 3, "caret width applies");
+		check(f.v().send(SCI_GETTABWIDTH) == 32, "tab width is clamped");
+		check(f.v().send(SCI_GETUSETABS) == 0, "tabs to spaces applies");
+		check(f.v().send(SCI_GETENDATLASTLINE) == 0, "scroll past end applies");
+		check(f.v().send(SCI_GETCARETLINEVISIBLE) == 0, "current line highlight turns off");
+		check(f.host.paneView(1).send(SCI_GETEDGECOLUMN) == 80, "the other pane gets it too");
+		f.w.createUntitledDocument();
+		check(f.v().send(SCI_GETEOLMODE) == SC_EOL_CRLF, "new documents use the default line ending");
+
+		f.host.formAnswer = [&](std::vector<FormField> &form) {
+			for (FormField &field : form) if (field.key == "edgeColumn") field.value = "100";
+			return true;
+		};
+		f.w.run(Cmd::ShowPreferences);
+		checkEq(f.host.lastFormTitle, "Preferences", "preferences open a form");
+		check(f.v().send(SCI_GETEDGECOLUMN) == 100, "the form's answer applies");
+		f.host.formAnswer = [&](std::vector<FormField> &form) {
+			for (FormField &field : form) if (field.key == "edgeColumn") field.value = "60";
+			return false;
+		};
+		f.w.run(Cmd::ShowPreferences);
+		check(f.v().send(SCI_GETEDGECOLUMN) == 100, "cancelling changes nothing");
+		f.w.run(Cmd::CloseAll);
+	}
+	Fixture f(support);
+	check(f.w.settings.edgeColumn == 100 && !f.w.settings.lineNumbers && f.w.settings.defaultEol == "crlf" && !f.w.settings.autoComplete && f.w.settings.backupSeconds == 120,
+	      "preferences persist");
+	check(f.v().send(SCI_GETEDGECOLUMN) == 100 && f.v().send(SCI_GETMARGINWIDTHN, 0) == 0, "preferences apply at launch");
+
+	f.w.run(Cmd::CloseAll);
+}
+
+static void testPanelsAndBackupInterval(const std::string &tmp) {
+	const std::string support = tmp + "/panels";
+	const std::string state = support + "/state/session.json";
+	const std::string path = writeFile(tmp, "panels.py", "def one():\n    pass\n");
+	{
+		Fixture f(support);
+		check(f.w.openPath(path), "open for the session");
+		f.w.run(Cmd::ToggleFunctionList);
+		f.w.run(Cmd::ToggleDocumentMap);
+
+		// Backups wait for their interval, counted in ticks of a second.
+		f.w.settings.backupSeconds = 3;
+		std::error_code error;
+		fs::remove(state, error);
+		f.w.tick();
+		f.w.tick();
+		check(!fs::exists(state), "no backup before the interval");
+		f.w.tick();
+		check(fs::exists(state), "a backup at the interval");
+		fs::remove(state, error);
+		f.w.settings.backupSeconds = 0;
+		for (int i = 0; i < 5; i++) f.w.tick();
+		check(!fs::exists(state), "an interval of 0 means no timed backups");
+		f.w.settings.backupSeconds = 7;
+		// A session is only rewritten when it changes, so change it to bring the file back.
+		f.w.run(Cmd::ToggleFunctionList);
+		f.w.writeSession();
+		f.w.run(Cmd::ToggleFunctionList);
+		check(f.w.writeSession() && fs::exists(state), "session saved");
+	}
+	{
+		Fixture f(support);
+		check(f.w.restoreSession(), "session restored");
+		checkEq(f.w.activePath(), path, "the file came back");
+		check(f.host.functionVisible && f.w.functionListVisible(), "the Function List came back");
+		check(f.host.mapVisible && f.w.documentMapVisible(), "the Document Map came back");
+		check(f.host.map->send(SCI_GETDOCPOINTER) == f.v().send(SCI_GETDOCPOINTER), "the restored map shows the restored document");
+		f.w.settings.restoreSessionOnStart = false;
+		std::vector<FormField> fields = f.w.preferenceFields();
+		for (FormField &field : fields) if (field.key == "restoreSessionOnStart") field.value = "0";
+		f.w.applyPreferenceFields(fields);
+		check(f.w.writeSession(), "session saved again");
+	}
+	{
+		Fixture f(support);
+		check(!f.w.settings.restoreSessionOnStart, "the session preference persists");
+		f.w.restoreSession();
+		check(f.w.activePath().empty(), "with it off, nothing is reopened", f.w.activePath());
+		f.host.answer = 2;
+		f.w.run(Cmd::CloseAll);
+	}
+}
+
+static void testShortcuts(const std::string &tmp) {
+	const std::string support = tmp + "/keys";
+	checkEq(normalizeShortcut("shift+mod+f"), "Mod+Shift+F", "shortcut text is normalized");
+	checkEq(normalizeShortcut("Shift+Alt+Mod+u"), "Mod+Alt+Shift+U", "modifiers have one order");
+	checkEq(normalizeShortcut("ALT+ctrl+Space"), "Ctrl+Alt+Space", "named keys keep their name");
+	checkEq(normalizeShortcut(""), "", "no shortcut stays empty");
+	{
+		Fixture f(support);
+		std::map<std::string, std::string> seen;
+		for (const ShortcutEntry &entry : f.w.shortcutEntries()) {
+			if (entry.defaultShortcut.empty()) continue;
+			const auto other = seen.find(entry.defaultShortcut);
+			check(other == seen.end(), "no two commands share a default shortcut", entry.defaultShortcut + ": " + entry.id + (other == seen.end() ? "" : " and " + other->second));
+			seen[entry.defaultShortcut] = entry.id;
+		}
+		check(seen.size() > 40, "many commands have shortcuts");
+		const auto entryFor = [&](const std::string &id) {
+			for (const ShortcutEntry &entry : f.w.shortcutEntries()) if (entry.id == id) return entry;
+			return ShortcutEntry{};
+		};
+		checkEq(entryFor("Edit/Undo").shortcut, "Mod+Z", "ids are menu paths");
+
+		check(f.w.assignShortcut("Edit/Undo", "Mod+Alt+Shift+U"), "assigning a free shortcut");
+		checkEq(entryFor("Edit/Undo").shortcut, "Mod+Alt+Shift+U", "the new shortcut shows");
+		check(f.host.menusChangedCount == 1, "menus are rebuilt");
+		const auto menuShortcut = [&](const std::string &menuTitle, const std::string &title) {
+			for (const MenuItem &top : f.w.mainMenu())
+				if (top.title == menuTitle)
+					for (const MenuItem &item : top.children)
+						if (item.title == title) return item.shortcut;
+			return std::string("(missing)");
+		};
+		checkEq(menuShortcut("Edit", "Undo"), "Mod+Alt+Shift+U", "the menu shows the new shortcut");
+
+		f.host.answer = 0;
+		check(!f.w.assignShortcut("Edit/Redo", "Mod+Alt+Shift+U"), "declining a conflict refuses");
+		check(f.host.lastTitle.find("already used") != std::string::npos, "a conflict asks first");
+		checkEq(entryFor("Edit/Undo").shortcut, "Mod+Alt+Shift+U", "the old command keeps it");
+		f.host.answer = 1;
+		check(f.w.assignShortcut("Edit/Redo", "Mod+Alt+Shift+U"), "accepting a conflict moves it");
+		checkEq(entryFor("Edit/Redo").shortcut, "Mod+Alt+Shift+U", "the new command has it");
+		checkEq(entryFor("Edit/Undo").shortcut, "", "the old command loses it");
+		check(!f.w.assignShortcut("Edit/NoSuchThing", "Mod+Q"), "unknown commands are refused");
+		f.w.run(Cmd::ShowShortcutMapper);
+		check(f.host.mapperRuns == 1, "the mapper opens");
+		f.w.run(Cmd::CloseAll);
+	}
+	{
+		Fixture f(support);
+		bool found = false;
+		for (const ShortcutEntry &entry : f.w.shortcutEntries())
+			if (entry.id == "Edit/Redo") found = entry.shortcut == "Mod+Alt+Shift+U";
+		check(found, "shortcuts persist");
+		f.w.resetShortcuts();
+		for (const ShortcutEntry &entry : f.w.shortcutEntries())
+			check(entry.shortcut == entry.defaultShortcut, "reset restores defaults", entry.id);
+		f.w.run(Cmd::CloseAll);
+	}
+}
+
+static void testCompletion(const std::string &tmp, const std::string &support) {
+	Fixture f(support);
+	Workspace &e = f.w;
+	const std::string path = writeFile(tmp, "complete.py", "");
+	check(e.openPath(path), "open python");
+
+	std::vector<std::string> names = e.completionCandidates("pri", true, false, 0);
+	check(std::find(names.begin(), names.end(), "print") != names.end(), "language keywords complete");
+
+	e.setText("alphabet alpha alpine other\nalp");
+	e.setSelection(e.text().size(), e.text().size());
+	names = e.completionCandidates("alp", false, true, e.text().size());
+	checkEq(names.size() == 3 ? names[0] + "," + names[1] + "," + names[2] : "wrong count", "alpha,alphabet,alpine", "document words, sorted, without the word being typed");
+
+	check(e.showCompletion(false, true, true), "a completion list opens");
+	checkEq(e.lastCompletionList, "alpha\nalphabet\nalpine", "the list has the words");
+	f.v().send(SCI_AUTOCCANCEL);
+
+	e.setText("zzz");
+	e.setSelection(3, 3);
+	check(!e.showCompletion(false, true, true), "nothing to offer");
+	checkEq(f.host.flashed, "No completions", "an explicit request says why");
+
+	// Typing only offers once the threshold is reached.
+	e.setText("hello hxllo\nh");
+	e.setSelection(e.text().size(), e.text().size());
+	check(!e.showCompletion(false, true, false), "below the threshold");
+	e.setText("hello hxllo\nhe");
+	e.setSelection(e.text().size(), e.text().size());
+	check(e.showCompletion(false, true, false), "at the threshold");
+	f.v().send(SCI_AUTOCCANCEL);
+
+	// Function hints.
+	const std::string cpp = writeFile(tmp, "hint.php", "");
+	check(e.openPath(cpp), "open php");
+	check(e.activeLanguageName() == "php", "php detected", e.activeLanguageName());
+	e.setText("<?php substr(");
+	e.setSelection(e.text().size(), e.text().size());
+	check(e.showParameterHint(true), "hint opens inside a call");
+	check(e.hintActive() && e.hintParameter() == 0, "on the first parameter");
+	e.setText("<?php substr($a, ");
+	e.setSelection(e.text().size(), e.text().size());
+	check(e.showParameterHint(true) && e.hintParameter() == 1, "commas move to the next parameter");
+	e.setText("<?php substr(strlen($a), ");
+	e.setSelection(e.text().size(), e.text().size());
+	check(e.showParameterHint(true) && e.hintParameter() == 1, "nested calls are skipped");
+	e.setText("<?php substr(strlen(");
+	e.setSelection(e.text().size(), e.text().size());
+	check(e.showParameterHint(true) && e.hintParameter() == 0, "the innermost call wins");
+	e.setText("<?php nosuchfunction(");
+	e.setSelection(e.text().size(), e.text().size());
+	check(!e.showParameterHint(true) && !e.hintActive(), "unknown functions have no hint");
+
+	// Paths complete from the disk.
+	writeFile(tmp, "pathtarget.txt", "x");
+	e.setText(tmp + "/pathtar");
+	e.setSelection(e.text().size(), e.text().size());
+	e.run(Cmd::CompletePath);
+	checkEq(e.lastCompletionList, "pathtarget.txt", "paths complete");
+	f.v().send(SCI_AUTOCCANCEL);
+
+	ApiKeyword keyword;
+	keyword.name = "max";
+	ApiOverload overload;
+	overload.returnValue = "int";
+	overload.parameters = {"int a", "int b"};
+	overload.description = "bigger one";
+	keyword.overloads = {overload, overload};
+	const std::string tip = formatHint(keyword, overload, "(", ")", ",", 0, 2);
+	check(tip.find("int max(int a, int b)") != std::string::npos && tip.find("bigger one") != std::string::npos, "hint text", tip);
+	const auto range = hintHighlight(keyword, overload, "(", ",", 0, 2, 1);
+	checkEq(tip.substr(range.first, range.second - range.first), "int b", "hint highlights the current parameter");
+	e.run(Cmd::CloseAll);
+}
+
+static void testFunctionList(const std::string &tmp, const std::string &support) {
+	FunctionListCatalog catalog(OMAPAD_RESOURCES);
+	const auto names = [](const std::vector<FunctionEntry> &entries) {
+		std::string out;
+		for (const FunctionEntry &entry : entries) out += (entry.className.empty() ? "" : entry.className + "::") + entry.name + " ";
+		return out;
+	};
+	check(catalog.supports("python") && catalog.supports("cpp"), "languages with rules");
+	check(!catalog.supports("nosuchlanguage"), "languages without rules");
+	checkEq(names(catalog.parse("python", "def top():\n    pass\n\nclass Thing:\n    def method(self):\n        pass\n# def commented():\n")),
+	        "top() Thing::method(self) ", "python functions and classes");
+	checkEq(names(catalog.parse("c", "int add(int a, int b) { return a + b; }\n/* int gone(void) {} */\nvoid run(void)\n{\n}\n")), "add(int a, int b) run(void) ", "c functions, skipping comments");
+	const std::string cppNames = names(catalog.parse("cpp", "class Box {\npublic:\n  int size() { return 1; }\n};\nint Box2::width() { return 2; }\nint main() { return 0; }\n"));
+	check(cppNames.find("main") != std::string::npos && cppNames.find("size") != std::string::npos, "c++ functions", cppNames);
+	const std::string javaNames = names(catalog.parse("java", "public class App {\n  public void go(int x) { }\n  private int stop() { return 1; }\n}\n"));
+	check(javaNames.find("go") != std::string::npos && javaNames.find("stop") != std::string::npos, "java methods", javaNames);
+	const std::string jsNames = names(catalog.parse("javascript.js", "function hello(a) { }\nconst x = 1;\n"));
+	check(jsNames.find("hello") != std::string::npos, "javascript functions", jsNames);
+	const std::string rubyNames = names(catalog.parse("ruby", "def greet(name)\nend\n"));
+	check(rubyNames.find("greet") != std::string::npos, "ruby methods", rubyNames);
+	const std::string bashNames = names(catalog.parse("bash", "build() {\n  echo\n}\nfunction deploy {\n  echo\n}\n"));
+	check(bashNames.find("build") != std::string::npos && bashNames.find("deploy") != std::string::npos, "bash functions", bashNames);
+	const std::string rustNames = names(catalog.parse("rust", "fn alpha() {}\nimpl Thing {\n  pub fn beta(&self) {}\n}\n"));
+	check(rustNames.find("alpha") != std::string::npos && rustNames.find("beta") != std::string::npos, "rust functions", rustNames);
+
+	// Every rule file parses, and none hangs on ordinary text.
+	std::error_code error;
+	long files = 0;
+	std::string sample = "def a(): pass\nfunction b() { }\nvoid c(int x) { }\nclass D { void e() { } }\nsub f { }\n";
+	for (int i = 0; i < 8; i++) sample += sample;
+	for (const auto &file : fs::directory_iterator(std::string(OMAPAD_RESOURCES) + "/functionList", error)) {
+		const std::string language = file.path().stem().string();
+		check(catalog.supports(language), "rule file loads", language);
+		catalog.parse(language, sample);
+		files++;
+	}
+	check(files == 47, "all rule files were tried", std::to_string(files));
+
+	Fixture f(support);
+	Workspace &e = f.w;
+	const std::string path = writeFile(tmp, "list.py", "def first():\n    pass\n\ndef second():\n    pass\n");
+	check(e.openPath(path), "open a file for the list");
+	check(e.activeLanguageHasFunctionList(), "python has a list");
+	e.run(Cmd::ToggleFunctionList);
+	check(f.host.functionVisible && e.functionListVisible(), "the panel opens");
+	check(e.functionEntries().size() == 2, "the panel lists functions", std::to_string(e.functionEntries().size()));
+	const int changes = f.host.functionListChangedCount;
+	e.goToFunction(1);
+	check(f.v().send(SCI_LINEFROMPOSITION, f.v().send(SCI_GETCURRENTPOS)) == 3, "going to a function moves the caret");
+	e.goToFunction(99);  // Past the end, as a stale click might be.
+
+	// After an edit, it refreshes once typing pauses, not on every key.
+	e.setSelection(e.text().size(), e.text().size());
+	const char *added = "def third():\n    pass\n";
+	f.v().send(SCI_ADDTEXT, strlen(added), reinterpret_cast<intptr_t>(added));
+	e.tick();
+	check(f.host.functionListChangedCount == changes, "no refresh right after an edit");
+	e.tick();
+	check(f.host.functionListChangedCount == changes + 1 && e.functionEntries().size() == 3, "it refreshes after a pause");
+	e.tick();
+	check(f.host.functionListChangedCount == changes + 1, "no refresh when nothing changed");
+	e.run(Cmd::ToggleFunctionList);
+	check(!f.host.functionVisible, "the panel closes");
+	e.run(Cmd::CloseAll);
+}
+
+static void testMultiSelectAndColumns(const std::string &support) {
+	Fixture f(support);
+	Workspace &e = f.w;
+	e.setText("foo bar foo baz foo\n");
+	e.setSelection(0, 3);
+	e.run(Cmd::MultiSelectAll, 1);
+	check(f.v().send(SCI_GETSELECTIONS) == 3, "select all occurrences", std::to_string(f.v().send(SCI_GETSELECTIONS)));
+	e.setSelection(0, 3);
+	e.run(Cmd::MultiSelectNext, 1);
+	check(f.v().send(SCI_GETSELECTIONS) == 2, "select the next occurrence");
+	check(f.v().send(SCI_GETSELECTIONNSTART, 1) == 8, "that's the second one");
+	e.run(Cmd::MultiSelectSkip, 1);
+	check(f.v().send(SCI_GETSELECTIONS) == 2 && f.v().send(SCI_GETSELECTIONNSTART, f.v().send(SCI_GETMAINSELECTION)) == 16, "skip moves on to the third");
+	e.run(Cmd::MultiSelectUndo);
+	check(f.v().send(SCI_GETSELECTIONS) == 1, "undo drops the latest");
+	e.setText("foo bar\n");
+	e.setSelection(1, 1);
+	e.run(Cmd::MultiSelectAll, 1);
+	checkEq(e.selectedText(), "foo", "with no selection, it starts from the word at the caret");
+
+	// Typing into all of them.
+	check(f.w.settings.multiEditing, "multi-edit starts on");
+	check(f.v().send(SCI_GETADDITIONALSELECTIONTYPING) == 1, "multi-edit reaches the editor");
+
+	e.setText("a\nb\nc\n");
+	e.setSelection(1, 1);
+	check(e.columnInsertText("X"), "column text");
+	checkEq(e.text(), "aX\nbX\ncX\n X", "text fills to the end, padding as needed");
+	check(!e.columnInsertText(""), "empty column text does nothing");
+
+	e.setText("aaaa\nb\ncccc");
+	e.setSelection(2, 2);
+	check(e.columnInsertText("|"), "pads short lines");
+	checkEq(e.text(), "aa|aa\nb |\ncc|cc", "short lines stay straight");
+
+	e.setText("a\nb\nc\nd\n");
+	e.setSelection(0, 0);
+	e.columnInsertNumbers(1, 1, 1, false, 10);
+	checkEq(e.text(), "1a\n2b\n3c\n4d\n5", "numbers count up");
+	e.setText(std::string("x\n") + "x\n" + "x\n" + "x\n" + "x\n" + "x\n" + "x\n" + "x\n" + "x\n" + "x\n" + "x");
+	e.setSelection(0, 0);
+	e.columnInsertNumbers(1, 1, 1, true, 10);
+	check(e.text().rfind("01x\n", 0) == 0 && e.text().find("11x") != std::string::npos, "leading zeros", e.text());
+	e.setText("x\nx\nx\nx");
+	e.setSelection(0, 0);
+	e.columnInsertNumbers(10, 5, 2, false, 10);
+	checkEq(e.text(), "10x\n10x\n15x\n15x", "repeat holds each value");
+	e.setText("x\nx\nx");
+	e.setSelection(0, 0);
+	e.columnInsertNumbers(14, 1, 1, false, 16);
+	checkEq(e.text(), " Ex\n Fx\n10x", "hexadecimal, right-aligned");
+
+	e.setText("aaa\nbbb\nccc\nddd");
+	f.v().send(SCI_SETRECTANGULARSELECTIONANCHOR, 1);
+	f.v().send(SCI_SETRECTANGULARSELECTIONCARET, f.v().send(SCI_FINDCOLUMN, 1, 1));
+	check(f.v().send(SCI_SELECTIONISRECTANGLE) != 0, "a rectangle is selected");
+	e.columnInsertNumbers(1, 1, 1, false, 10);
+	checkEq(e.text(), "a1aa\nb2bb\nccc\nddd", "a rectangle limits the lines");
+
+	checkEq(formatNumber(255, 16, 0), "FF", "hex format");
+	checkEq(formatNumber(5, 2, 0), "101", "binary format");
+	checkEq(formatNumber(-8, 8, 0), "-10", "negative octal");
+	checkEq(formatNumber(7, 10, 3), "007", "width pads");
+
+	f.host.formAnswer = [](std::vector<FormField> &fields) {
+		for (FormField &field : fields) if (field.key == "text") field.value = "T";
+		return true;
+	};
+	e.setText("a\nb");
+	e.setSelection(1, 1);
+	e.run(Cmd::ColumnEditor);
+	checkEq(f.host.lastFormTitle, "Column Editor", "the column form opens");
+	checkEq(e.text(), "aT\nbT", "the form inserts");
+	f.v().send(SCI_UNDO);
+	checkEq(e.text(), "a\nb", "one undo reverses it all");
+	e.run(Cmd::CloseAll);
+}
+
+static void testChangeHistoryAndStyles(const std::string &tmp, const std::string &support) {
+	Fixture f(support);
+	Workspace &e = f.w;
+	const std::string path = writeFile(tmp, "history.txt", "one\ntwo\nthree\nfour\n");
+	check(e.openPath(path), "open for change history");
+	check(f.v().send(SCI_GETCHANGEHISTORY) != 0, "change history is on");
+	const long mask = 0xFL << SC_MARKNUM_HISTORY_REVERTED_TO_ORIGIN;
+	const auto firstChanged = [&]() {
+		for (long line = 0; line < f.v().send(SCI_GETLINECOUNT); line++)
+			if (f.v().send(SCI_MARKERGET, line) & mask) return line;
+		return -1L;
+	};
+	check(firstChanged() < 0, "opening a file isn't a change");
+	f.v().send(SCI_GOTOLINE, 2);
+	f.v().send(SCI_ADDTEXT, 1, reinterpret_cast<intptr_t>("X"));
+	check(firstChanged() == 2, "an edit marks its line");
+	f.v().send(SCI_GOTOLINE, 0);
+	e.run(Cmd::NextChange);
+	check(f.v().send(SCI_LINEFROMPOSITION, f.v().send(SCI_GETCURRENTPOS)) == 2, "next change");
+	e.run(Cmd::NextChange);
+	check(f.v().send(SCI_LINEFROMPOSITION, f.v().send(SCI_GETCURRENTPOS)) == 2, "next change wraps");
+	f.host.answer = 0;
+	e.run(Cmd::ClearChangeHistory);
+	check(firstChanged() == 2, "declining keeps the history");
+	f.host.answer = 1;
+	e.run(Cmd::ClearChangeHistory);
+	check(firstChanged() < 0, "clearing removes the marks");
+	check(f.v().send(SCI_GETCHANGEHISTORY) != 0, "history keeps recording after a clear");
+	f.host.flashed.clear();
+	e.run(Cmd::NextChange);
+	checkEq(f.host.flashed, "No changes", "nothing to go to");
+	// Two separate changes, the first spanning two lines, and wrapping both ways.
+	f.v().send(SCI_GOTOLINE, 0);
+	f.v().send(SCI_ADDTEXT, 1, reinterpret_cast<intptr_t>("Y"));
+	f.v().send(SCI_GOTOLINE, 1);
+	f.v().send(SCI_ADDTEXT, 1, reinterpret_cast<intptr_t>("Y"));
+	f.v().send(SCI_GOTOLINE, 3);
+	f.v().send(SCI_ADDTEXT, 1, reinterpret_cast<intptr_t>("Y"));
+	const auto caretLine = [&]() { return f.v().send(SCI_LINEFROMPOSITION, f.v().send(SCI_GETCURRENTPOS)); };
+	e.run(Cmd::NextChange);
+	check(caretLine() == 0, "next wraps to the first change", std::to_string(caretLine()));
+	e.run(Cmd::NextChange);
+	check(caretLine() == 3, "a run of lines is one change", std::to_string(caretLine()));
+	e.run(Cmd::PreviousChange);
+	check(caretLine() == 0, "previous lands on the start of a run", std::to_string(caretLine()));
+	e.run(Cmd::PreviousChange);
+	check(caretLine() == 3, "previous wraps", std::to_string(caretLine()));
+	f.host.answer = 0;
+	e.run(Cmd::CloseAll);
+
+	Fixture g(support);
+	Workspace &w = g.w;
+	w.setText("foo bar\nbaz foo\nfoo\nfoobar\n");
+	w.setSelection(0, 3);
+	w.run(Cmd::StyleAllOccurrences, 1);
+	const long indicator = 25;
+	check(g.v().send(SCI_INDICATORVALUEAT, indicator, 0) != 0, "style marks the first");
+	check(g.v().send(SCI_INDICATORVALUEAT, indicator, 12) != 0, "style marks the others");
+	check(g.v().send(SCI_INDICATORVALUEAT, indicator, 4) == 0, "style leaves the rest alone");
+	w.setSelection(0, 3);
+	w.run(Cmd::JumpStyleDown, 1);
+	checkEq(w.selectedText(), "foo", "jump down selects a marked range");
+	check(g.v().send(SCI_GETSELECTIONSTART) == 12, "jumps to the next");
+	w.run(Cmd::JumpStyleUp, 1);
+	check(g.v().send(SCI_GETSELECTIONSTART) == 0, "jumps back");
+	w.run(Cmd::JumpStyleUp, 1);
+	check(g.v().send(SCI_GETSELECTIONSTART) > 12, "jump up wraps");
+	w.setSelection(4, 7);
+	w.run(Cmd::StyleOneToken, 2);
+	check(g.v().send(SCI_INDICATORVALUEAT, 24, 4) != 0, "style one token");
+	w.run(Cmd::CopyStyled, 2);
+	checkEq(g.host.clipboard, "bar\n", "copy styled text");
+	w.run(Cmd::ClearStyle, 2);
+	check(g.v().send(SCI_INDICATORVALUEAT, 24, 4) == 0, "clear one style");
+	check(g.v().send(SCI_INDICATORVALUEAT, indicator, 0) != 0, "clearing one leaves the others");
+	w.run(Cmd::ClearStyle, 0);
+	check(g.v().send(SCI_INDICATORVALUEAT, indicator, 0) == 0, "clear all styles");
+	g.host.flashed.clear();
+	w.run(Cmd::JumpStyleDown, 1);
+	checkEq(g.host.flashed, "Nothing marked with that style", "nothing to jump to");
+	w.run(Cmd::CloseAll);
+}
+
+static void testDocumentMapAndMisc(const std::string &tmp, const std::string &support) {
+	Fixture f(support);
+	Workspace &e = f.w;
+	std::string many;
+	for (int i = 0; i < 500; i++) many += "line " + std::to_string(i) + "\n";
+	const std::string path = writeFile(tmp, "map.txt", many);
+	check(e.openPath(path), "open for the map");
+	e.run(Cmd::ToggleDocumentMap);
+	check(f.host.mapVisible && e.documentMapVisible(), "the map shows");
+	check(f.host.map->send(SCI_GETDOCPOINTER) == f.v().send(SCI_GETDOCPOINTER), "the map shows the same document");
+	check(f.host.map->send(SCI_GETZOOM) == -10, "the map is zoomed out");
+	check(f.host.map->send(SCI_INDICATORVALUEAT, 19, 0) != 0, "the map shades what's on screen");
+
+	// Clicking the map moves the editor.
+	const long target = f.host.map->send(SCI_POSITIONFROMLINE, 400);
+	e.mapPressed(f.host.map->send(SCI_POINTXFROMPOSITION, 0, target), f.host.map->send(SCI_POINTYFROMPOSITION, 0, target));
+	check(f.v().send(SCI_GETFIRSTVISIBLELINE) > 300, "a click on the map scrolls the editor", std::to_string(f.v().send(SCI_GETFIRSTVISIBLELINE)));
+	const long scrolledTo = f.v().send(SCI_GETFIRSTVISIBLELINE);
+	e.mapScrolled(-10);
+	check(f.v().send(SCI_GETFIRSTVISIBLELINE) == scrolledTo - 10, "scrolling on the map scrolls the editor");
+	check(f.v().send(SCI_LINEFROMPOSITION, f.v().send(SCI_GETCURRENTPOS)) == 0, "the caret stays put");
+
+	// The map follows tab changes, and closing a document doesn't free it under the map.
+	e.createUntitledDocument();
+	e.setText("new");
+	check(f.host.map->send(SCI_GETDOCPOINTER) == f.v().send(SCI_GETDOCPOINTER), "the map follows the tab");
+	f.host.answer = 2;
+	e.closeActive();
+	check(f.host.map->send(SCI_GETDOCPOINTER) == f.v().send(SCI_GETDOCPOINTER), "the map follows a close");
+	e.run(Cmd::ToggleDocumentMap);
+	check(!f.host.mapVisible, "the map hides");
+
+	// Next search result.
+	const std::string a = writeFile(tmp, "result.txt", "needle one\nother\nneedle two\n");
+	check(e.openPath(a), "open for results");
+	FindOptions o = findOptions("needle", "", SearchMode::Normal);
+	check(e.findAllInDocument(o) == 2, "find all for next result");
+	e.run(Cmd::NextSearchResult);
+	const long firstJump = f.v().send(SCI_LINEFROMPOSITION, f.v().send(SCI_GETCURRENTPOS));
+	e.run(Cmd::NextSearchResult);
+	const long secondJump = f.v().send(SCI_LINEFROMPOSITION, f.v().send(SCI_GETCURRENTPOS));
+	check(firstJump != secondJump && (firstJump == 0 || firstJump == 2) && (secondJump == 0 || secondJump == 2), "next result walks them", std::to_string(firstJump) + " " + std::to_string(secondJump));
+	e.run(Cmd::PreviousSearchResult);
+	check(f.v().send(SCI_LINEFROMPOSITION, f.v().send(SCI_GETCURRENTPOS)) == firstJump, "previous result goes back");
+
+	e.setText("call(one, [two])");
+	e.setSelection(11, 11);
+	e.run(Cmd::SelectInBraces);
+	checkEq(e.selectedText(), "two", "selects inside the nearest bracket");
+	e.setSelection(6, 6);
+	e.run(Cmd::SelectInBraces);
+	checkEq(e.selectedText(), "one, [two]", "skips finished brackets");
+
+	e.setText("line");
+	e.setSelection(0, 4);
+	e.run(Cmd::DeleteSelection);
+	checkEq(e.text(), "", "delete");
+	e.run(Cmd::ToggleReadOnly);
+	check(f.v().send(SCI_GETREADONLY) != 0, "read-only on");
+	f.v().send(SCI_ADDTEXT, 1, reinterpret_cast<intptr_t>("x"));
+	checkEq(e.text(), "", "read-only stops edits");
+	e.run(Cmd::ToggleReadOnly);
+
+	e.setText("1,5\n10,25\n2,75\n");
+	e.setSelection(0, 0);
+	e.run(Cmd::LineOperation, static_cast<int>(LineOp::SortDecimalCommaAsc));
+	checkEq(e.text(), "1,5\n2,75\n10,25\n", "comma decimals sort");
+	e.run(Cmd::LineOperation, static_cast<int>(LineOp::SortDecimalCommaDesc));
+	checkEq(e.text(), "10,25\n2,75\n1,5\n", "comma decimals sort down");
+
+	const std::string oldName = writeFile(tmp, "before-rename.txt", "x");
+	check(e.openPath(oldName), "open for rename");
+	f.host.promptAnswer = "after-rename.txt";
+	f.host.promptAccepted = true;
+	e.run(Cmd::Rename);
+	check(e.activePath() == tmp + "/after-rename.txt" && fs::exists(tmp + "/after-rename.txt") && !fs::exists(oldName), "rename moves the file", e.activePath());
+
+	// Close to the left and right.
+	f.host.answer = 2;  // Don't Save.
+	e.run(Cmd::CloseAll);
+	e.createUntitledDocument();
+	e.createUntitledDocument();
+	const size_t before = e.tabs(e.focusedPane()).size();
+	check(before >= 3, "three tabs", std::to_string(before));
+	e.clickTab(e.focusedPane(), 1);
+	e.run(Cmd::CloseLeft);
+	check(e.tabs(e.focusedPane()).size() == before - 1, "close to the left");
+	e.clickTab(e.focusedPane(), 0);
+	e.run(Cmd::CloseRight);
+	check(e.tabs(e.focusedPane()).size() == 1, "close to the right");
+	e.run(Cmd::CloseAll);
+}
+
 int main() {
 	setvbuf(stdout, nullptr, _IONBF, 0);
 	initTestToolkit();
@@ -1328,6 +1997,27 @@ int main() {
 	testOmarchyTheme(tmp, support);
 	printf("== testHighlighting\n");
 	testHighlighting(tmp, support);
+
+	printf("== testRegexEngine\n");
+	testRegexEngine();
+	printf("== testRegexInDocument\n");
+	testRegexInDocument(support);
+	printf("== testPreferences\n");
+	testPreferences(tmp);
+	printf("== testPanelsAndBackupInterval\n");
+	testPanelsAndBackupInterval(tmp);
+	printf("== testShortcuts\n");
+	testShortcuts(tmp);
+	printf("== testCompletion\n");
+	testCompletion(tmp, support);
+	printf("== testFunctionList\n");
+	testFunctionList(tmp, support);
+	printf("== testMultiSelectAndColumns\n");
+	testMultiSelectAndColumns(support);
+	printf("== testChangeHistoryAndStyles\n");
+	testChangeHistoryAndStyles(tmp, support);
+	printf("== testDocumentMapAndMisc\n");
+	testDocumentMapAndMisc(tmp, support);
 
 	std::error_code error;
 	chmod((tmp + "/locked").c_str(), 0700);

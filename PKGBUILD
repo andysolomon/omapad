@@ -1,6 +1,6 @@
 # Build from a checkout of this repository with: makepkg -si
 pkgname=omapad
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc='Native text editor modelled on Notepad++, built for Omarchy'
 arch=('x86_64' 'aarch64')

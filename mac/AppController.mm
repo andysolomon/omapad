@@ -1,6 +1,8 @@
 #import "AppController.h"
+#import "Dialogs.h"
 #import "FindPanel.h"
 #import "FolderPanel.h"
+#import "FunctionPanel.h"
 #import "TabBar.h"
 #import "ScintillaView.h"
 #import "Scintilla.h"
@@ -71,6 +73,31 @@ static void (^sFileDropHandler)(NSArray<NSString *> *);
 }
 @end
 
+// Sits over the Document Map and takes its mouse input, so the map itself never gets focus
+// or a selection. Presses jump the editor there, and scrolling scrolls the editor.
+@interface OmaMapOverlay : NSView
+@property(nonatomic, copy) void (^pressed)(NSPoint point);
+@property(nonatomic, copy) void (^scrolled)(CGFloat lines);
+@end
+@implementation OmaMapOverlay {
+	CGFloat _pendingLines;
+}
+- (BOOL)isFlipped { return YES; }
+- (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
+- (void)report:(NSEvent *)event {
+	if (self.pressed) self.pressed([self convertPoint:event.locationInWindow fromView:nil]);
+}
+- (void)mouseDown:(NSEvent *)event { [self report:event]; }
+- (void)mouseDragged:(NSEvent *)event { [self report:event]; }
+- (void)scrollWheel:(NSEvent *)event {
+	// Trackpads send fractions of a line, so they're saved up until there's a whole one.
+	_pendingLines -= event.hasPreciseScrollingDeltas ? event.scrollingDeltaY / 16 : event.scrollingDeltaY;
+	const CGFloat whole = trunc(_pendingLines);
+	_pendingLines -= whole;
+	if (whole != 0 && self.scrolled) self.scrolled(whole);
+}
+@end
+
 // What a menu item does, carried on the item itself.
 @interface OmaMenuAction : NSObject {
 @public
@@ -90,6 +117,11 @@ struct MacSciView : SciView {
 - (void)hostSplitChanged:(BOOL)visible stacked:(BOOL)stacked;
 - (void)hostResultsVisible:(BOOL)visible;
 - (void)hostFolderVisible:(BOOL)visible;
+- (void)hostFunctionListVisible:(BOOL)visible;
+- (void)hostFunctionListChanged;
+- (void)hostDocumentMapVisible:(BOOL)visible;
+- (void)buildMenus;
+- (Workspace *)workspacePointer;
 - (void)hostFoldersChanged;
 - (void)hostFocusPane:(int)pane;
 - (void)hostThemeChanged;
@@ -106,11 +138,12 @@ struct MacSciView : SciView {
 
 struct MacHost : Host {
 	__unsafe_unretained AppController *controller = nil;
-	MacSciView panes[2], results, background;
+	MacSciView panes[2], results, background, map;
 
 	SciView &paneView(int pane) override { return panes[pane]; }
 	SciView &resultsView() override { return results; }
 	SciView &backgroundView() override { return background; }
+	SciView &mapView() override { return map; }
 
 	int ask(const std::string &title, const std::string &detail, const std::vector<std::string> &buttons) override {
 		NSAlert *alert = [NSAlert new];
@@ -189,6 +222,12 @@ struct MacHost : Host {
 	void foldersChanged() override { [controller hostFoldersChanged]; }
 	void focusPane(int pane) override { [controller hostFocusPane:pane]; }
 	void themeChanged() override { [controller hostThemeChanged]; }
+	void menusChanged() override { [controller buildMenus]; }
+	bool runForm(const std::string &title, std::vector<FormField> &fields) override { return OmaRunForm(toNS(title), fields); }
+	void runShortcutMapper() override { OmaRunShortcutMapper(*[controller workspacePointer]); }
+	void setDocumentMapVisible(bool visible) override { [controller hostDocumentMapVisible:visible]; }
+	void setFunctionListVisible(bool visible) override { [controller hostFunctionListVisible:visible]; }
+	void functionListChanged() override { [controller hostFunctionListChanged]; }
 	void showFind(FindTab tab, const std::string &prefill, const std::string &directory) override {
 		if (!directory.empty()) [controller.findPanel setDirectory:toNS(directory)];
 		[controller.findPanel showTab:tab prefill:toNS(prefill)];
@@ -226,6 +265,9 @@ struct MacHost : Host {
 	NSSplitView *_rightSplit;  // Editors above results.
 	NSSplitView *_editorSplit; // The two views.
 	FolderPanel *_folderPanel;
+	FunctionPanel *_functionPanel;
+	ScintillaView *_map;
+	NSView *_mapBox;
 	NSTextField *_statusLeft, *_statusMessage, *_statusRight;
 	FindPanel *_findPanel;
 	NSTimer *_backupTimer;
@@ -249,6 +291,7 @@ struct MacHost : Host {
 		_host->panes[1].view = _editors[1];
 		_host->results.view = _results;
 		_host->background.view = _background;
+		_host->map.view = _map;
 		_findPanel = [[FindPanel alloc] initWithWorkspace:_workspace.get()];
 		__weak AppController *weakSelf = self;
 		sFileDropHandler = ^(NSArray<NSString *> *paths) { [weakSelf openPaths:paths]; };
@@ -355,6 +398,34 @@ struct MacHost : Host {
 		AppController *strong = weakSelf;
 		return strong ? [strong menuFromItems:items title:@""] : nil;
 	};
+
+	_functionPanel = [[FunctionPanel alloc] initWithWorkspace:_workspace.get()];
+
+	_map = [[ScintillaView alloc] initWithFrame:NSMakeRect(0, 0, 120, 600)];
+	_map.translatesAutoresizingMaskIntoConstraints = NO;
+	OmaMapOverlay *overlay = [OmaMapOverlay new];
+	overlay.translatesAutoresizingMaskIntoConstraints = NO;
+	overlay.pressed = ^(NSPoint point) {
+		AppController *strong = weakSelf;
+		if (strong) strong->_workspace->mapPressed(static_cast<long>(point.x), static_cast<long>(point.y));
+	};
+	overlay.scrolled = ^(CGFloat lines) {
+		AppController *strong = weakSelf;
+		if (strong) strong->_workspace->mapScrolled(static_cast<long>(lines));
+	};
+	_mapBox = [NSView new];
+	[_mapBox addSubview:_map];
+	[_mapBox addSubview:overlay positioned:NSWindowAbove relativeTo:_map];
+	[NSLayoutConstraint activateConstraints:@[
+		[_map.topAnchor constraintEqualToAnchor:_mapBox.topAnchor],
+		[_map.leadingAnchor constraintEqualToAnchor:_mapBox.leadingAnchor],
+		[_map.trailingAnchor constraintEqualToAnchor:_mapBox.trailingAnchor],
+		[_map.bottomAnchor constraintEqualToAnchor:_mapBox.bottomAnchor],
+		[overlay.topAnchor constraintEqualToAnchor:_mapBox.topAnchor],
+		[overlay.leadingAnchor constraintEqualToAnchor:_mapBox.leadingAnchor],
+		[overlay.trailingAnchor constraintEqualToAnchor:_mapBox.trailingAnchor],
+		[overlay.bottomAnchor constraintEqualToAnchor:_mapBox.bottomAnchor],
+	]];
 
 	_outer = [NSSplitView new];
 	_outer.vertical = YES;
@@ -467,6 +538,42 @@ struct MacHost : Host {
 	} else if (!visible && _folderPanel.superview) {
 		[_folderPanel removeFromSuperview];
 	}
+	[self arrangeSidePanels];
+}
+
+- (Workspace *)workspacePointer { return _workspace.get(); }
+
+// Keeps the side panels' widths when the window resizes, and gives a newly shown one its room.
+- (void)arrangeSidePanels {
+	[_outer layoutSubtreeIfNeeded];
+	NSArray<NSView *> *views = _outer.arrangedSubviews;
+	const NSUInteger editors = [views indexOfObject:_rightSplit];
+	for (NSUInteger i = 0; i < views.count; i++) [_outer setHoldingPriority:views[i] == _rightSplit ? 240 : 260 forSubviewAtIndex:i];
+	const CGFloat total = NSWidth(_outer.bounds);
+	const BOOL hasMap = _mapBox.superview != nil, hasFunctions = _functionPanel.superview != nil;
+	const CGFloat mapWidth = hasMap ? 120 : 0;
+	if (hasFunctions) [_outer setPosition:total - mapWidth - 250 ofDividerAtIndex:editors];
+	if (hasMap) [_outer setPosition:total - mapWidth ofDividerAtIndex:views.count - 2];
+}
+
+- (void)hostFunctionListVisible:(BOOL)visible {
+	if (visible && !_functionPanel.superview) {
+		[_outer insertArrangedSubview:_functionPanel atIndex:[_outer.arrangedSubviews indexOfObject:_rightSplit] + 1];
+		[_functionPanel reload];
+	} else if (!visible && _functionPanel.superview) {
+		[_functionPanel removeFromSuperview];
+	}
+	[self arrangeSidePanels];
+}
+
+- (void)hostFunctionListChanged {
+	if (_functionPanel.superview) [_functionPanel reload];
+}
+
+- (void)hostDocumentMapVisible:(BOOL)visible {
+	if (visible && !_mapBox.superview) [_outer addArrangedSubview:_mapBox];
+	else if (!visible && _mapBox.superview) [_mapBox removeFromSuperview];
+	[self arrangeSidePanels];
 }
 
 - (void)hostFoldersChanged {
@@ -551,7 +658,7 @@ struct MacHost : Host {
 	[_window makeKeyAndOrderFront:nil];
 	[self hostFocusPane:_workspace->focusedPane()];
 	[NSApp activateIgnoringOtherApps:YES];
-	_backupTimer = [NSTimer scheduledTimerWithTimeInterval:7 target:self selector:@selector(backupTick:) userInfo:nil repeats:YES];
+	_backupTimer = [NSTimer scheduledTimerWithTimeInterval:1 target:self selector:@selector(backupTick:) userInfo:nil repeats:YES];
 }
 
 - (void)backupTick:(NSTimer *)timer { _workspace->tick(); }
@@ -606,31 +713,6 @@ struct MacHost : Host {
 	return state.enabled && action->item.cmd != Cmd::None;
 }
 
-- (void)applyShortcut:(const std::string &)shortcut to:(NSMenuItem *)item {
-	if (shortcut.empty()) return;
-	NSEventModifierFlags mods = 0;
-	NSString *key = nil;
-	for (NSString *part in [toNS(shortcut) componentsSeparatedByString:@"+"]) {
-		if ([part isEqualToString:@"Mod"]) mods |= NSEventModifierFlagCommand;
-		else if ([part isEqualToString:@"Ctrl"]) mods |= NSEventModifierFlagControl;
-		else if ([part isEqualToString:@"Alt"]) mods |= NSEventModifierFlagOption;
-		else if ([part isEqualToString:@"Shift"]) mods |= NSEventModifierFlagShift;
-		else key = part;
-	}
-	if (!key.length) return;
-	const auto special = [](unichar c) { return [NSString stringWithCharacters:&c length:1]; };
-	if ([key isEqualToString:@"Up"]) key = special(NSUpArrowFunctionKey);
-	else if ([key isEqualToString:@"Down"]) key = special(NSDownArrowFunctionKey);
-	else if ([key isEqualToString:@"Left"]) key = special(NSLeftArrowFunctionKey);
-	else if ([key isEqualToString:@"Right"]) key = special(NSRightArrowFunctionKey);
-	else if ([key isEqualToString:@"PageUp"]) key = special(NSPageUpFunctionKey);
-	else if ([key isEqualToString:@"PageDown"]) key = special(NSPageDownFunctionKey);
-	else if (key.length >= 2 && [key hasPrefix:@"F"]) key = special(static_cast<unichar>(NSF1FunctionKey + key.integerValue + [key substringFromIndex:1].integerValue - 1));
-	else key = key.lowercaseString;
-	item.keyEquivalent = key;
-	item.keyEquivalentModifierMask = mods;
-}
-
 - (NSMenuItem *)nativeItem:(const MenuItem &)source {
 	if (source.separator) return NSMenuItem.separatorItem;
 	NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:toNS(source.title) action:nil keyEquivalent:@""];
@@ -647,7 +729,7 @@ struct MacHost : Host {
 		item.submenu = [self menuFromItems:source.children title:item.title];
 		return item;
 	}
-	[self applyShortcut:source.shortcut to:item];
+	OmaApplyShortcut(source.shortcut, item);
 	if (!source.macAction.empty()) {
 		// Standard actions go to whichever view has focus, so they also work in the Find panel.
 		item.action = NSSelectorFromString(toNS(source.macAction));

@@ -5,7 +5,9 @@ owner and is used here only to describe where data files came from.
 
 Notepad++ 8.9.8.1 (GPLv3), Copyright (C) Don HO, https://notepad-plus-plus.org/
   resources/langs.model.xml, resources/stylers.model.xml and resources/themes/*.xml are unmodified
-  copies from the official release. core/LangTable.inc is generated from the language table in
+  copies from the official release. resources/autoCompletion/*.xml and resources/functionList/*.xml
+  come from the source tag below. overrideMap.xml is left out, and functionList/rust.xml also
+  recognizes `pub` functions. core/LangTable.inc is generated from the language table in
   PowerEditor/src/ScintillaComponent/ScintillaEditView.cpp at tag v8.9.8.1, commit dd40fe45.
   This use of GPL data is why omapad as a whole is GPLv3. Its license notice is kept in
   licenses/Notepad++.txt.
@@ -25,6 +27,12 @@ Changes to the bundled third-party code:
 
 pugixml 1.16, Copyright (C) 2006-2026 Arseny Kapoulkine, https://pugixml.org/
   third_party/pugixml is distributed under the MIT license.
+
+PCRE2 10.47, Copyright (c) 1997-2007 University of Cambridge, 2007-2024 Philip Hazel and others,
+https://www.pcre.org/
+  third_party/pcre2 is distributed under the BSD license with the PCRE2 exception. It holds the
+  library's source, with pcre2.h, config.h and pcre2_chartables.c made from their .generic files,
+  and without pcre2_dftables.c, which only generates tables. JIT compilation isn't enabled.
 
 JSON for Modern C++ 3.12.0, Copyright (c) 2013-2025 Niels Lohmann,
 https://github.com/nlohmann/json

@@ -294,6 +294,15 @@ void LanguageCatalog::setOmarchyPalette(const Palette &p) {
 	set("Bookmark margin", "", background);
 	set("Smart Highlighting", "", accent);
 	set("Find Mark Style", "", p.get("yellow", "accent"));
+	set("Mark Style 1", "", p.get("blue", "accent"));
+	set("Mark Style 2", "", p.get("green", "accent"));
+	set("Mark Style 3", "", p.get("orange", "accent"));
+	set("Mark Style 4", "", p.get("magenta", "accent"));
+	set("Mark Style 5", "", p.get("cyan", "accent"));
+	set("Change History modified", "", p.get("orange", "accent"));
+	set("Change History saved", "", p.get("green", "accent"));
+	set("Change History revert origin", "", p.get("cyan", "accent"));
+	set("Change History revert modified", "", p.get("yellow", "accent"));
 	omarchyTheme = std::move(theme);
 }
 
@@ -462,6 +471,20 @@ void LanguageCatalog::applyChrome(const Theme &theme, SciView &view) const {
 	// Indicators 30 and 31 hold smart highlighting and Mark All. See Workspace.
 	if (bg("Smart Highlighting", &colour)) view.send(SCI_INDICSETFORE, 30, colour);
 	if (bg("Find Mark Style", &colour)) view.send(SCI_INDICSETFORE, 31, colour);
+	// Token styles 1 to 5 use indicators 25 down to 21, as Notepad++ does.
+	const char *markStyles[] = {"Mark Style 1", "Mark Style 2", "Mark Style 3", "Mark Style 4", "Mark Style 5"};
+	for (int i = 0; i < 5; i++)
+		if (bg(markStyles[i], &colour)) view.send(SCI_INDICSETFORE, 25 - i, colour);
+	const std::pair<const char *, int> history[] = {
+		{"Change History revert origin", SC_MARKNUM_HISTORY_REVERTED_TO_ORIGIN}, {"Change History saved", SC_MARKNUM_HISTORY_SAVED},
+		{"Change History modified", SC_MARKNUM_HISTORY_MODIFIED}, {"Change History revert modified", SC_MARKNUM_HISTORY_REVERTED_TO_MODIFIED},
+	};
+	for (const auto &entry : history) {
+		if (bg(entry.first, &colour)) {
+			view.send(SCI_MARKERSETBACK, entry.second, colour);
+			view.send(SCI_MARKERSETFORE, entry.second, colour);
+		}
+	}
 }
 
 }  // namespace omapad
