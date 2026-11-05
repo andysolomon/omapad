@@ -98,6 +98,18 @@ void OmaApplyShortcut(const std::string &shortcut, NSMenuItem *item) {
 
 #pragma mark - Form
 
+// A table whose right-click menu depends on the row.
+@interface OmaMenuTable : NSTableView
+@property(nonatomic, copy) NSMenu *(^menuForRow)(NSInteger row);
+@end
+@implementation OmaMenuTable
+- (NSMenu *)menuForEvent:(NSEvent *)event {
+	const NSInteger row = [self rowAtPoint:[self convertPoint:event.locationInWindow fromView:nil]];
+	if (row >= 0) [self selectRowIndexes:[NSIndexSet indexSetWithIndex:static_cast<NSUInteger>(row)] byExtendingSelection:NO];
+	return self.menuForRow ? self.menuForRow(row) : nil;
+}
+@end
+
 @interface OmaFormDelegate : NSObject <NSWindowDelegate>
 @end
 @implementation OmaFormDelegate
@@ -136,6 +148,8 @@ static std::string hexFromColour(NSColor *colour) {
 @interface OmaStyleRow : NSStackView
 @property(nonatomic, strong) NSButton *fgOn, *bgOn, *bold, *italic, *underline;
 @property(nonatomic, strong) NSColorWell *fg, *bg;
+@property(nonatomic, strong) NSTextField *fontName;
+@property(nonatomic, strong) NSTextField *fontSize;
 @end
 @implementation OmaStyleRow
 - (instancetype)initWithLabel:(NSString *)label value:(const std::string &)value {
@@ -166,6 +180,19 @@ static std::string hexFromColour(NSColor *colour) {
 		self.alignment = NSLayoutAttributeCenterY;
 		self.spacing = 8;
 		for (NSView *view in @[name, _fgOn, _fg, _bgOn, _bg, _bold, _italic, _underline]) [self addArrangedSubview:view];
+		// The font's name and size come after the third comma, for rows that have them.
+		const size_t third = second == std::string::npos ? second : value.find(',', second + 1);
+		const size_t fourth = third == std::string::npos ? third : value.find(',', third + 1);
+		if (fourth != std::string::npos) {
+			_fontName = [NSTextField textFieldWithString:toNS(value.substr(third + 1, fourth - third - 1))];
+			_fontName.placeholderString = @"Font";
+			[_fontName.widthAnchor constraintEqualToConstant:110].active = YES;
+			_fontSize = [NSTextField textFieldWithString:toNS(value.substr(fourth + 1))];
+			_fontSize.placeholderString = @"Size";
+			[_fontSize.widthAnchor constraintEqualToConstant:40].active = YES;
+			[self addArrangedSubview:_fontName];
+			[self addArrangedSubview:_fontSize];
+		}
 	}
 	return self;
 }
@@ -182,7 +209,12 @@ static std::string hexFromColour(NSColor *colour) {
 - (void)picked:(NSColorWell *)well { (well == _fg ? _fgOn : _bgOn).state = NSControlStateValueOn; }
 - (std::string)value {
 	const int fontStyle = (_bold.state == NSControlStateValueOn ? 1 : 0) | (_italic.state == NSControlStateValueOn ? 2 : 0) | (_underline.state == NSControlStateValueOn ? 4 : 0);
-	return (_fgOn.state == NSControlStateValueOn ? hexFromColour(_fg.color) : std::string()) + "," + (_bgOn.state == NSControlStateValueOn ? hexFromColour(_bg.color) : std::string()) + "," + std::to_string(fontStyle);
+	std::string out = (_fgOn.state == NSControlStateValueOn ? hexFromColour(_fg.color) : std::string()) + "," + (_bgOn.state == NSControlStateValueOn ? hexFromColour(_bg.color) : std::string()) + "," + std::to_string(fontStyle);
+	if (_fontName) {
+		const int size = _fontSize.intValue;
+		out += "," + toStd(_fontName.stringValue) + "," + (size > 0 ? std::to_string(size) : std::string());
+	}
+	return out;
 }
 @end
 
@@ -503,6 +535,7 @@ BOOL OmaRunForm(NSString *title, std::vector<FormField> &fields) {
 	NSPanel *_window;
 	NSTableView *_table;
 	NSSearchField *_search;
+	NSPopUpButton *_category;
 	NSTextField *_hint;
 	id _monitor;
 }
@@ -535,6 +568,11 @@ BOOL OmaRunForm(NSString *title, std::vector<FormField> &fields) {
 	_search.placeholderString = @"Filter commands or shortcuts";
 	_search.delegate = self;
 	_search.translatesAutoresizingMaskIntoConstraints = NO;
+	_category = [NSPopUpButton new];
+	[_category addItemsWithTitles:@[@"Main menu", @"Macros", @"Run commands", @"Plugin commands", @"Scintilla commands"]];
+	_category.target = self;
+	_category.action = @selector(categoryChanged:);
+	_category.translatesAutoresizingMaskIntoConstraints = NO;
 
 	_table = [NSTableView new];
 	_table.dataSource = self;
@@ -569,6 +607,7 @@ BOOL OmaRunForm(NSString *title, std::vector<FormField> &fields) {
 		[self button:@"Set…" action:@selector(setShortcut:)],
 		[self button:@"Clear" action:@selector(clearShortcut:)],
 		[self button:@"Reset" action:@selector(resetShortcut:)],
+		[self button:@"Delete…" action:@selector(deleteCommand:)],
 		[self button:@"Reset All…" action:@selector(resetAll:)],
 		[NSView new],
 		done,
@@ -577,13 +616,16 @@ BOOL OmaRunForm(NSString *title, std::vector<FormField> &fields) {
 	buttons.translatesAutoresizingMaskIntoConstraints = NO;
 
 	NSView *content = _window.contentView;
+	[content addSubview:_category];
 	[content addSubview:_search];
 	[content addSubview:scroll];
 	[content addSubview:_hint];
 	[content addSubview:buttons];
 	[NSLayoutConstraint activateConstraints:@[
+		[_category.topAnchor constraintEqualToAnchor:content.topAnchor constant:12],
+		[_category.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:14],
 		[_search.topAnchor constraintEqualToAnchor:content.topAnchor constant:12],
-		[_search.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:14],
+		[_search.leadingAnchor constraintEqualToAnchor:_category.trailingAnchor constant:8],
 		[_search.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-14],
 		[scroll.topAnchor constraintEqualToAnchor:_search.bottomAnchor constant:10],
 		[scroll.leadingAnchor constraintEqualToAnchor:_search.leadingAnchor],
@@ -603,6 +645,26 @@ BOOL OmaRunForm(NSString *title, std::vector<FormField> &fields) {
 	[self applyFilter];
 }
 
+- (void)categoryChanged:(id)sender { [self applyFilter]; }
+
+- (void)deleteCommand:(id)sender {
+	const ShortcutEntry *entry = [self selectedEntry];
+	if (!entry) return;
+	const std::string id = entry->id;
+	NSAlert *alert = [NSAlert new];
+	if (id.rfind("Macro/", 0) != 0 && id.rfind("Run/", 0) != 0) {
+		alert.messageText = @"Only saved macros and run commands can be deleted.";
+		[alert runModal];
+		return;
+	}
+	alert.messageText = toNS("Delete “" + id + "”?");
+	[alert addButtonWithTitle:@"Delete"];
+	[alert addButtonWithTitle:@"Cancel"];
+	if ([alert runModal] != NSAlertFirstButtonReturn) return;
+	_workspace->deleteShortcutCommand(id);
+	[self reload];
+}
+
 - (void)applyFilter {
 	const std::string selected = [self selectedEntry] ? [self selectedEntry]->id : std::string();
 	std::string filter = toStd(_search.stringValue);
@@ -612,7 +674,9 @@ BOOL OmaRunForm(NSString *title, std::vector<FormField> &fields) {
 	};
 	filter = lower(filter);
 	_visible.clear();
+	const std::string category = toStd(_category.titleOfSelectedItem ?: @"Main menu");
 	for (size_t i = 0; i < _entries.size(); i++) {
+		if (_entries[i].category != category) continue;
 		if (filter.empty() || lower(_entries[i].id).find(filter) != std::string::npos || lower(_entries[i].shortcut).find(filter) != std::string::npos)
 			_visible.push_back(i);
 	}
@@ -798,9 +862,11 @@ static const CGFloat kPointsPerMillimetre = 72.0 / 25.4;
 
 - (NSRect)rectForPage:(NSInteger)page { return NSMakeRect(0, _paper.height * (page - 1), _paper.width, _paper.height); }
 
-- (void)drawCaption:(const omapad::PrintPageText &)text atY:(CGFloat)y width:(CGFloat)width {
+- (void)drawCaption:(const omapad::PrintPageText &)text atY:(CGFloat)y width:(CGFloat)width bold:(BOOL)bold italic:(BOOL)italic {
+	NSFont *font = bold ? [NSFont boldSystemFontOfSize:omapad::PrintJob::kCaptionPoints] : [NSFont systemFontOfSize:omapad::PrintJob::kCaptionPoints];
+	if (italic) font = [NSFontManager.sharedFontManager convertFont:font toHaveTrait:NSItalicFontMask];
 	NSDictionary *attributes = @{
-		NSFontAttributeName: [NSFont systemFontOfSize:omapad::PrintJob::kCaptionPoints],
+		NSFontAttributeName: font,
 		NSForegroundColorAttributeName: NSColor.blackColor,
 	};
 	NSString *left = toNS(text.left), *middle = toNS(text.middle), *right = toNS(text.right);
@@ -818,8 +884,8 @@ static const CGFloat kPointsPerMillimetre = 72.0 / 25.4;
 	CGContextSaveGState(context);
 	CGContextTranslateCTM(context, o.marginLeft * kPointsPerMillimetre, _paper.height * page + o.marginTop * kPointsPerMillimetre);
 	_job->drawPage(context, static_cast<int>(page), width, height);
-	if (_job->headerHeight() > 0) [self drawCaption:_job->header(static_cast<int>(page)) atY:0 width:width];
-	if (_job->footerHeight() > 0) [self drawCaption:_job->footer(static_cast<int>(page)) atY:height - _job->footerHeight() + 6 width:width];
+	if (_job->headerHeight() > 0) [self drawCaption:_job->header(static_cast<int>(page)) atY:0 width:width bold:o.headerBold italic:o.headerItalic];
+	if (_job->footerHeight() > 0) [self drawCaption:_job->footer(static_cast<int>(page)) atY:height - _job->footerHeight() + 6 width:width bold:o.footerBold italic:o.footerItalic];
 	CGContextRestoreGState(context);
 }
 
@@ -852,3 +918,235 @@ BOOL OmaRunPrint(omapad::PrintJob &job, const omapad::PrintOutput &output, std::
 	}
 	return YES;
 }
+
+#pragma mark - List dialog
+
+@interface OmaListDialog : NSObject <NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate>
+@property(nonatomic) NSInteger pressed;
+- (int)runList:(const omapad::ListDialog &)list selection:(std::vector<int> &)selection;
+@end
+
+@implementation OmaListDialog {
+	std::vector<std::vector<std::string>> _rows;
+	NSTableView *_table;
+}
+
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)view { return static_cast<NSInteger>(_rows.size()); }
+
+- (NSView *)tableView:(NSTableView *)view viewForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
+	NSTextField *cell = [view makeViewWithIdentifier:@"cell" owner:self];
+	if (!cell) {
+		cell = [NSTextField labelWithString:@""];
+		cell.identifier = @"cell";
+		cell.lineBreakMode = NSLineBreakByTruncatingMiddle;
+	}
+	const NSUInteger index = [view.tableColumns indexOfObject:column];
+	const auto &values = _rows[static_cast<size_t>(row)];
+	cell.stringValue = index < values.size() ? toNS(values[index]) : @"";
+	return cell;
+}
+
+- (void)press:(NSButton *)button {
+	self.pressed = button.tag;
+	[NSApp stopModalWithCode:NSModalResponseOK];
+}
+- (void)doubleClicked:(id)sender {
+	if (_table.clickedRow < 0) return;
+	self.pressed = 0;
+	[NSApp stopModalWithCode:NSModalResponseOK];
+}
+- (BOOL)windowShouldClose:(NSWindow *)window {
+	self.pressed = -1;
+	[NSApp stopModalWithCode:NSModalResponseCancel];
+	return NO;
+}
+
+- (int)runList:(const omapad::ListDialog &)list selection:(std::vector<int> &)selection {
+	_rows = list.rows;
+	self.pressed = -1;
+	NSPanel *window = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 720, 460)
+	                                             styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
+	                                               backing:NSBackingStoreBuffered
+	                                                 defer:NO];
+	window.title = toNS(list.title);
+	window.delegate = self;
+	window.releasedWhenClosed = NO;
+	_table = [NSTableView new];
+	_table.dataSource = self;
+	_table.delegate = self;
+	_table.allowsMultipleSelection = list.multiSelect;
+	_table.target = self;
+	_table.doubleAction = @selector(doubleClicked:);
+	for (const std::string &title : list.columns) {
+		NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:toNS(title)];
+		column.title = toNS(title);
+		column.width = 680 / MAX(list.columns.size(), static_cast<size_t>(1));
+		[_table addTableColumn:column];
+	}
+	NSScrollView *scroll = [NSScrollView new];
+	scroll.documentView = _table;
+	scroll.hasVerticalScroller = YES;
+	scroll.borderType = NSBezelBorder;
+	scroll.translatesAutoresizingMaskIntoConstraints = NO;
+	NSMutableArray<NSView *> *buttons = [NSMutableArray array];
+	for (size_t i = 0; i < list.buttons.size(); i++) {
+		NSButton *button = [NSButton buttonWithTitle:toNS(list.buttons[i]) target:self action:@selector(press:)];
+		button.tag = static_cast<NSInteger>(i);
+		[buttons addObject:button];
+	}
+	NSStackView *row = [NSStackView stackViewWithViews:buttons];
+	row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+	row.translatesAutoresizingMaskIntoConstraints = NO;
+	NSView *content = window.contentView;
+	[content addSubview:scroll];
+	[content addSubview:row];
+	[NSLayoutConstraint activateConstraints:@[
+		[scroll.topAnchor constraintEqualToAnchor:content.topAnchor constant:12],
+		[scroll.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:12],
+		[scroll.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-12],
+		[scroll.bottomAnchor constraintEqualToAnchor:row.topAnchor constant:-10],
+		[row.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-12],
+		[row.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-12],
+	]];
+	[_table reloadData];
+	if (!_rows.empty()) [_table selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
+	[window center];
+	[NSApp runModalForWindow:window];
+	[window orderOut:nil];
+	selection.clear();
+	[_table.selectedRowIndexes enumerateIndexesUsingBlock:^(NSUInteger index, BOOL *) { selection.push_back(static_cast<int>(index)); }];
+	return static_cast<int>(self.pressed);
+}
+
+@end
+
+int OmaRunList(const omapad::ListDialog &list, std::vector<int> &selection) {
+	OmaListDialog *dialog = [OmaListDialog new];
+	return [dialog runList:list selection:selection];
+}
+
+#pragma mark - Side panel
+
+@interface OmaSidePanel () <NSTableViewDataSource, NSTableViewDelegate>
+@end
+
+@implementation OmaSidePanel {
+	Workspace *_workspace;
+	int _panel;
+	std::vector<omapad::PanelRow> _rows;
+	std::vector<std::string> _headings;
+	NSTableView *_table;
+	NSScrollView *_scroll;
+}
+
+- (instancetype)initWithWorkspace:(Workspace *)workspace panel:(int)panel title:(NSString *)title {
+	if ((self = [super initWithFrame:NSMakeRect(0, 0, 250, 300)])) {
+		_workspace = workspace;
+		_panel = panel;
+		NSTextField *label = [NSTextField labelWithString:title.uppercaseString];
+		label.font = [NSFont systemFontOfSize:10 weight:NSFontWeightSemibold];
+		label.textColor = NSColor.secondaryLabelColor;
+		label.translatesAutoresizingMaskIntoConstraints = NO;
+		_table = [OmaMenuTable new];
+		_table.headerView = nil;
+		_table.dataSource = self;
+		_table.delegate = self;
+		_table.target = self;
+		_table.doubleAction = @selector(activated:);
+		_table.rowSizeStyle = NSTableViewRowSizeStyleSmall;
+		_table.style = NSTableViewStyleSourceList;
+		NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:@"title"];
+		column.resizingMask = NSTableColumnAutoresizingMask;
+		[_table addTableColumn:column];
+		_table.columnAutoresizingStyle = NSTableViewUniformColumnAutoresizingStyle;
+		__weak OmaSidePanel *weakSelf = self;
+		((OmaMenuTable *)_table).menuForRow = ^NSMenu *(NSInteger row) {
+			OmaSidePanel *strong = weakSelf;
+			if (!strong || !strong.menuBuilder) return nil;
+			return strong.menuBuilder(strong->_workspace->panelMenu(strong->_panel, static_cast<int>(MAX(row, 0))));
+		};
+		NSScrollView *scroll = [NSScrollView new];
+		scroll.documentView = _table;
+		scroll.hasVerticalScroller = YES;
+		scroll.autohidesScrollers = YES;
+		scroll.drawsBackground = NO;
+		scroll.translatesAutoresizingMaskIntoConstraints = NO;
+		_scroll = scroll;
+		[self addSubview:label];
+		[self addSubview:scroll];
+		[NSLayoutConstraint activateConstraints:@[
+			[label.topAnchor constraintEqualToAnchor:self.topAnchor constant:8],
+			[label.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:10],
+			[scroll.topAnchor constraintEqualToAnchor:label.bottomAnchor constant:6],
+			[scroll.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
+			[scroll.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+			[scroll.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
+		]];
+	}
+	return self;
+}
+
+- (NSView *)focusTarget { return _table; }
+
+- (void)reload {
+	std::vector<omapad::PanelRow> rows = _workspace->panelRows(_panel);
+	const std::vector<std::string> headings = _workspace->panelColumns(_panel);
+	const bool sameColumns = headings == _headings && (!headings.empty() || _table.tableColumns.count == 1);
+	if (!sameColumns) {
+		_headings = headings;
+		while (_table.tableColumns.count) [_table removeTableColumn:_table.tableColumns.firstObject];
+		if (headings.empty()) {
+			NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:@"title"];
+			column.resizingMask = NSTableColumnAutoresizingMask;
+			[_table addTableColumn:column];
+			_table.headerView = nil;
+		} else {
+			_table.headerView = [NSTableHeaderView new];
+			_table.columnAutoresizingStyle = NSTableViewNoColumnAutoresizing;
+			for (size_t i = 0; i < headings.size(); i++) {
+				NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:[NSString stringWithFormat:@"%zu", i]];
+				column.title = toNS(headings[i]);
+				column.width = _panel == omapad::kPanelCharacters ? (i >= 3 ? 90 : 56) : (i == 0 ? 150 : i == headings.size() - 1 && headings.size() > 1 ? 220 : 50);
+				column.resizingMask = NSTableColumnUserResizingMask;
+				[_table addTableColumn:column];
+			}
+			_scroll.hasHorizontalScroller = YES;
+		}
+		// The scroll view has to lay itself out again around the header.
+		_scroll.documentView = _table;
+		[_scroll tile];
+	}
+	bool same = sameColumns && rows.size() == _rows.size();
+	for (size_t i = 0; same && i < rows.size(); i++) same = rows[i].title == _rows[i].title && rows[i].depth == _rows[i].depth && rows[i].columns == _rows[i].columns;
+	if (same) return;
+	_rows = std::move(rows);
+	[_table reloadData];
+}
+
+- (void)activated:(id)sender {
+	if (_table.clickedRow >= 0) _workspace->panelActivate(_panel, static_cast<int>(_table.clickedRow), static_cast<int>(MAX(_table.clickedColumn, 0)));
+}
+
+- (void)tableView:(NSTableView *)view didClickTableColumn:(NSTableColumn *)column {
+	_workspace->panelColumnClicked(_panel, column.identifier.intValue);
+}
+
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)view { return static_cast<NSInteger>(_rows.size()); }
+
+- (NSView *)tableView:(NSTableView *)view viewForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
+	NSTextField *cell = [view makeViewWithIdentifier:@"cell" owner:self];
+	if (!cell) {
+		cell = [NSTextField labelWithString:@""];
+		cell.identifier = @"cell";
+		cell.lineBreakMode = NSLineBreakByTruncatingTail;
+		cell.font = _panel == omapad::kPanelCharacters ? [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular] : [NSFont systemFontOfSize:12];
+	}
+	const omapad::PanelRow &entry = _rows[static_cast<size_t>(row)];
+	const size_t at = static_cast<size_t>(column.identifier.intValue);
+	const bool cellText = !_headings.empty() && at < entry.columns.size();
+	cell.stringValue = toNS(cellText ? entry.columns[at] : std::string(2 * static_cast<size_t>(entry.depth), ' ') + entry.title);
+	cell.toolTip = toNS(entry.toolTip);
+	return cell;
+}
+
+@end

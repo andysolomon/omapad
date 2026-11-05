@@ -6,7 +6,7 @@ Both share the same C++ document, search, split-view, folder-workspace and sessi
 
 omapad is an independent project, formerly called Folio. It is not affiliated with or endorsed
 by Notepad++. It uses Scintilla 5.6.6, Lexilla 5.5.3, and the language data and themes bundled
-with Notepad++ 8.9.8.1. This is version 0.4.0 of our own editor, not a Notepad++ release.
+with Notepad++ 8.9.8.1. This is version 1.1.0 of our own editor, not a Notepad++ release.
 
 ## Build and install
 
@@ -115,6 +115,22 @@ omapad comes with Notepad++'s Markdown language, so `.md` and `.markdown` files 
 using its dark variant on dark themes. Defining a language with the same name overrides it, and
 removing yours brings the original back.
 
+## Everything else
+
+- **Plugins** are native libraries in the `plugins` folder next to your settings. See `plugins/example/example.c` for a complete one. A plugin runs with all of your permissions, so only install ones you trust.
+- **Side panels:** Document List, Character Panel, Clipboard History, and three Project Panels that read and write Notepad++ workspace files.
+- **Find:** Mark tab, Replace in Files, Find in Projects, Find All in All Opened Documents, Incremental Search, Find Characters in Range, and searching only in found lines.
+- **Window modes:** toolbar, Post-It, Distraction Free, vertical and multi-line tabs, tab colours and pinned tabs.
+- **Style Configurator** edits any theme and keeps your copy in the `themes` folder next to your settings. **Import Style Theme** takes Notepad++ theme files.
+- **Sessions:** Load Session reads omapad's and Notepad++'s session files.
+- **Macros and Run:** named macros, Run a Macro Multiple Times, and saved Run commands with Notepad++'s variables.
+- **Encodings:** all of Notepad++'s character sets.
+- **Command line:** Notepad++'s switches, including `-L`, `-x`, `-y`, `-r` with wildcards, `-monitoringMode`, `-fullReadOnly`, `-fullReadOnlySavingForbidden`, `-settingsDir=`, `-titleAdd=`, `-pluginMessage=`, `-noPlugin` and `-qn=`, `-qt=`, `-qf=` ghost typing. `omapad --help` lists them all.
+- **Encodings on open:** the bundled uchardet detects legacy encodings, and HTML and XML files can declare their own.
+- **Configuration files:** `tabContextMenu.xml` and `toolbarButtonsConf.xml` in your settings folder work as they do in Notepad++, and examples are installed with the program. Next to the program, `doLocalConf.xml` makes a portable copy, `asNotepad.xml` turns off tabs and sessions, `noEasterEggs.xml` turns off the quotes, and `disableNppAutoUpdate.xml` hides the update command.
+- **File association:** Settings → File Association makes omapad the default for the extensions you list. **Edit with omapad** is in the Services menu on a Mac, and the desktop entry on Linux adds a new-window action.
+- **Context menu:** Settings → Edit Popup ContextMenu opens the file that defines it.
+
 ## Included
 
 | Area | Features |
@@ -174,35 +190,31 @@ The previous Folio application's data is separate and is not automatically migra
 - The language editor is an ordinary dialog, so changes appear when you press OK. Notepad++'s stays
   open and updates the document as you edit.
 - User languages get word completion but not function completion, hints or a Function List, which
-  Notepad++ can add with extra files. A style's font name and size are kept from imported files
-  and applied, but the editor doesn't offer them.
+  Notepad++ can add with extra files.
 
-### Not in omapad yet
+### What's different from Notepad++
 
-The full Notepad++ menu has more than this. These are the commands and features still missing:
+This is what we know differs, from comparing omapad with the 8.9.8.1 installer and its source. It doesn't prove nothing else does: every platform draws these windows differently, and much of it hasn't been used by hand. See [VALIDATION.md](VALIDATION.md).
 
-| Area | Missing |
+| Area | Difference |
 | --- | --- |
-| Files and tabs | Load and Save Session, pinned tabs, tab colours, sorting tabs, the Windows dialog, Document List, Open in a new instance, read-only for all documents |
-| Editing | Begin/End Select, Paste HTML, RTF or Binary content, Character Panel, Clipboard History, Hide Lines, right-to-left text, customized date and time, locale-order sorting, Redact Selection, Search on Internet |
-| Search | Volatile Find, Incremental Search, Find Characters in Range, Cut and Paste to Bookmarked Lines |
-| View | Project Panels, Post-It, Distraction Free mode, monitoring (`tail -f`), browser preview, control character display |
-| Encodings | About half of Notepad++'s character sets, including Arabic, Greek, Hebrew, Thai, Turkish and the OEM code pages |
-| Settings | Style Configurator, theme import, context menu editing, many of Notepad++'s individual preferences |
-| Macros and tools | Saved macros, Run a Macro Multiple Times, Run menu, Generate-to-file hash dialogs |
-| Plugins | Notepad++ plugins are Windows DLLs and can't load here. omapad has no plugin system |
+| Plugins | Notepad++ plugins are Windows DLLs and can't load here. omapad has its own plugin interface, `core/OmapadPlugin.h`, with an example in `plugins/example`. MIME Tools, Converter and NppExport are built in. Plugins Admin manages what's installed, but there's no online catalogue |
+| Windows-only commands | Explorer, `cmd` and PowerShell became your file manager and Terminal, Edge opens if it's installed, and Safari is added on a Mac. Internet Explorer has no equivalent |
+| Updates | Check for Updates compares with the latest GitHub release and opens its page. It doesn't install anything |
+| Menu languages | The menus can use any of Notepad++'s 94 translations, for titles that match Notepad++'s English. Dialogs stay in English |
+| Right-to-left text | Available on a Mac only. The Linux editing widget has no right-to-left drawing, and omapad says so if you choose the command |
+| Instances | On a Mac, Finder always opens files in the running copy. **Open in New Instance** and `-multiInst` start another |
+| Menu bar | Hide Menu has no effect on a Mac, where the menu bar belongs to the system |
+| Default keys on Linux | Follow Notepad++. Ctrl+1 to 5 jump between styled text, so tabs are Ctrl+Numpad 1 to 9. A Mac keeps its own conventions where they clash, and Notepad++'s keys on a Mac aren't all adopted |
+| System tray | Mac only. GTK3 has no tray on Wayland without another library |
+| Window position | `-x` and `-y` work on a Mac and under X11. Wayland doesn't let a program place its own window |
+| Dark mode tones | Linux only. The Mac window follows the system's appearance |
+| Toolbar icons | On Linux, line icons are the theme's symbolic set and filled ones its full-colour set, and a colour forces line icons. On a Mac, filled uses each symbol's `.fill` form where there is one |
+| Run dialog | History and browsing are controls in the form, not a combo box with a browse button |
+| Network paths | No UNC path warning or server list, as there are no UNC paths |
+| Preferences not offered | Windows rendering modes |
 
-Windows-only commands such as Open in Explorer or `cmd`, Edge and Internet Explorer preview, and
-the updater aren't planned.
-
-- Folder refresh is manual; it does not continuously watch the filesystem.
-- Mac tab strips are custom drawn and do not expose individual tabs to VoiceOver yet.
-  The Window menu and Cmd+1 through Cmd+9 provide keyboard access.
-- Wayland does not support the app's Always on Top request. Use the compositor's float/pin controls.
-
-For isolated development checks, `OMAPAD_SUPPORT_DIR` redirects settings and sessions to a test
-folder. Linux also supports `OMAPAD_RESOURCES` for resource lookup and `OMAPAD_NON_UNIQUE=1` to
-launch an independent test instance. `OMAPAD_OMARCHY_THEME` selects a test colors.toml file.
+The dialogs work slightly differently: the language editor and Style Configurator apply changes when you press OK, rather than live.
 
 ## Provenance and license
 

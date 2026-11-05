@@ -39,6 +39,13 @@ struct ThemeStyle {
 	std::string fg;
 	std::string bg;
 	int fontStyle = -1;  // Bit 1 bold, bit 2 italic, bit 4 underline. -1 means unset.
+	std::string fontName;  // Empty leaves the editor font.
+	int fontSize = 0;      // 0 leaves the editor size.
+};
+
+struct GlobalOverride {
+	bool fg = false, bg = false, font = false, bold = false, italic = false, underline = false, size = false;
+	bool any() const { return fg || bg || font || bold || italic || underline || size; }
 };
 
 struct Theme {
@@ -74,6 +81,15 @@ public:
 	// A language object stays valid afterwards, even if it has gone: check with languageNamed.
 	void loadUserLanguages(const std::string &personalDirectory);
 
+	// Styles the Style Configurator edits. `lexer` is a language, or "global" for the window's styles.
+	void setPersonalThemeFolder(const std::string &folder);
+	std::vector<ThemeStyle> editableStyles(const std::string &themeName, const std::string &lexer) const;
+	bool saveStyles(const std::string &themeName, const std::string &lexer, const std::vector<ThemeStyle> &styles, std::string &error);
+	bool importTheme(const std::string &path, std::string &error);
+	void setGlobalOverride(const GlobalOverride &override_) { globalOverride = override_; }
+	// Extra extensions and keywords, per language name.
+	void setLanguageCustomisation(const std::map<std::string, std::string> &extensions, const std::map<std::string, std::string> &keywords);
+
 	// Builds the theme named "Omarchy" from a palette, replacing any earlier one.
 	void setOmarchyPalette(const Palette &palette);
 	bool hasOmarchyTheme() const { return omarchyTheme != nullptr; }
@@ -92,7 +108,9 @@ private:
 	void applyChrome(const Theme &theme, SciView &view) const;
 	void applyUserLanguage(const UserLanguage &language, SciView &view) const;
 
-	std::string directory;
+	std::string directory, personalThemes;
+	GlobalOverride globalOverride;
+	std::map<std::string, std::string> extraExtensions, extraKeywords;
 	std::vector<std::unique_ptr<Language>> owned;
 	std::map<std::string, const Language *> languagesByName;
 	std::map<std::string, const Language *> languagesByExtension;

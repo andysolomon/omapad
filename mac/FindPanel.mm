@@ -14,7 +14,8 @@
 	NSPopUpButton *_mode;
 	NSTextField *_status;
 	NSView *_withRow, *_filesRow, *_directoryRow, *_filesOptionsRow, *_inSelectionRow;
-	NSView *_findButtons, *_replaceButtons, *_filesButtons;
+	NSView *_findButtons, *_replaceButtons, *_filesButtons, *_markButtons, *_markOptionsRow;
+	NSButton *_bookmarkLine, *_purge;
 	NSButton *_findInFilesButton, *_stopButton;
 	NSMutableArray<NSString *> *_whatHistory;
 	NSMutableArray<NSString *> *_withHistory;
@@ -81,7 +82,7 @@
 	_panel.delegate = self;
 	_panel.frameAutosaveName = @"OmapadFindPanel";
 
-	_tabs = [NSSegmentedControl segmentedControlWithLabels:@[@"Find", @"Replace", @"Find in Files"]
+	_tabs = [NSSegmentedControl segmentedControlWithLabels:@[@"Find", @"Replace", @"Find in Files", @"Mark"]
 	                                          trackingMode:NSSegmentSwitchTrackingSelectOne
 	                                                target:self
 	                                                action:@selector(tabChanged:)];
@@ -115,16 +116,27 @@
 	NSView *whatRow = [self labelled:@"Find:" control:_what];
 	_withRow = [self labelled:@"Replace:" control:_with];
 	_filesRow = [self labelled:@"Filters:" control:_filters];
-	_directoryRow = [self row:@[[self labelled:@"Folder:" control:_directory], browse]];
+	NSButton *documentFolder = [self button:@"<<" action:@selector(useDocumentFolder:)];
+	documentFolder.toolTip = @"Use the current document's folder";
+	_directoryRow = [self row:@[[self labelled:@"Folder:" control:_directory], documentFolder, browse]];
 	NSView *modeRow = [self row:@[[self labelled:@"Mode:" control:_mode], _dotNewline]];
 	NSView *optionsRow = [self row:@[_matchCase, _wholeWord, _wrap, _backward]];
 	_inSelectionRow = [self row:@[_inSelection]];
 	_filesOptionsRow = [self row:@[_recursive, _hidden]];
 
+	_bookmarkLine = [self checkbox:@"Bookmark line"];
+	_purge = [self checkbox:@"Purge for each search"];
+	_markOptionsRow = [self row:@[_bookmarkLine, _purge]];
+	_markButtons = [self row:@[
+		[self button:@"Mark All" action:@selector(markAll:)],
+		[self button:@"Clear All Marks" action:@selector(clearMarks:)],
+		[self button:@"Copy Marked Text" action:@selector(copyMarked:)],
+	]];
 	_findButtons = [self row:@[
 		[self button:@"Find Next" action:@selector(findNext:)],
 		[self button:@"Count" action:@selector(count:)],
 		[self button:@"Find All" action:@selector(findAll:)],
+		[self button:@"In All Open Documents" action:@selector(findAllOpen:)],
 		[self button:@"Mark All" action:@selector(markAll:)],
 		[self button:@"Clear Marks" action:@selector(clearMarks:)],
 	]];
@@ -137,7 +149,7 @@
 	_findInFilesButton = [self button:@"Find All" action:@selector(findInFiles:)];
 	_stopButton = [self button:@"Stop" action:@selector(stop:)];
 	_stopButton.enabled = NO;
-	_filesButtons = [self row:@[_findInFilesButton, _stopButton]];
+	_filesButtons = [self row:@[_findInFilesButton, [self button:@"Replace in Files" action:@selector(replaceInFiles:)], _stopButton]];
 
 	_status = [NSTextField wrappingLabelWithString:@""];
 	_status.font = [NSFont systemFontOfSize:11];
@@ -145,7 +157,7 @@
 
 	NSStackView *stack = [NSStackView stackViewWithViews:@[
 		_tabs, whatRow, _withRow, _filesRow, _directoryRow, modeRow, optionsRow, _inSelectionRow, _filesOptionsRow,
-		_findButtons, _replaceButtons, _filesButtons, _status,
+		_markOptionsRow, _findButtons, _replaceButtons, _filesButtons, _markButtons, _status,
 	]];
 	stack.orientation = NSUserInterfaceLayoutOrientationVertical;
 	stack.alignment = NSLayoutAttributeLeading;
@@ -172,17 +184,21 @@
 
 - (void)applyTab {
 	const NSInteger tab = _tabs.selectedSegment;
-	_withRow.hidden = tab != static_cast<NSInteger>(omapad::FindTab::Replace);
+	_withRow.hidden = tab != static_cast<NSInteger>(omapad::FindTab::Replace) && tab != static_cast<NSInteger>(omapad::FindTab::Files);
 	_filesRow.hidden = tab != static_cast<NSInteger>(omapad::FindTab::Files);
 	_directoryRow.hidden = tab != static_cast<NSInteger>(omapad::FindTab::Files);
 	_filesOptionsRow.hidden = tab != static_cast<NSInteger>(omapad::FindTab::Files);
 	_inSelectionRow.hidden = tab == static_cast<NSInteger>(omapad::FindTab::Files);
 	_findButtons.hidden = tab != static_cast<NSInteger>(omapad::FindTab::Find);
+	_markButtons.hidden = tab != static_cast<NSInteger>(omapad::FindTab::Mark);
+	_markOptionsRow.hidden = tab != static_cast<NSInteger>(omapad::FindTab::Mark);
 	_replaceButtons.hidden = tab != static_cast<NSInteger>(omapad::FindTab::Replace);
 	_filesButtons.hidden = tab != static_cast<NSInteger>(omapad::FindTab::Files);
 	_backward.hidden = tab == static_cast<NSInteger>(omapad::FindTab::Files);
 	_wrap.hidden = tab == static_cast<NSInteger>(omapad::FindTab::Files);
-	_panel.title = @[@"Find", @"Replace", @"Find in Files"][tab];
+	_panel.title = @[@"Find", @"Replace", @"Find in Files", @"Mark"][tab];
+	const BOOL monospace = _workspace->settings.prefOn("findMonospace");
+	for (NSComboBox *box in @[_what, _with]) box.font = monospace ? [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightRegular] : [NSFont systemFontOfSize:12];
 	[_panel.contentView layoutSubtreeIfNeeded];
 	NSSize fitting = _panel.contentView.fittingSize;
 	NSRect frame = [_panel frameRectForContentRect:NSMakeRect(0, 0, MAX(NSWidth(_panel.contentView.bounds), fitting.width), fitting.height)];
@@ -212,8 +228,24 @@
 
 // Return in the Find field runs whatever the current tab is for.
 - (void)whatEntered:(id)sender {
-	if (_tabs.selectedSegment == static_cast<NSInteger>(omapad::FindTab::Files)) [self findInFiles:sender];
-	else [self findNext:sender];
+	if (_tabs.selectedSegment == static_cast<NSInteger>(omapad::FindTab::Files)) {
+		[self findInFiles:sender];
+	} else if (NSApp.currentEvent.modifierFlags & NSEventModifierFlagShift) {
+		// Shift+Return searches the other way, once.
+		const NSControlStateValue was = _backward.state;
+		_backward.state = was == NSControlStateValueOn ? NSControlStateValueOff : NSControlStateValueOn;
+		[self findNext:sender];
+		_backward.state = was;
+	} else {
+		[self findNext:sender];
+	}
+}
+
+- (void)setInSelection:(BOOL)on { _inSelection.state = on ? NSControlStateValueOn : NSControlStateValueOff; }
+
+- (void)useDocumentFolder:(id)sender {
+	const std::string path = _workspace->activePath();
+	if (!path.empty()) _directory.stringValue = [NSString stringWithUTF8String:path.c_str()].stringByDeletingLastPathComponent;
 }
 
 - (void)setDirectory:(NSString *)directory {
@@ -237,6 +269,9 @@
 	o.filters = _filters.stringValue.UTF8String ?: "*";
 	o.recursive = _recursive.state == NSControlStateValueOn;
 	o.includeHidden = _hidden.state == NSControlStateValueOn;
+	const BOOL marking = _tabs.selectedSegment == static_cast<NSInteger>(omapad::FindTab::Mark);
+	o.bookmarkLine = marking && _bookmarkLine.state == NSControlStateValueOn;
+	o.purge = marking && _purge.state == NSControlStateValueOn;
 	return o;
 }
 
@@ -272,6 +307,17 @@
 - (void)replaceAllOpen:(id)sender { [self rememberHistory]; _workspace->findPanelReplaceAllOpen(); }
 - (void)markAll:(id)sender { [self rememberHistory]; _workspace->findPanelMarkAll(); }
 - (void)clearMarks:(id)sender { _workspace->findPanelClearMarks(); }
+- (void)findAllOpen:(id)sender { [self rememberHistory]; _workspace->findPanelFindAllOpen(); }
+- (void)replaceInFiles:(id)sender { [self rememberHistory]; _workspace->findPanelReplaceInFiles(); }
+- (void)applyTransparency:(BOOL)focused {
+	const std::string mode = _workspace->settings.pref("findTransparency");
+	const CGFloat opacity = _workspace->settings.prefInt("findOpacity") / 100.0;
+	_panel.alphaValue = mode == "always" || (mode == "lostFocus" && !focused) ? opacity : 1.0;
+}
+- (void)windowDidBecomeKey:(NSNotification *)note { [self applyTransparency:YES]; }
+- (void)windowDidResignKey:(NSNotification *)note { [self applyTransparency:NO]; }
+- (void)copyMarked:(id)sender { _workspace->run(omapad::Cmd::CopyStyled, 0); }
+- (void)close { [_panel orderOut:nil]; }
 - (void)findInFiles:(id)sender { [self rememberHistory]; _workspace->findPanelFindInFiles(); }
 - (void)stop:(id)sender { _workspace->stopFindInFiles(); }
 

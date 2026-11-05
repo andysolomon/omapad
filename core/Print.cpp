@@ -2,6 +2,7 @@
 
 #include "Scintilla.h"
 
+#include <algorithm>
 #include <filesystem>
 
 namespace omapad {
@@ -42,7 +43,14 @@ PrintJob::~PrintJob() {
 int PrintJob::headerHeight() const { return options.header.empty() ? 0 : kCaptionPoints + kCaptionGap; }
 int PrintJob::footerHeight() const { return options.footer.empty() ? 0 : kCaptionPoints + kCaptionGap; }
 
-intptr_t PrintJob::format(void *surface, bool draw, intptr_t from, int width, int height) {
+intptr_t PrintJob::formFeedAfter(intptr_t from) const {
+	if (!options.formFeedBreaks) return options.end;
+	for (intptr_t at = from; at < options.end; at++)
+		if (view.send(SCI_GETCHARAT, at) == '\f') return at;
+	return options.end;
+}
+
+intptr_t PrintJob::format(void *surface, bool draw, intptr_t from, int width, int height, intptr_t to) {
 	Sci_RangeToFormatFull range{};
 	range.hdc = surface;
 	range.hdcTarget = surface;
@@ -55,23 +63,31 @@ intptr_t PrintJob::format(void *surface, bool draw, intptr_t from, int width, in
 	range.rcPage.right = width;
 	range.rcPage.bottom = height;
 	range.chrg.cpMin = from;
-	range.chrg.cpMax = options.end;
+	range.chrg.cpMax = to;
 	return view.send(SCI_FORMATRANGEFULL, draw, reinterpret_cast<intptr_t>(&range));
 }
 
 void PrintJob::paginate(void *surface, int width, int height) {
 	pageStarts.clear();
+	pageEnds.clear();
 	for (intptr_t at = options.start; at < options.end;) {
-		const intptr_t next = format(surface, false, at, width, height);
+		// A form feed ends the page it's on, wherever that falls.
+		const intptr_t stop = formFeedAfter(at);
+		const intptr_t next = format(surface, false, at, width, height, stop);
 		pageStarts.push_back(at);
+		pageEnds.push_back(std::min(next, stop));
 		if (next <= at) break;  // The page is too small to fit anything. Don't loop for ever.
-		at = next;
+		at = next >= stop && stop < options.end ? stop + 1 : next;
 	}
-	if (pageStarts.empty()) pageStarts.push_back(options.start);  // An empty document is one blank page.
+	if (pageStarts.empty()) {
+		// An empty document is one blank page.
+		pageStarts.push_back(options.start);
+		pageEnds.push_back(options.end);
+	}
 }
 
 void PrintJob::drawPage(void *surface, int page, int width, int height) {
-	if (page >= 0 && page < pageCount()) format(surface, true, pageStarts[page], width, height);
+	if (page >= 0 && page < pageCount()) format(surface, true, pageStarts[page], width, height, pageEnds[page]);
 }
 
 std::string PrintJob::expand(const std::string &text, int page) const {

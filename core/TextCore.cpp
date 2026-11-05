@@ -1,4 +1,8 @@
+#include "uchardet.h"
 #include "TextCore.h"
+
+#include <cctype>
+#include <ctime>
 
 #include "CaseConvert.h"
 #include "CharacterCategoryMap.h"
@@ -282,23 +286,65 @@ std::string convertEol(const std::string &text, Eol eol) {
 	return out;
 }
 
+#include "CodePages.inc"
+
 const std::vector<Encoding> &allEncodings() {
 	static const std::vector<Encoding> list = {
 		{"utf8", "UTF-8", "UTF-8", false},
 		{"utf8bom", "UTF-8-BOM", "UTF-8", true},
 		{"utf16le", "UTF-16 LE BOM", "UTF-16LE", true},
 		{"utf16be", "UTF-16 BE BOM", "UTF-16BE", true},
-		{"cp1252", "ANSI (Windows-1252)", "CP1252", false},
-		{"latin1", "ISO-8859-1 (Latin-1)", "ISO-8859-1", false},
-		{"latin2", "ISO-8859-2 (Central European)", "ISO-8859-2", false},
-		{"cp1250", "Windows-1250 (Central European)", "CP1250", false},
-		{"cp1251", "Windows-1251 (Cyrillic)", "CP1251", false},
-		{"koi8r", "KOI8-R (Cyrillic)", "KOI8-R", false},
-		{"shiftjis", "Shift-JIS (Japanese)", "SHIFT_JIS", false},
-		{"eucjp", "EUC-JP (Japanese)", "EUC-JP", false},
-		{"gb18030", "GB18030 (Simplified Chinese)", "GB18030", false},
-		{"big5", "Big5 (Traditional Chinese)", "BIG5", false},
-		{"euckr", "EUC-KR (Korean)", "EUC-KR", false},
+		{"iso88596", "ISO 8859-6", "ISO-8859-6", false, "Arabic"},
+		{"oem720", "OEM 720", "", false, "Arabic", kTable_cp720},
+		{"cp1256", "Windows-1256", "CP1256", false, "Arabic"},
+		{"iso88594", "ISO 8859-4", "ISO-8859-4", false, "Baltic"},
+		{"iso885913", "ISO 8859-13", "ISO-8859-13", false, "Baltic"},
+		{"oem775", "OEM 775", "", false, "Baltic", kTable_cp775},
+		{"cp1257", "Windows-1257", "CP1257", false, "Baltic"},
+		{"iso885914", "ISO 8859-14", "ISO-8859-14", false, "Celtic"},
+		{"iso885910", "ISO 8859-10", "ISO-8859-10", false, "North European"},
+		{"iso885911", "ISO 8859-11", "ISO-8859-11", false, "Thai"},
+		{"iso885916", "ISO 8859-16", "ISO-8859-16", false, "Eastern European"},
+		{"iso88595", "ISO 8859-5", "ISO-8859-5", false, "Cyrillic"},
+		{"koi8r", "KOI8-R", "KOI8-R", false, "Cyrillic"},
+		{"koi8u", "KOI8-U", "KOI8-U", false, "Cyrillic"},
+		{"maccyrillic", "Macintosh", "MACCYRILLIC", false, "Cyrillic"},
+		{"oem855", "OEM 855", "", false, "Cyrillic", kTable_cp855},
+		{"oem866", "OEM 866", "", false, "Cyrillic", kTable_cp866},
+		{"cp1251", "Windows-1251", "CP1251", false, "Cyrillic"},
+		{"oem852", "OEM 852", "", false, "Central European", kTable_cp852},
+		{"cp1250", "Windows-1250", "CP1250", false, "Central European"},
+		{"big5", "Big5 (Traditional)", "BIG5", false, "Chinese"},
+		{"gb2312", "GB2312 (Simplified)", "GB2312", false, "Chinese"},
+		{"gb18030", "GB18030 (Simplified)", "GB18030", false, "Chinese"},
+		{"latin2", "ISO 8859-2", "ISO-8859-2", false, "Eastern European"},
+		{"iso88597", "ISO 8859-7", "ISO-8859-7", false, "Greek"},
+		{"oem737", "OEM 737", "", false, "Greek", kTable_cp737},
+		{"oem869", "OEM 869", "", false, "Greek", kTable_cp869},
+		{"cp1253", "Windows-1253", "CP1253", false, "Greek"},
+		{"iso88598", "ISO 8859-8", "ISO-8859-8", false, "Hebrew"},
+		{"oem862", "OEM 862", "", false, "Hebrew", kTable_cp862},
+		{"cp1255", "Windows-1255", "CP1255", false, "Hebrew"},
+		{"shiftjis", "Shift-JIS", "SHIFT_JIS", false, "Japanese"},
+		{"eucjp", "EUC-JP", "EUC-JP", false, "Japanese"},
+		{"cp949", "Windows 949", "CP949", false, "Korean"},
+		{"euckr", "EUC-KR", "EUC-KR", false, "Korean"},
+		{"oem861", "OEM 861 : Icelandic", "", false, "North European", kTable_cp861},
+		{"oem865", "OEM 865 : Nordic", "", false, "North European", kTable_cp865},
+		{"tis620", "TIS-620", "TIS-620", false, "Thai"},
+		{"iso88593", "ISO 8859-3", "ISO-8859-3", false, "Turkish"},
+		{"iso88599", "ISO 8859-9", "ISO-8859-9", false, "Turkish"},
+		{"oem857", "OEM 857", "", false, "Turkish", kTable_cp857},
+		{"cp1254", "Windows-1254", "CP1254", false, "Turkish"},
+		{"latin1", "ISO 8859-1", "ISO-8859-1", false, "Western European"},
+		{"iso885915", "ISO 8859-15", "ISO-8859-15", false, "Western European"},
+		{"oem850", "OEM 850", "", false, "Western European", kTable_cp850},
+		{"oem858", "OEM 858", "", false, "Western European", kTable_cp858},
+		{"oem860", "OEM 860 : Portuguese", "", false, "Western European", kTable_cp860},
+		{"oem863", "OEM 863 : French", "", false, "Western European", kTable_cp863},
+		{"oem437", "OEM-US : CP437", "", false, "Western European", kTable_cp437},
+		{"cp1252", "Windows-1252", "CP1252", false, "Western European"},
+		{"cp1258", "Windows-1258", "CP1258", false, "Vietnamese"},
 	};
 	return list;
 }
@@ -356,6 +402,16 @@ bool decodeAs(const std::string &data, const Encoding *encoding, std::string &ut
 		utf8Out.assign(bytes, length);
 		return true;
 	}
+	if (encoding->table) {
+		utf8Out.clear();
+		for (size_t i = 0; i < length; i++) {
+			const unsigned char c = u[i];
+			const unsigned long cp = c < 0x80 ? c : encoding->table[c - 0x80];
+			if (cp == 0xFFFD) return false;
+			appendUtf8(utf8Out, cp);
+		}
+		return true;
+	}
 	return iconvConvert(encoding->iconvName, "UTF-8", bytes, length, utf8Out);
 }
 
@@ -405,6 +461,26 @@ bool encode(const std::string &utf8, const Encoding *encoding, std::string &out)
 		return true;
 	}
 	if (!isValidUtf8(utf8.data(), utf8.size())) return false;
+	if (encoding->table) {
+		for (const char32_t cp : utf8ToCodePoints(utf8)) {
+			if (cp < 0x80) {
+				out += static_cast<char>(cp);
+				continue;
+			}
+			bool found = false;
+			for (int i = 0; i < 128 && !found; i++) {
+				if (encoding->table[i] == cp) {
+					out += static_cast<char>(i + 0x80);
+					found = true;
+				}
+			}
+			if (!found) {
+				out.clear();
+				return false;
+			}
+		}
+		return true;
+	}
 	std::string body;
 	if (!iconvConvert("UTF-8", encoding->iconvName, utf8.data(), utf8.size(), body)) return false;
 	out = prefix + body;
@@ -435,6 +511,31 @@ std::string applyLineOp(const std::string &text, LineOp op, Eol eol) {
 		out.reserve(lines.size());
 		for (const auto &k : keys) out.push_back(std::move(lines[k.second]));
 		lines = std::move(out);
+		break;
+	}
+	case LineOp::SortLocaleAsc:
+	case LineOp::SortLocaleDesc: {
+		const bool ascending = op == LineOp::SortLocaleAsc;
+		// By letter first, whatever its accent or case, as a dictionary would. Then by what's left.
+		const auto key = [](const std::string &line) {
+			std::u32string out;
+			for (char32_t cp : utf8ToCodePoints(line)) {
+				if (cp >= 0xC0 && cp < 0x180) cp = kLatinBase[cp - 0xC0];
+				out += foldCodePoint(cp);
+			}
+			return out;
+		};
+		std::vector<std::pair<std::u32string, size_t>> keys;
+		keys.reserve(lines.size());
+		for (size_t i = 0; i < lines.size(); i++) keys.emplace_back(key(lines[i]), i);
+		std::stable_sort(keys.begin(), keys.end(), [&](const auto &a, const auto &b) {
+			if (a.first != b.first) return ascending ? a.first < b.first : a.first > b.first;
+			return ascending ? lines[a.second] < lines[b.second] : lines[a.second] > lines[b.second];
+		});
+		std::vector<std::string> sorted;
+		sorted.reserve(lines.size());
+		for (const auto &k : keys) sorted.push_back(lines[k.second]);
+		lines = std::move(sorted);
 		break;
 	}
 	case LineOp::SortIntAsc: sortNumeric(lines, true, parseInteger); break;
@@ -803,6 +904,105 @@ std::string hashHex(const void *bytes, size_t length, HashKind kind) {
 	out = digest;
 	g_free(digest);
 #endif
+	return out;
+}
+
+const Encoding *detectLegacyEncoding(const std::string &bytes) {
+	uchardet_t detector = uchardet_new();
+	if (!detector) return nullptr;
+	uchardet_handle_data(detector, bytes.data(), bytes.size());
+	uchardet_data_end(detector);
+	const std::string name = uchardet_get_charset(detector);
+	uchardet_delete(detector);
+	static const std::pair<const char *, const char *> known[] = {
+		{"Shift_JIS", "shiftjis"}, {"EUC-JP", "eucjp"}, {"GB18030", "gb18030"}, {"GB2312", "gb2312"}, {"Big5", "big5"}, {"EUC-KR", "euckr"},
+		{"KOI8-R", "koi8r"}, {"windows-1251", "cp1251"}, {"WINDOWS-1251", "cp1251"}, {"windows-1253", "cp1253"}, {"WINDOWS-1253", "cp1253"},
+		{"windows-1255", "cp1255"}, {"WINDOWS-1255", "cp1255"}, {"windows-1250", "cp1250"}, {"WINDOWS-1250", "cp1250"},
+		{"ISO-8859-2", "latin2"}, {"ISO-8859-5", "iso88595"}, {"ISO-8859-7", "iso88597"}, {"ISO-8859-8", "iso88598"},
+		{"IBM855", "oem855"}, {"IBM866", "oem866"}, {"X-MAC-CYRILLIC", "maccyrillic"}, {"x-mac-cyrillic", "maccyrillic"},
+	};
+	for (const auto &entry : known)
+		if (name == entry.first) return encodingWithIdentifier(entry.second);
+	return nullptr;
+}
+
+const Encoding *declaredEncoding(const std::string &bytes) {
+	// An XML declaration or an HTML meta tag near the start can say what the file is.
+	std::string head = bytes.substr(0, 1024);
+	std::string lowered = head;
+	std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	size_t at = std::string::npos;
+	if (lowered.rfind("<?xml", 0) == 0) at = lowered.find("encoding=");
+	else if (lowered.find("<meta") != std::string::npos) at = lowered.find("charset=");
+	if (at == std::string::npos) return nullptr;
+	size_t start = lowered.find('=', at) + 1;
+	while (start < lowered.size() && (lowered[start] == '"' || lowered[start] == '\'' || lowered[start] == ' ')) start++;
+	size_t end = start;
+	while (end < lowered.size() && (std::isalnum(static_cast<unsigned char>(lowered[end])) || lowered[end] == '-' || lowered[end] == '_')) end++;
+	const std::string name = lowered.substr(start, end - start);
+	static const std::pair<const char *, const char *> aliases[] = {
+		{"utf-8", "utf8"}, {"iso-8859-1", "latin1"}, {"windows-1252", "cp1252"}, {"shift_jis", "shiftjis"}, {"euc-jp", "eucjp"}, {"gb2312", "gb2312"},
+		{"gbk", "gb18030"}, {"gb18030", "gb18030"}, {"big5", "big5"}, {"euc-kr", "euckr"}, {"koi8-r", "koi8r"}, {"koi8-u", "koi8u"},
+		{"windows-1250", "cp1250"}, {"windows-1251", "cp1251"}, {"windows-1253", "cp1253"}, {"windows-1254", "cp1254"}, {"windows-1255", "cp1255"},
+		{"windows-1256", "cp1256"}, {"windows-1257", "cp1257"}, {"windows-1258", "cp1258"}, {"iso-8859-2", "latin2"}, {"iso-8859-15", "iso885915"},
+	};
+	for (const auto &alias : aliases)
+		if (name == alias.first) return encodingWithIdentifier(alias.second);
+	return nullptr;
+}
+
+std::string formatDateTime(const std::string &format, long long seconds) {
+	const time_t when = static_cast<time_t>(seconds);
+	struct tm t;
+	localtime_r(&when, &t);
+	static const char *months[] = {"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"};
+	static const char *days[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+	const auto pad = [](int value, size_t width) {
+		std::string text = std::to_string(value);
+		return text.size() < width ? std::string(width - text.size(), '0') + text : text;
+	};
+	std::string out;
+	for (size_t i = 0; i < format.size();) {
+		const char c = format[i];
+		size_t run = 1;
+		while (i + run < format.size() && format[i + run] == c) run++;
+		const int hour12 = t.tm_hour % 12 == 0 ? 12 : t.tm_hour % 12;
+		switch (c) {
+		case 'y': out += run >= 3 ? std::to_string(t.tm_year + 1900) : pad((t.tm_year + 1900) % 100, run); break;
+		case 'M':
+			if (run >= 4) out += months[t.tm_mon];
+			else if (run == 3) out += std::string(months[t.tm_mon]).substr(0, 3);
+			else out += pad(t.tm_mon + 1, run);
+			break;
+		case 'd':
+			if (run >= 4) out += days[t.tm_wday];
+			else if (run == 3) out += std::string(days[t.tm_wday]).substr(0, 3);
+			else out += pad(t.tm_mday, run);
+			break;
+		case 'H': out += pad(t.tm_hour, run); break;
+		case 'h': out += pad(hour12, run); break;
+		case 'm': out += pad(t.tm_min, run); break;
+		case 's': out += pad(t.tm_sec, run); break;
+		case 't': out += run >= 2 ? (t.tm_hour < 12 ? "AM" : "PM") : (t.tm_hour < 12 ? "A" : "P"); break;
+		default: out.append(run, c); break;
+		}
+		i += run;
+	}
+	return out;
+}
+
+std::string percentEncode(const std::string &text) {
+	static const char *hex = "0123456789ABCDEF";
+	std::string out;
+	for (const unsigned char c : text) {
+		if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+			out += static_cast<char>(c);
+		} else {
+			out += '%';
+			out += hex[c >> 4];
+			out += hex[c & 0xF];
+		}
+	}
 	return out;
 }
 

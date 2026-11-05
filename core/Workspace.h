@@ -17,12 +17,13 @@
 #include <vector>
 
 struct SCNotification;
+struct OmapadPluginInfo;
 
 namespace omapad {
 
 enum class SearchMode { Normal = 0, Extended = 1, Regex = 2 };
 enum class SearchResult { Found, NotFound, InvalidPattern };
-enum class FindTab { Find = 0, Replace = 1, Files = 2 };
+enum class FindTab { Find = 0, Replace = 1, Files = 2, Mark = 3 };
 
 struct FindOptions {
 	std::string what, with;
@@ -31,6 +32,9 @@ struct FindOptions {
 	SearchMode mode = SearchMode::Normal;
 	std::string directory, filters = "*";
 	bool recursive = true, includeHidden = false;
+	std::vector<std::string> files;  // If set, search these rather than a folder.
+	std::map<std::string, std::string> openDocuments;  // Text to use instead of what's on disk.
+	bool bookmarkLine = false, purge = false;  // For Mark.
 };
 
 enum class Cmd {
@@ -63,6 +67,58 @@ enum class Cmd {
 	ToggleReadOnly, Rename, CloseLeft, CloseRight,
 	Print, PrintNow, PrintSelection, SaveAsPdf,
 	DefineLanguage, ImportLanguage, ExportLanguage, RemoveLanguage, OpenLanguageFolder,
+	OpenTerminal, OpenFolderOfFile, OpenDefaultViewer, CloseUnpinned, TabPin, PinActive, LoadSession, SaveSession,
+	BeginEndSelect, CopyAllNames, BlockUncomment, TrimEolToSpace, PasteHtml, PasteRtf, CopyBinary, CutBinary, PasteBinary,
+	OpenSelection, OpenSelectionFolder, RedactSelection, SearchInternet, ChangeSearchEngine, ColumnModeInfo,
+	ReadOnlyAll, ReadOnlyClearAll, FileReadOnly, VolatileFind, GoToDialog, ShowMark, CutBookmarked, PasteBookmarked, FindCharsInRange,
+	ViewInBrowser, ToggleNonPrinting, ToggleControlChars, ToggleZoomSync, MoveToNewInstance, OpenInNewInstance,
+	FirstTab, LastTab, MoveTabStart, MoveTabEnd, TabColour, HideLines, TextDirection, ToggleMonitoring,
+	WindowSort, ShowWindows, RecentWindow, DocumentSwitch,
+	MacroSave, MacroRunSaved, MacroRunMultiple, MacroManage, RunDialog, RunSaved, RunManage, ValidateShortcuts,
+	HashDialog, HelpOpen, HelpArguments, DebugInfo, CheckUpdates, SetUpdateProxy,
+	TogglePanel, PanelCommand, IncrementalSearch, PostIt, DistractionFree, StyleConfigurator, ImportTheme, EditContextMenu,
+	PluginsAdmin, ImportPlugin, OpenPluginsFolder, PluginCommand, TextTool, ConversionPanel, ExportDocument,
+	ToggleOvertype, ResultsAction, TabAction, FindInProjects,
+	RestoreClosed, FocusPanel, FolderExpandAll, FolderCollapseAll, FolderLocate, FolderOpen, FolderRunBySystem, FolderCopyName, FolderTerminal, FolderRemoveAll,
+	FileAssociation,
+};
+
+enum PanelId { kPanelClipboard = 0, kPanelCharacters, kPanelDocuments, kPanelProject1, kPanelProject2, kPanelProject3, kPanelCount };
+constexpr int kPanelFolders = 100, kPanelFunctions = 101;
+const char *panelTitle(int panel);
+
+// One line in a side panel.
+struct PanelRow {
+	std::string title, toolTip;
+	int depth = 0;
+	std::vector<std::string> columns;  // Set for panels with panelColumns.
+};
+
+// What's showing around the editor.
+struct ChromeState {
+	bool menu = true, toolbar = true, tabs = true, status = true, panels = true, frameless = false, largeToolbar = false;
+	bool filledToolbar = false;
+	std::string appearance = "system";
+	std::string toolbarColour;  // RRGGBB, or empty for the default.
+	int borderWidth = 0;
+};
+
+struct TabStyle {
+	bool vertical = false, multiLine = false, locked = false, reduced = false;
+	bool inactiveColour = true, activeBar = true, closeButton = true;
+	bool pinButton = false, buttonsOnInactive = true, alternateIcons = false, rightShortcuts = true;
+};
+struct TabInfo;
+// A tab's title with its pinned, unsaved, read-only and monitoring marks.
+std::string tabDisplayTitle(const TabInfo &info, const TabStyle &style);
+
+struct ToolItem {
+	std::string title, icon, symbol;  // A freedesktop icon name, and an SF Symbol name.
+	std::string customIcon;  // An image file from toolbarIcons, if the person set one up.
+	std::string iconName;    // The name Notepad++'s icon sets use, like "new".
+	Cmd cmd = Cmd::None;
+	int arg = 0;
+	bool separator = false;
 };
 
 // A menu described once and drawn natively by each platform.
@@ -81,7 +137,51 @@ struct MenuItem {
 
 struct MenuState { bool enabled = true; bool checked = false; };
 
-struct TabInfo { std::string title, toolTip; bool dirty = false; };
+struct TabInfo {
+	std::string title, toolTip;
+	bool dirty = false;
+	bool readOnly = false, monitoring = false;
+	bool pinned = false;
+	int colour = 0;  // 1 to 5, or 0 for none.
+};
+
+// A table in a dialog, with buttons along the bottom.
+struct ListDialog {
+	std::string title;
+	std::vector<std::string> columns;
+	std::vector<std::vector<std::string>> rows;
+	std::vector<std::string> buttons;
+	bool multiSelect = false;
+};
+
+// What was on the command line.
+struct CommandLine {
+	std::vector<std::string> files, ignored;
+	long line = -1, column = -1, position = -1;
+	std::string language;
+	bool readOnly = false, fullReadOnly = false, monitor = false, noSession = false, noTabBar = false, multiInstance = false;
+	bool alwaysOnTop = false, openSession = false, foldersAsWorkspace = false, quickPrint = false;
+	bool help = false, noPlugin = false, monitoringMode = false, savingForbidden = false, systemTray = false, loadingTime = false, recursive = false;
+	long windowX = -1, windowY = -1;
+	std::string localeCode, settingsDirectory, titleAdd, pluginMessage;
+	std::string ghostName, ghostText, ghostFile;
+	int ghostSpeed = -1;  // 0 slow, 1 fast, 2 fastest. Unset uses the quote's own.
+};
+// Things that have to be known before the Workspace exists.
+void setLaunchOptions(const CommandLine &line);
+const CommandLine &launchOptions();
+// Where settings and state live, once doLocalConf.xml and -settingsDir have had their say.
+void resolveConfigDirectories(std::string &settings, std::string &state);
+// The folder holding the program, or next to the app bundle on a Mac.
+std::string programDirectory();
+CommandLine parseCommandLine(const std::vector<std::string> &arguments);
+const char *commandLineHelp();
+// MIME Tools and Converter. `ok` is false if the input isn't valid for the tool.
+std::string applyTextTool(const std::string &tool, const std::string &input, bool &ok);
+// Starts a program that carries on by itself, even if we quit.
+bool spawnDetached(const std::vector<std::string> &arguments, const std::string &directory, std::string &error);
+bool commandExists(const std::string &name);
+std::string currentExecutablePath();
 
 struct FolderEntry { std::string name, path; bool isDirectory = false; bool isSymlink = false; };
 
@@ -105,6 +205,7 @@ struct ShortcutEntry {
 	std::string id;        // The menu path, like "Edit/Undo".
 	std::string shortcut;  // Empty if there's none.
 	std::string defaultShortcut;
+	std::string category = "Main menu";  // Main menu, Macros, Run commands, Plugin commands or Scintilla commands.
 };
 
 struct ChromeColors {
@@ -127,6 +228,12 @@ struct Host {
 	virtual bool chooseFont(std::string &family, double &size) = 0;
 	virtual bool promptText(const std::string &title, const std::string &label, const std::string &initial, std::string &out) = 0;
 	virtual void setClipboard(const std::string &text) = 0;
+	// `format` is "text", "text/html" or "text/rtf". False if the clipboard has nothing in that form.
+	virtual bool clipboardData(const std::string &format, std::string &out) = 0;
+	virtual void setClipboardData(const std::string &format, const std::string &data) = 0;
+	virtual void launch(const std::vector<std::string> &arguments, const std::string &directory) = 0;
+	// Returns which button was pressed, or -1 if the window was closed.
+	virtual int runList(const ListDialog &dialog, std::vector<int> &selection) = 0;
 	virtual void reveal(const std::string &path) = 0;
 	virtual bool moveToTrash(const std::string &path, std::string &error) = 0;
 
@@ -154,6 +261,21 @@ struct Host {
 	virtual FindOptions currentFindOptions() = 0;
 	virtual void setFindStatus(const std::string &status, bool isError) = 0;
 	virtual void setFindInFilesRunning(bool running) = 0;
+
+	virtual void setPanelVisible(int panel, const std::string &title, bool visible) = 0;
+	virtual void panelChanged(int panel) = 0;
+	virtual void setIncrementalBar(bool visible) = 0;
+	virtual void setChrome(const ChromeState &chrome) = 0;
+	virtual void setTabStyle(const TabStyle &style) = 0;
+	virtual void closeFind() = 0;  // After a search that fills the results, if the preference says so.
+	virtual void setFindInSelection(bool on) = 0;
+	virtual void beep() = 0;
+	virtual void focusPanel(int panel) = 0;  // A PanelId, or kPanelFolders or kPanelFunctions.
+	virtual void selectFolderPath(const std::string &path) = 0;
+	virtual void setTray(bool visible) = 0;  // Does nothing where there's no tray to use.
+	virtual void setWindowPosition(long x, long y) = 0;
+	// Makes omapad the default for these extensions. False with a message if that failed.
+	virtual bool registerFileTypes(const std::vector<std::string> &extensions, std::string &error) = 0;
 
 	virtual void setFullScreen(bool on) = 0;
 	virtual void setAlwaysOnTop(bool on) = 0;
@@ -197,6 +319,20 @@ struct Settings {
 	std::string printHeaderLeft = "$(FILE_NAME)", printHeaderMiddle, printHeaderRight = "$(SHORT_DATE)";
 	std::string printFooterLeft, printFooterMiddle = "$(CURRENT_PRINTING_PAGE) / $(TOTAL_PAGES)", printFooterRight;
 	int printMarginTop = 15, printMarginBottom = 15, printMarginLeft = 15, printMarginRight = 15;  // Millimetres.
+
+	std::string dateTimeFormat = "yyyy-MM-dd HH:mm:ss";
+	bool dateTimeReverse = false;
+	std::string searchEngine = "https://duckduckgo.com/?q=$(CURRENT_WORD)";
+	std::string updateProxy;
+	std::string sessionExtension = ".session";
+	bool showNonPrinting = false, showControlChars = false, npcCodepoint = false;
+	bool syncZoom = false, switcherMru = true, folderDropOpensFiles = false, tabHide = false;
+
+	// Everything Preferences.cpp describes in its table.
+	std::map<std::string, std::string> prefs;
+	std::string pref(const std::string &key) const;
+	bool prefOn(const std::string &key) const;
+	long prefInt(const std::string &key) const;
 };
 
 struct Document;
@@ -217,7 +353,7 @@ public:
 	MenuState stateOf(const MenuItem &item);
 	std::vector<MenuItem> mainMenu() const;
 	std::vector<MenuItem> dynamicMenu(MenuItem::Dynamic kind) const;
-	std::vector<MenuItem> tabMenu(int pane, int index) const;
+	std::vector<MenuItem> tabMenu(int pane, int index);
 	std::vector<MenuItem> folderMenu(const std::string &path, bool isDirectory, bool isRoot) const;
 	void runFolderCommand(Cmd cmd, const std::string &path);
 
@@ -231,8 +367,42 @@ public:
 	bool tick();                  // Call about once a second. Writes backups and refreshes panels.
 	bool prepareToQuit();         // False means don't quit.
 	void openFiles(const std::vector<std::string> &paths);
+	void afterStartup();          // Once the session is back and the window is ready.
 	std::string windowTitle() const;
 	std::string windowPath() const;
+	void prepareCommandLine(const CommandLine &line);  // What has to happen before the session comes back.
+	void applyCommandLine(const CommandLine &line);
+
+	// Side panels.
+	bool panelVisible(int panel) const;
+	void togglePanel(int panel);
+	std::vector<PanelRow> panelRows(int panel) const;
+	std::string dialogDirectory() const;
+	void updateMatchingTags(int pane);
+	std::vector<std::string> panelColumns(int panel) const;  // Headings, if it has more than one column.
+	void panelActivate(int panel, int row, int column = 0);
+	void panelColumnClicked(int panel, int column);
+	bool deleteShortcutCommand(const std::string &id);  // A macro or a saved run command.
+	std::vector<MenuItem> panelMenu(int panel, int row) const;
+
+	// Things the platforms ask for.
+	std::string incrementalSearch(const std::string &text, bool backward, bool next, bool matchCase, bool highlightAll);
+	void closeIncrementalSearch();
+	std::vector<ToolItem> toolbarItems() const;
+	std::vector<MenuItem> editorContextMenu() const;
+	std::vector<MenuItem> statusMenu(bool rightSide) const;  // The status bar's two ends.
+	std::vector<MenuItem> resultsMenu() const;
+	void editorRightClicked(int pane, long position);
+	void tabDoubleClicked(int pane, int index);
+	void refreshChromeState() { applyChromeState(); }
+	intptr_t sendToActiveEditor(unsigned message, uintptr_t w, intptr_t l);
+
+	struct ProjectNode {
+		enum class Kind { Root, Project, Folder, File } kind = Kind::Root;
+		std::string name, path;
+		bool expanded = false;
+		std::vector<ProjectNode> children;
+	};
 	bool windowDirty() const;
 
 	// Tabs.
@@ -242,6 +412,7 @@ public:
 	bool splitStacked() const { return stacked; }
 	std::vector<TabInfo> tabs(int pane) const;
 	int activeTab(int pane) const;
+	void tabHovered(int pane, int index);  // -1 when the pointer leaves.
 	void clickTab(int pane, int index);
 	bool closeTab(int pane, int index);
 	void moveTab(int pane, int from, int to);
@@ -290,10 +461,13 @@ public:
 	void findPanelMarkAll();
 	void findPanelClearMarks();
 	void findPanelFindInFiles();
+	void findPanelFindAllOpen();
+	void findPanelReplaceInFiles();
 
 	bool convertActiveToEncoding(const std::string &identifier);  // False if the text can't be represented.
 	bool reinterpretActiveAsEncoding(const std::string &identifier);
 	void setActiveLanguage(const std::string &name);
+	void setActiveLanguageForTests(const std::string &name) { setActiveLanguage(name); }
 	void checkExternalChanges();
 	bool writeSession();  // False if anything could not be written.
 	bool restoreSession();
@@ -337,7 +511,7 @@ public:
 
 	// Column Editor, as its form submits it.
 	bool columnInsertText(const std::string &text);
-	bool columnInsertNumbers(long initial, long increment, long repeat, bool leadingZeros, int base);
+	bool columnInsertNumbers(long initial, long increment, long repeat, int leading, int base);  // leading: 0 none, 1 zeros, 2 spaces.
 
 	// Themes.
 	std::string effectiveTheme() const;
@@ -421,6 +595,111 @@ private:
 	void goToChange(bool forward);
 	void goToNextResult(bool forward);
 	void selectInBraces();
+	bool runFeature(Cmd cmd, int arg, const std::string &argument);
+	void openExternally(const std::string &target);
+	void openTerminalAt(const std::string &directory);
+	void viewInBrowser(const std::string &browser);
+	void openNewInstance(const std::string &path);
+	std::string sessionFileText();
+	bool loadSessionFile(const std::string &path);
+	void beginEndSelect(bool column);
+	void insertDate(int kind);
+	void copyAllNames(bool fullPaths);
+	void blockUncomment();
+	void eolAndTrimToSpace();
+	void pasteClipboardFormat(const char *format, const char *name);
+	void copyBinary(bool cut);
+	void pasteBinary();
+	std::string selectionAsPath() const;
+	void redactSelection(bool dots);
+	void searchOnInternet();
+	void changeSearchEngine();
+	void setAllReadOnly(bool on);
+	void toggleFileReadOnly();
+	void goToDialog();
+	void pasteToBookmarked();
+	bool findCharacterInRange(long from, long to, bool backward, bool wrap);
+	void findCharactersDialog();
+	void setPrintableSymbols();
+	void hideSelectedLines();
+	bool showHiddenLinesAt(long line);
+	void setTextDirection(bool rightToLeft);
+	void toggleMonitoring();
+	void updateMonitoredDocuments();
+	void setTabColour(int pane, int index, int colour);
+	void setTabPinned(int pane, int index, bool pinned);
+	void sortTabs(int kind);
+	void noteTabUsed();
+	void activateDocument(const Document *document);
+	void switchDocument(bool backward);
+	void showWindowsDialog();
+	std::string macroFile() const;
+	void loadMacros();
+	void saveMacros() const;
+	void saveCurrentMacro();
+	void runMacroMultiple();
+	void manageMacros();
+	std::string expandRunVariables(const std::string &command) const;
+	void runCommandLine(const std::string &command);
+	std::string runCommandFile() const;
+	void loadRunCommands();
+	void saveRunCommands() const;
+	void runDialog();
+	void manageRunCommands();
+	void validateShortcuts();
+	void hashDialog(HashKind kind);
+	std::string debugInfo() const;
+	void checkForUpdates();
+	void applyChromeState();
+	void appendPrefFields(std::vector<FormField> &fields) const;
+	void applyPrefField(const FormField &field);
+	void syncPrefsToFields();
+	bool isLargeDocument() const;
+	void applyExtraViewPreferences(int pane);
+	void autoInsertAfter(int pane, int ch);
+	void autoCloseTag(int pane);
+	void delimiterSelect(int pane, long position);
+	void updateLinks(int pane);
+	bool openLinkAt(int pane, long position);
+	void backupBeforeSave(const std::string &path);
+	bool runPanelCommand(Cmd cmd, int arg, const std::string &argument);
+	void panelCommand(int panel, int row, const std::string &action);
+	void notePanelsChanged();
+	void pollClipboard();
+	ProjectNode *projectNodeAt(int panel, int row);
+	ProjectNode *projectParentOf(int panel, ProjectNode *target);
+	bool loadWorkspaceFile(int panel, const std::string &path);
+	bool saveWorkspaceFile(int panel, const std::string &path, bool adopt);
+	void findInProjects();
+	void togglePostIt();
+	void toggleDistractionFree();
+	std::string contextMenuPath() const;
+	void editContextMenu();
+	void styleConfigurator();
+	void applyGlobalOverride();
+	void applyLanguageCustomisation();
+	void importTheme();
+	std::string pluginFolder() const;
+	void loadPlugins();
+	void pluginsAdmin();
+	void importPlugin();
+	void runTextTool(const std::string &tool);
+	void conversionPanel();
+	std::string exportHtml() const;
+	std::string exportRtf() const;
+	void runExport(const std::string &action);
+	void loadMenuLanguage();
+	void translateMenu(std::vector<MenuItem> &items) const;
+	std::string catalogDirectory() const { return resourceDir; }
+	std::vector<MenuItem> pluginMenu() const;
+	void resultsAction(const std::string &action);
+	long replaceInFileList(const FindOptions &options, const std::vector<std::string> &files);
+	std::vector<std::string> filesMatching(const FindOptions &options) const;
+	void searchInResults(const FindOptions &options, bool onlyFoundLines);
+	bool findAllAppends = false;
+	void tabAction(int pane, int index, const std::string &action);
+	void appendScintillaShortcuts(std::vector<ShortcutEntry> &entries) const;
+	void applyScintillaShortcuts(int pane);
 	void applyChangeHistoryTo(SciView &target);
 	void syncDocumentMap(bool documentChanged);
 	void showDocumentMap(bool visible);
@@ -459,6 +738,21 @@ private:
 	void macroPlayOnce();
 	void runFromMenu(bool backward, bool useSelection);
 	std::string selectionOrWord() const;
+	std::string findPrefill() const;
+	void notifyPlugins(const char *event, const std::string &path);
+	bool saveWithAdminRights(const std::string &bytes, const std::string &path, std::string &error);
+	void ghostType(const std::string &text, int speed);
+	void ghostTypeNext(std::shared_ptr<std::u32string> text, size_t at, int speed);
+	bool aboutEasterEgg();
+	void openWildcard(const std::string &pattern, bool recursive);
+	void findInResultsDialog();
+	std::vector<std::pair<int, int>> documentListOrder() const;  // Pane and index for each row, or -1 for a heading.
+	std::vector<MenuItem> menuFromXml(const std::string &xml, const char *section, const char *fallback, int pane, int index) const;
+	void markWorkspaceDirty(int panel);
+	bool offerSavingWorkspaces();
+	void fileAssociationDialog();
+	void applyDocumentReadOnlyToOpen();
+	std::vector<ToolItem> configuredToolbar(std::vector<ToolItem> items) const;
 
 	LanguageCatalog catalog;
 	CompletionCatalog completion;
@@ -483,7 +777,7 @@ private:
 	mutable std::string cachedRegexKey;
 	mutable Regex::Options regexOptions;
 	mutable Regex::Match lastMatch;
-	std::string settingsDir, stateDir;
+	std::string settingsDir, stateDir, homeSettingsDir;
 	std::vector<std::shared_ptr<Document>> documents;
 	std::unique_ptr<Pane> panes[2];
 	int focus = 0;
@@ -505,6 +799,47 @@ private:
 	bool recording = false;
 	struct MacroStep { unsigned message; uintptr_t w; intptr_t l; std::string text; };
 	std::vector<MacroStep> macro;
+	struct SavedMacro { std::string name; std::vector<MacroStep> steps; };
+	std::vector<SavedMacro> savedMacros;
+	void playSteps(const std::vector<MacroStep> &steps);
+	std::vector<std::pair<std::string, std::string>> runCommands;  // Name and command.
+	std::string lastRunCommand;
+	long selectAnchor = -1;
+	bool selectAnchorColumn = false;
+	std::string binaryClipboard;
+	struct { std::string mode = "high"; long from = 128, to = 255; bool backward = false, wrap = true; } charRange;
+	std::vector<const Document *> mru;
+	long switcherPosition = 0, switcherTick = -10;
+	bool sessionDisabled = false, tabsHiddenByCommandLine = false;
+	bool offerCreatingMissing = false, allFilesReadOnly = false, allFilesMonitored = false, savingForbidden = false;
+	bool closingSeveral = false;
+	int closeAllDecision = 0;  // 1 saves the rest, 2 discards the rest.
+	std::vector<std::string> recentlyClosed;
+	std::string lastDialogDirectory, titleSuffix;
+	bool workspaceDirty[3] = {false, false, false};
+	int documentSortColumn = -1;
+	bool documentSortDescending = false;
+	bool distractionFree = false, postIt = false, fullScreenBeforeDistraction = false;
+	bool panelShown[kPanelCount] = {};
+	std::vector<std::string> clipboardHistory;
+	std::string lastClipboard;
+	struct ProjectPanel {
+		std::string file;
+		ProjectNode root;
+	};
+	ProjectPanel projectPanels[3];
+	struct LoadedPlugin {
+		std::string name, folderName, path, description, error;
+		bool enabled = true;
+		void *handle = nullptr;
+		const ::OmapadPluginInfo *info = nullptr;
+		void (*notify)(const char *, const char *) = nullptr;
+	};
+	std::vector<LoadedPlugin> plugins;
+	std::map<std::string, std::string> menuTranslations;
+	std::string resourceDir;
+	long lastAutoInserted = -1;
+	int completionKeys = 3;
 
 	// Find in Files runs on its own thread with a large stack, because the C++ regex
 	// library recurses per character and an ordinary stack can't hold a long line.

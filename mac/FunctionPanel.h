@@ -5,5 +5,6 @@
 
 @interface FunctionPanel : NSView
 - (instancetype)initWithWorkspace:(omapad::Workspace *)workspace;
+- (NSView *)focusTarget;
 - (void)reload;  // Shows the workspace's current list, keeping the filter and what's collapsed.
 @end

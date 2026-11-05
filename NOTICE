@@ -6,7 +6,7 @@ owner and is used here only to describe where data files came from.
 Notepad++ 8.9.8.1 (GPLv3), Copyright (C) Don HO, https://notepad-plus-plus.org/
   resources/langs.model.xml, resources/stylers.model.xml and resources/themes/*.xml are unmodified
   copies from the official release. resources/autoCompletion/*.xml and resources/functionList/*.xml
-  come from the source tag below. overrideMap.xml is left out, and functionList/rust.xml also
+  and resources/nativeLang/*.xml come from the source tag below. overrideMap.xml is left out, and functionList/rust.xml also
   recognizes `pub` functions. core/LangTable.inc is generated from the language table in
   PowerEditor/src/ScintillaComponent/ScintillaEditView.cpp at tag v8.9.8.1, commit dd40fe45.
   This use of GPL data is why omapad as a whole is GPLv3. Its license notice is kept in
@@ -24,6 +24,12 @@ Changes to the bundled third-party code:
   - resources/mac_cursor_*.tiff are made from Scintilla's cocoa/res PNGs using tiffutil.
   - third_party/scintilla/include/Sci_Position.h: explicitly includes stdint.h so intptr_t
     is available when compiling the GTK port with GCC.
+
+uchardet, Mozilla Public License 1.1 / GPL 2 or later / LGPL 2.1 or later
+  third_party/uchardet is Mozilla's Universal Charset Detector, as bundled with Notepad++ at the tag above. omapad adds one #include to nsCharSetProber.cpp so that it builds with GCC 15.
+
+Code page tables
+  core/CodePages.inc is generated from Python's codec tables for the OEM code pages.
 
 Markdown-plus-plus, Copyright (c) Edditoria, https://github.com/Edditoria/markdown-plus-plus
   resources/userDefineLangs/markdown._preinstalled*.udl.xml come unmodified from the Notepad++

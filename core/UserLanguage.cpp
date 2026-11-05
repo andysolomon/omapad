@@ -417,7 +417,7 @@ const char *const kCommentGroupKeys[5] = {"commentLineOpen", "commentLineContinu
 const char *const kCommentGroupLabels[5] = {"Line comment open", "Line comment continue", "Line comment close", "Comment open", "Comment close"};
 
 std::string styleValue(const UserStyle &style) {
-	return ((style.colorStyle & 1) ? style.fg : std::string()) + "," + ((style.colorStyle & 2) ? style.bg : std::string()) + "," + std::to_string(style.fontStyle);
+	return ((style.colorStyle & 1) ? style.fg : std::string()) + "," + ((style.colorStyle & 2) ? style.bg : std::string()) + "," + std::to_string(style.fontStyle) + "," + style.fontName + "," + (style.fontSize > 0 ? std::to_string(style.fontSize) : std::string());
 }
 
 void applyStyleValue(const std::string &value, UserStyle &style) {
@@ -431,6 +431,11 @@ void applyStyleValue(const std::string &value, UserStyle &style) {
 	if (!fg.empty()) style.fg = fg;
 	if (!bg.empty()) style.bg = bg;
 	style.fontStyle = std::atoi(value.c_str() + second + 1) & 7;
+	const size_t third = value.find(',', second + 1), fourth = third == std::string::npos ? third : value.find(',', third + 1);
+	if (fourth != std::string::npos) {
+		style.fontName = value.substr(third + 1, fourth - third - 1);
+		style.fontSize = std::atoi(value.c_str() + fourth + 1);
+	}
 }
 
 }  // namespace
