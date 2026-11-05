@@ -56,6 +56,18 @@ omapad notes.txt ~/my-project
 Linux launches use a single application instance: subsequent launches open files in the existing
 window. On macOS, use `open -a omapad notes.txt` or `open -a omapad ~/my-project`.
 
+## Notes mode
+
+Choose **Notes → Notes Mode** (Command-Option-N / Ctrl-Alt-N) for quick Markdown
+capture with autosave, a searchable library, hierarchical tags, formatting controls,
+word counts, and Write/Split/Read views. Notes are ordinary files in
+`~/Documents/omapad Notes`, or a folder you choose. Import copies existing notes;
+returning to Editor preserves your code tabs and preferences.
+
+Inspired by [Mac Markdown](https://github.com/andysolomon/mac-markdown-workspace),
+implemented natively for AppKit and GTK. See [Notes mode](docs/notes-mode.md) for
+saving/recovery behavior, supported Markdown, limits and reference evidence.
+
 ## Split view and Folder as Workspace
 
 - **View → Split View → Move to Other View** moves a tab into the second pane.

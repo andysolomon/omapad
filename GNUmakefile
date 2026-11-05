@@ -21,7 +21,7 @@ LDLIBS += $(shell pkg-config --libs $(PKGS)) -pthread
 ENGINE_SRC := $(wildcard $(SCI)/src/*.cxx) $(wildcard $(SCI)/gtk/*.cxx) \
               $(wildcard $(LEX)/lexers/*.cxx) $(wildcard $(LEX)/lexlib/*.cxx) $(wildcard $(LEX)/src/*.cxx)
 ENGINE_OBJ := $(ENGINE_SRC:%=$(BUILD)/%.o) $(BUILD)/$(SCI)/gtk/scintilla-marshal.c.o
-CORE_SRC := core/TextCore.cpp core/Languages.cpp core/Regex.cpp core/Completion.cpp core/FunctionList.cpp core/UserLanguage.cpp core/Print.cpp core/Features.cpp core/Preferences.cpp core/Panels.cpp $(wildcard third_party/uchardet/*.cpp) core/Workspace.cpp third_party/pugixml/pugixml.cpp
+CORE_SRC := core/Notes.cpp core/NoteWorkspace.cpp core/TextCore.cpp core/Languages.cpp core/Regex.cpp core/Completion.cpp core/FunctionList.cpp core/UserLanguage.cpp core/Print.cpp core/Features.cpp core/Preferences.cpp core/Panels.cpp $(wildcard third_party/uchardet/*.cpp) core/Workspace.cpp third_party/pugixml/pugixml.cpp
 PCRE2_SRC := $(wildcard third_party/pcre2/*.c)
 CORE_OBJ := $(CORE_SRC:%=$(BUILD)/%.o) $(PCRE2_SRC:%=$(BUILD)/%.o)
 OWN_FLAGS := -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations -Wno-unknown-pragmas -Wno-missing-field-initializers

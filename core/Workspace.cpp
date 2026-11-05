@@ -492,6 +492,7 @@ void Workspace::applyViewPreferences(int pane) {
 	updateLineNumberMargin(pane);
 	applyExtraViewPreferences(pane);
 	applyScintillaShortcuts(pane);
+	applyNotesPreferences(pane);
 }
 
 void Workspace::applyChangeHistoryTo(SciView &target) {
@@ -634,6 +635,7 @@ void Workspace::applyLanguageTo(int pane) {
 		view(pane).send(SCI_SETPROPERTY, reinterpret_cast<uintptr_t>("sql.backslash.escapes"), reinterpret_cast<intptr_t>(settings.prefOn("sqlBackslash") ? "1" : "0"));
 	p.lineDigits = 0;
 	updateLineNumberMargin(pane);
+	applyNotesPreferences(pane);
 }
 
 void Workspace::applyThemeEverywhere() {
@@ -652,7 +654,7 @@ void Workspace::applyThemeEverywhere() {
 
 void Workspace::updateLineNumberMargin(int pane) {
 	SciView &v = view(pane);
-	if (!settings.lineNumbers) {
+	if (!settings.lineNumbers || (notesEnabled && paneAt(pane).active >= 0 && isNotePath(paneAt(pane).tabs[paneAt(pane).active].document->path))) {
 		v.send(SCI_SETMARGINWIDTHN, kMarginNumber, 0);
 		paneAt(pane).lineDigits = 0;
 		return;
@@ -766,6 +768,7 @@ void Workspace::createUntitledDocument() {
 void Workspace::refreshChrome() {
 	host.tabsChanged();
 	updateStatus();
+	if (notesEnabled) notifyNotes();
 }
 
 void Workspace::updateStatus() {
@@ -1218,6 +1221,12 @@ bool Workspace::writeFileAtomically(const std::string &bytes, const std::string 
 }
 
 bool Workspace::saveDocument(Document &document, const std::string &path) {
+	if (notesEnabled && path == document.path && isNoteLocation(path)) {
+		const bool saved = saveNote(document);
+		if (saved) notesError.clear();
+		refreshNotes(); refreshChrome();
+		return saved;
+	}
 	backupBeforeSave(path);
 	const std::string content = textOf(document);
 	std::string bytes;
@@ -1261,6 +1270,7 @@ bool Workspace::saveDocument(Document &document, const std::string &path) {
 	}
 	removeBackup(document);
 	addRecent(path);
+	rememberNoteBaseline(document);
 	refreshChrome();
 	notifyPlugins("fileSaved", path);
 	return true;
@@ -1345,6 +1355,8 @@ bool Workspace::reloadActive() {
 	document->encoding = decoded.encoding;
 	document->hasMtime = fileMTime(document->path, document->mtime);
 	loadInto(*document, decoded.utf8);
+	rememberNoteBaseline(*document);
+	if (isNotePath(document->path)) notesError.clear();
 	s(SCI_SETEOLMODE, static_cast<int>(document->eol));
 	s(SCI_GOTOPOS, std::min<long>(caret, s(SCI_GETLENGTH)));
 	s(SCI_SETFIRSTVISIBLELINE, firstLine);
@@ -1440,6 +1452,7 @@ bool Workspace::writeSession() {
 	}
 	json session;
 	session["version"] = 2;
+	session["noteBaselines"] = noteBaselines;
 	{
 		json shown = json::array();
 		for (int panel = 0; panel < kPanelCount; panel++)
@@ -1482,6 +1495,10 @@ bool Workspace::restoreSession() {
 	buffer << in.rdbuf();
 	const json session = json::parse(buffer.str(), nullptr, false);
 	if (session.is_discarded() || !session.is_object()) return false;
+	const auto baselines = session.find("noteBaselines");
+	if (baselines != session.end() && baselines->is_object())
+		for (auto it = baselines->begin(); it != baselines->end(); ++it)
+			if (it.value().is_string()) noteBaselines[it.key()] = it.value().get<std::string>();
 	if (sessionDisabled) {
 		// Without the session, panels can still come back as they were, if that's wanted.
 		if (!settings.prefOn("rememberPanels")) return false;
@@ -1693,10 +1710,12 @@ void Workspace::afterStartup() {
 	if (settings.prefOn("openNewAtStart") && documents.size() > 1) createUntitledDocument();
 	applyChromeState();
 	setPrintableSymbols();
+	restoreNotesMode();
 }
 
 bool Workspace::tick() {
 	tickCount++;
+	notesTick();
 	updateMonitoredDocuments();
 	pollClipboard();
 	notePanelsChanged();
@@ -1722,6 +1741,11 @@ bool Workspace::tick() {
 }
 
 bool Workspace::prepareToQuit() {
+	if (notesEnabled && !flushNotes()) {
+		const bool backedUp = writeSession();
+		host.ask("A note could not be saved.", notesError + (backedUp ? "\nYour edits have been backed up. Save a Copy or resolve the conflict before quitting." : "\nYour edits could not be backed up. Save a Copy before quitting."), {"Keep Editing"});
+		return false;
+	}
 	if (!offerSavingWorkspaces()) return false;
 	if (writeSession()) return true;
 	return host.ask("Your unsaved work couldn't be backed up.", "Quitting now could lose changes that haven't been saved.",
@@ -1731,6 +1755,7 @@ bool Workspace::prepareToQuit() {
 void Workspace::applicationActivated() {
 	reloadOmarchyTheme();
 	checkExternalChanges();
+	if (notesEnabled) refreshNotes();
 	host.foldersChanged();
 }
 
@@ -1896,6 +1921,10 @@ void Workspace::syncDocumentMap(bool documentChanged) {
 void Workspace::afterCharacter(int pane, int ch) {
 	if (ch > 0 && ch < 0x20 && ch != '\t' && ch != '\r' && ch != '\n' && settings.prefOn("preventC0")) {
 		s(SCI_DELETEBACK);
+		return;
+	}
+	if (notesEnabled && activeDocument() && isNotePath(activePath())) {
+		if (settings.autoIndent) autoIndent(pane, ch);
 		return;
 	}
 	autoInsertAfter(pane, ch);
@@ -4062,6 +4091,25 @@ void walkMenu(std::vector<MenuItem> &items, const std::string &prefix, const std
 
 std::vector<MenuItem> Workspace::mainMenu() const {
 	std::vector<MenuItem> menu = baseMenu();
+	const auto noteItem = [](const std::string &title, Cmd cmd, int arg = 0, const std::string &text = "", const std::string &shortcut = "") {
+		MenuItem item; item.title = title; item.cmd = cmd; item.arg = arg; item.text = text; item.shortcut = shortcut; return item;
+	};
+	MenuItem notes; notes.title = "Notes";
+	notes.children = {
+		noteItem("Notes Mode", Cmd::NotesMode, 0, "", "Mod+Alt+N"),
+		noteItem("New Note", Cmd::NotesNew), noteItem("Import Notes…", Cmd::NotesImport),
+		noteItem("Choose Notes Folder…", Cmd::NotesFolder), noteItem("Reveal Notes Folder", Cmd::NotesReveal),
+		noteItem("Refresh Library", Cmd::NotesRefresh),
+		noteItem("Write", Cmd::NotesView, 0), noteItem("Split", Cmd::NotesView, 1), noteItem("Read", Cmd::NotesView, 2),
+		noteItem("Focus Writing", Cmd::NotesFocus),
+		noteItem("Heading", Cmd::NotesFormat, 0, "heading"), noteItem("Bold", Cmd::NotesFormat, 0, "bold"),
+		noteItem("Italic", Cmd::NotesFormat, 0, "italic"), noteItem("Bullet List", Cmd::NotesFormat, 0, "bullet"),
+		noteItem("Task", Cmd::NotesFormat, 0, "task"), noteItem("Quote", Cmd::NotesFormat, 0, "quote"),
+		noteItem("Inline Code", Cmd::NotesFormat, 0, "code"), noteItem("Link", Cmd::NotesFormat, 0, "link"),
+		noteItem("Export HTML…", Cmd::NotesExportHtml), noteItem("Retry Save", Cmd::NotesRetry),
+		noteItem("Move Note to Trash…", Cmd::NotesTrash)
+	};
+	menu.insert(menu.end() - 1, std::move(notes));
 	const bool lineCopy = settings.prefOn("copyLineNoSelection");
 	walkMenu(menu, "", [&](MenuItem &item, const std::string &id) {
 		if (lineCopy && (item.cmd == Cmd::Copy || item.cmd == Cmd::Cut)) item.macAction.clear();
@@ -4462,6 +4510,10 @@ int encodeTab(int pane, int index) { return pane * kPaneArgFactor + index; }
 }  // namespace
 
 void Workspace::run(Cmd cmd, int arg, const std::string &argument) {
+	if (runNotesCommand(cmd, arg, argument)) return;
+	if (notesEnabled && cmd == Cmd::New) { newNote(); return; }
+	if (notesEnabled && cmd == Cmd::Open) { runNotesCommand(Cmd::NotesImport, 0, ""); return; }
+	if (notesEnabled && cmd == Cmd::Save && isNoteLocation(activePath())) { flushNotes(); return; }
 	Document *document = activeDocument();
 	if (!document) return;
 	const int tabPane = arg / kPaneArgFactor;
@@ -5039,6 +5091,16 @@ void Workspace::run(Cmd cmd, int arg, const std::string &argument) {
 
 MenuState Workspace::stateOf(const MenuItem &item) {
 	MenuState state;
+	if (item.cmd >= Cmd::NotesMode && item.cmd <= Cmd::NotesExportHtml) {
+		const bool note = activeDocument() && isNotePath(activePath());
+		state.enabled = notesEnabled;
+		if (item.cmd == Cmd::NotesMode) { state.enabled = true; state.checked = notesEnabled; }
+		if (item.cmd == Cmd::NotesNew || item.cmd == Cmd::NotesFolder || item.cmd == Cmd::NotesImport) state.enabled = true;
+		if (item.cmd == Cmd::NotesView) state.checked = notesEnabled && notesViewMode == item.arg;
+		if (item.cmd == Cmd::NotesFocus) state.checked = notesEnabled && notesFocus;
+		if (item.cmd == Cmd::NotesFormat || item.cmd == Cmd::NotesTrash || item.cmd == Cmd::NotesExportHtml) state.enabled = notesEnabled && note;
+		return state;
+	}
 	const Document *document = activeDocument();
 	if (!document) return state;
 	const bool saved = !document->path.empty();

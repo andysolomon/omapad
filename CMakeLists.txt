@@ -45,7 +45,7 @@ target_compile_options(uchardet PRIVATE -w)
 
 # --- The shared core.
 add_library(omapad_core STATIC
-  core/TextCore.cpp core/Languages.cpp core/Workspace.cpp core/Regex.cpp core/Completion.cpp core/FunctionList.cpp core/UserLanguage.cpp core/Print.cpp core/Features.cpp core/Preferences.cpp core/Panels.cpp
+  core/Notes.cpp core/NoteWorkspace.cpp core/TextCore.cpp core/Languages.cpp core/Workspace.cpp core/Regex.cpp core/Completion.cpp core/FunctionList.cpp core/UserLanguage.cpp core/Print.cpp core/Features.cpp core/Preferences.cpp core/Panels.cpp
   third_party/pugixml/pugixml.cpp)
 target_link_libraries(omapad_core PUBLIC engine pcre2 iconv uchardet)
 target_include_directories(omapad_core PUBLIC core third_party/json third_party/pugixml third_party/pcre2)
@@ -65,7 +65,7 @@ set(SCI_RES_FILES
   resources/mac_cursor_busy.tiff resources/mac_cursor_flipped.tiff)
 
 add_executable(omapad MACOSX_BUNDLE
-  mac/main.mm mac/AppController.mm mac/TabBar.mm mac/FindPanel.mm mac/FolderPanel.mm mac/FunctionPanel.mm mac/Dialogs.mm
+  mac/main.mm mac/AppController.mm mac/NotesPanel.mm mac/TabBar.mm mac/FindPanel.mm mac/FolderPanel.mm mac/FunctionPanel.mm mac/Dialogs.mm
   ${DATA_FILES} ${THEME_FILES} ${COMPLETION_FILES} ${FUNCTION_FILES} ${USER_LANGUAGE_FILES} ${NATIVE_LANG_FILES} ${SCI_RES_FILES} ${LICENSE_FILES})
 target_link_libraries(omapad PRIVATE omapad_core "-framework Cocoa" "-framework QuartzCore" "-framework UniformTypeIdentifiers")
 target_include_directories(omapad PRIVATE mac)

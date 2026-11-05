@@ -131,6 +131,7 @@ bool isCheckable(Cmd cmd) {
 		Cmd::ToggleFunctionList, Cmd::ToggleDocumentMap, Cmd::ToggleReadOnly,
 		Cmd::TogglePanel, Cmd::PostIt, Cmd::DistractionFree, Cmd::ToggleNonPrinting, Cmd::ToggleControlChars, Cmd::ToggleZoomSync,
 		Cmd::ToggleMonitoring, Cmd::TextDirection, Cmd::TabColour, Cmd::PinActive, Cmd::FileReadOnly,
+		Cmd::NotesMode, Cmd::NotesFocus, Cmd::NotesView,
 	};
 	return checkable.count(cmd) != 0;
 }
@@ -168,6 +169,7 @@ public:
 	void panelChanged(int panel) override;
 	void setIncrementalBar(bool visible) override;
 	void setChrome(const ChromeState &chrome) override;
+	void notesChanged(const NotesState &state) override;
 	void setTabStyle(const TabStyle &style) override;
 	void closeFind() override { if (findWindow) gtk_widget_hide(findWindow); }
 	void setFindInSelection(bool on) override { if (inSelection) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(inSelection), on); }
@@ -195,7 +197,8 @@ public:
 	void setFolderPanelVisible(bool visible) override;
 	void foldersChanged() override;
 	void focusPane(int pane) override {
-		if (panes[pane].sci.widget) gtk_widget_grab_focus(panes[pane].sci.widget);
+		if (notesPreview && notesUiState.enabled && notesUiState.viewMode == 2) gtk_widget_grab_focus(notesPreview);
+		else if (panes[pane].sci.widget) gtk_widget_grab_focus(panes[pane].sci.widget);
 	}
 	void themeChanged() override;
 	void menusChanged() override;
@@ -254,6 +257,9 @@ private:
 	void buildFunctionPanel();
 	void buildDocumentMap();
 	void buildToolbar();
+	void buildNotes();
+	void applyNotesLayout();
+	void renderNotesPreview(const NotesState &state);
 	void buildIncrementalBar();
 	void runIncremental(bool backward, bool next);
 	void syncFlowTabs(int pane);
@@ -281,6 +287,17 @@ private:
 	GtkWidget *incrementalBar = nullptr, *incrementalEntry = nullptr, *incrementalCase = nullptr, *incrementalAll = nullptr, *incrementalStatus = nullptr;
 	GtkWidget *markButtons = nullptr, *markOptions = nullptr, *bookmarkLine = nullptr, *purgeMarks = nullptr;
 	GtkWidget *flowTabs[2] = {nullptr, nullptr};
+	NotesState notesUiState;
+	bool syncingNotes = false, notesSavedResults = false, notesSavedIncremental = false;
+	std::vector<int> notesSavedPositions;
+	std::string notesTagSignature, notesListSignature, notesPreviewSignature, notesPreviewPath;
+	GtkWidget *notesBar = nullptr, *notesSidebar = nullptr, *notesRootPaned = nullptr, *notesContentPaned = nullptr;
+	GtkWidget *notesSearch = nullptr, *notesTagView = nullptr, *notesList = nullptr, *notesListScroll = nullptr;
+	GtkListStore *notesTagStore = nullptr, *notesStore = nullptr;
+	GtkWidget *notesTitle = nullptr, *notesFolderLabel = nullptr, *notesEmpty = nullptr, *notesSaveBox = nullptr;
+	GtkWidget *notesSaveStatus = nullptr, *notesRetry = nullptr, *notesFocusButton = nullptr, *notesFormatButton = nullptr;
+	GtkWidget *notesBarStatus = nullptr, *notesBarRetry = nullptr;
+	GtkWidget *notesPreview = nullptr, *notesPreviewScroll = nullptr, *notesViewButtons[3] = {nullptr, nullptr, nullptr};
 	ChromeState chromeState;
 	TabStyle tabStyle;
 	std::string heldClipboard[2];
@@ -554,6 +571,7 @@ void App::tabsChanged() {
 	const std::string title = workspace->windowTitle();
 	const std::string shown = (workspace->windowDirty() ? "● " : "") + title + (title.empty() ? "omapad" : " - omapad");
 	gtk_window_set_title(GTK_WINDOW(window), shown.c_str());
+	applyNotesLayout();
 }
 
 void App::splitChanged(bool visible, bool stacked) {
@@ -565,9 +583,11 @@ void App::splitChanged(bool visible, bool stacked) {
 	const int size = stacked ? allocation.height : allocation.width;
 	if (visible && size > 1) gtk_paned_set_position(GTK_PANED(editorPaned), size / 2);
 	splitPositioned = visible && size > 1;
+	applyNotesLayout();
 }
 
 void App::setResultsVisible(bool visible) {
+	if (notesUiState.enabled) visible = false;
 	gtk_widget_set_visible(results.widget, visible);
 	if (visible) {
 		GtkAllocation allocation;
@@ -602,7 +622,7 @@ GtkWidget *App::createMenuWidget(const MenuItem &item, GtkAccelGroup *accel, boo
 	} else if (isCheckable(item.cmd)) {
 		widget = gtk_check_menu_item_new_with_label(item.title.c_str());
 		if (item.cmd == Cmd::SetLanguage || item.cmd == Cmd::SetTheme || item.cmd == Cmd::EolConvert || item.cmd == Cmd::SetTabWidth ||
-		    item.cmd == Cmd::ReopenEncoding || item.cmd == Cmd::ConvertEncoding || item.cmd == Cmd::SelectDocument)
+		    item.cmd == Cmd::ReopenEncoding || item.cmd == Cmd::ConvertEncoding || item.cmd == Cmd::SelectDocument || item.cmd == Cmd::NotesView)
 			gtk_check_menu_item_set_draw_as_radio(GTK_CHECK_MENU_ITEM(widget), TRUE);
 	} else {
 		widget = gtk_menu_item_new_with_label(item.title.c_str());
@@ -908,6 +928,7 @@ void App::foldersChanged() {
 }
 
 void App::setFolderPanelVisible(bool visible) {
+	if (notesUiState.enabled) visible = false;
 	gtk_widget_set_visible(folderBox, visible);
 	if (visible) {
 		gtk_widget_show_all(folderBox);
@@ -1100,6 +1121,7 @@ void App::setDocumentMapVisible(bool visible) {
 // Gives the side panels their room, now and whenever one is shown or hidden.
 void App::arrangeSidePanels() {
 	if (!sidePaned) return;
+	if (notesUiState.enabled) { gtk_widget_hide(sideBox); return; }
 	bool anyPanel = false;
 	for (const PanelWidgets &panel : panelWidgets) anyPanel = anyPanel || (panel.box && gtk_widget_get_visible(panel.box));
 	if (panelsBox) gtk_widget_set_visible(panelsBox, anyPanel);
@@ -1731,6 +1753,7 @@ void App::buildIncrementalBar() {
 }
 
 void App::setIncrementalBar(bool visible) {
+	if (notesUiState.enabled) visible = false;
 	if (visible) {
 		gtk_widget_show_all(incrementalBar);
 		gtk_widget_grab_focus(incrementalEntry);
@@ -1764,6 +1787,7 @@ void App::setChrome(const ChromeState &chrome) {
 	}
 	if (chrome.appearance != "system")
 		g_object_set(gtk_settings_get_default(), "gtk-application-prefer-dark-theme", chrome.appearance == "dark" ? TRUE : FALSE, nullptr);
+	applyNotesLayout();
 }
 
 void App::setTabStyle(const TabStyle &style) {
@@ -1804,7 +1828,7 @@ void App::setTabStyle(const TabStyle &style) {
 // GTK's notebook can't wrap its tabs, so multi-line tabs are a row of buttons above it.
 void App::syncFlowTabs(int pane) {
 	PaneWidgets &p = panes[pane];
-	const bool wanted = tabStyle.multiLine && chromeState.tabs;
+	const bool wanted = tabStyle.multiLine && chromeState.tabs && !notesUiState.enabled;
 	if (!wanted) {
 		if (flowTabs[pane]) gtk_widget_hide(flowTabs[pane]);
 		return;
@@ -2639,6 +2663,12 @@ void App::themeChanged() {
 			".omapad-folder-title { font-size: 80%; font-weight: bold; }\n"
 			".omapad-status { padding: 0; }\n";
 	}
+	css +=
+		".omapad-notes-library { padding: 2px; }\n"
+		".omapad-notes-library treeview.view { border: none; }\n"
+		".omapad-notes-bar { border-bottom: 1px solid alpha(currentColor, 0.15); }\n"
+		".omapad-notes-bar button { padding: 4px 9px; }\n"
+		".omapad-notes-preview { font-size: 110%; }\n";
 	gtk_css_provider_load_from_data(themeCss, css.c_str(), -1, nullptr);
 }
 
@@ -2678,6 +2708,384 @@ void App::scheduleActivationCheck() {
 		if (app->dialogDepth == 0 && gtk_window_is_active(GTK_WINDOW(app->window))) app->workspace->applicationActivated();
 		return G_SOURCE_REMOVE;
 	}, this);
+}
+
+#pragma mark - Notes mode
+
+void App::buildNotes() {
+	// These are native widgets around the existing editor, not a second document model.
+	notesBar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+	gtk_style_context_add_class(gtk_widget_get_style_context(notesBar), "omapad-notes-bar");
+	gtk_container_set_border_width(GTK_CONTAINER(notesBar), 8);
+	const auto button = [this](GtkWidget *box, const char *label, const char *hint, Cmd cmd, int arg = 0, const std::string &text = std::string()) {
+		GtkWidget *b = gtk_button_new_with_label(label);
+		gtk_widget_set_tooltip_text(b, hint);
+		gtk_widget_set_can_focus(b, FALSE);
+		onSignal(b, "clicked", [this, cmd, arg, text]() { post([this, cmd, arg, text]() { workspace->run(cmd, arg, text); }); });
+		gtk_box_pack_start(GTK_BOX(box), b, FALSE, FALSE, 0);
+		return b;
+	};
+	button(notesBar, "Editor", "Return to the regular editor", Cmd::NotesMode);
+	notesFocusButton = button(notesBar, "Focus", "Hide or show the notes library", Cmd::NotesFocus);
+	GtkWidget *formatButton = gtk_menu_button_new();
+	gtk_button_set_label(GTK_BUTTON(formatButton), "Format");
+	gtk_widget_set_tooltip_text(formatButton, "Markdown formatting helpers");
+	std::vector<MenuItem> formatItems;
+	for (const auto &entry : std::vector<std::pair<std::string, std::string>>{{"Heading", "heading"}, {"Bold", "bold"}, {"Italic", "italic"}, {"Bullet List", "bullet"}, {"Checklist", "task"}, {"Quote", "quote"}, {"Code", "code"}, {"Link", "link"}}) {
+		MenuItem item;
+		item.title = entry.first;
+		item.cmd = Cmd::NotesFormat;
+		item.text = entry.second;
+		formatItems.push_back(item);
+	}
+	GtkWidget *formatMenu = nativeMenu(formatItems, nullptr);
+	gtk_widget_show_all(formatMenu);
+	gtk_menu_button_set_popup(GTK_MENU_BUTTON(formatButton), formatMenu);
+	gtk_box_pack_start(GTK_BOX(notesBar), formatButton, FALSE, FALSE, 0);
+	notesFormatButton = formatButton;
+	notesTitle = gtk_label_new("Notes");
+	gtk_label_set_ellipsize(GTK_LABEL(notesTitle), PANGO_ELLIPSIZE_END);
+	gtk_label_set_xalign(GTK_LABEL(notesTitle), 0);
+	gtk_widget_set_margin_start(notesTitle, 8);
+	gtk_box_pack_start(GTK_BOX(notesBar), notesTitle, TRUE, TRUE, 0);
+	notesBarStatus = gtk_label_new("");
+	gtk_label_set_ellipsize(GTK_LABEL(notesBarStatus), PANGO_ELLIPSIZE_END);
+	gtk_label_set_max_width_chars(GTK_LABEL(notesBarStatus), 24);
+	gtk_style_context_add_class(gtk_widget_get_style_context(notesBarStatus), "dim-label");
+	gtk_box_pack_start(GTK_BOX(notesBar), notesBarStatus, FALSE, FALSE, 4);
+	notesBarRetry = button(notesBar, "Retry", "Retry saving unsaved notes", Cmd::NotesRetry);
+	GtkWidget *viewButtons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+	gtk_style_context_add_class(gtk_widget_get_style_context(viewButtons), "linked");
+	for (int i = 0; i < 3; i++) {
+		const char *label = i == 0 ? "Write" : i == 1 ? "Split" : "Read";
+		notesViewButtons[i] = gtk_toggle_button_new_with_label(label);
+		gtk_widget_set_can_focus(notesViewButtons[i], FALSE);
+		onSignal(notesViewButtons[i], "clicked", [this, i]() {
+			if (!syncingNotes) post([this, i]() { workspace->run(Cmd::NotesView, i); });
+		});
+		gtk_box_pack_start(GTK_BOX(viewButtons), notesViewButtons[i], FALSE, FALSE, 0);
+	}
+	gtk_box_pack_end(GTK_BOX(notesBar), viewButtons, FALSE, FALSE, 0);
+
+	notesSidebar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+	gtk_style_context_add_class(gtk_widget_get_style_context(notesSidebar), "omapad-notes-library");
+	gtk_widget_set_size_request(notesSidebar, 280, -1);
+	gtk_container_set_border_width(GTK_CONTAINER(notesSidebar), 12);
+	GtkWidget *libraryHeader = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+	GtkWidget *libraryTitle = gtk_label_new("NOTES");
+	gtk_style_context_add_class(gtk_widget_get_style_context(libraryTitle), "omapad-folder-title");
+	gtk_label_set_xalign(GTK_LABEL(libraryTitle), 0);
+	gtk_box_pack_start(GTK_BOX(libraryHeader), libraryTitle, TRUE, TRUE, 0);
+	button(libraryHeader, "+ New", "Create a note and start writing", Cmd::NotesNew);
+	GtkWidget *more = gtk_menu_button_new();
+	gtk_button_set_label(GTK_BUTTON(more), "⋯");
+	gtk_widget_set_tooltip_text(more, "Library actions");
+	std::vector<MenuItem> libraryItems;
+	for (const auto &entry : std::vector<std::pair<std::string, Cmd>>{{"Choose Notes Folder…", Cmd::NotesFolder}, {"Reveal Notes Folder", Cmd::NotesReveal}, {"Import Markdown…", Cmd::NotesImport}, {"Refresh Library", Cmd::NotesRefresh}, {"Export Note as HTML…", Cmd::NotesExportHtml}, {"Move Note to Trash…", Cmd::NotesTrash}}) {
+		MenuItem item;
+		item.title = entry.first;
+		item.cmd = entry.second;
+		libraryItems.push_back(item);
+	}
+	GtkWidget *libraryMenu = nativeMenu(libraryItems, nullptr);
+	gtk_widget_show_all(libraryMenu);
+	gtk_menu_button_set_popup(GTK_MENU_BUTTON(more), libraryMenu);
+	gtk_box_pack_end(GTK_BOX(libraryHeader), more, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(notesSidebar), libraryHeader, FALSE, FALSE, 0);
+	notesFolderLabel = gtk_label_new("");
+	gtk_label_set_xalign(GTK_LABEL(notesFolderLabel), 0);
+	gtk_label_set_ellipsize(GTK_LABEL(notesFolderLabel), PANGO_ELLIPSIZE_MIDDLE);
+	gtk_style_context_add_class(gtk_widget_get_style_context(notesFolderLabel), "dim-label");
+	gtk_box_pack_start(GTK_BOX(notesSidebar), notesFolderLabel, FALSE, FALSE, 0);
+	notesSearch = gtk_search_entry_new();
+	gtk_entry_set_placeholder_text(GTK_ENTRY(notesSearch), "Search all notes");
+	gtk_widget_set_tooltip_text(notesSearch, "Search titles and text. Every word must match.");
+	onSignal(notesSearch, "search-changed", [this]() {
+		if (!syncingNotes) workspace->setNotesQuery(gtk_entry_get_text(GTK_ENTRY(notesSearch)));
+	});
+	gtk_box_pack_start(GTK_BOX(notesSidebar), notesSearch, FALSE, FALSE, 0);
+
+	notesTagStore = gtk_list_store_new(2, G_TYPE_STRING, G_TYPE_STRING);
+	notesTagView = gtk_tree_view_new_with_model(GTK_TREE_MODEL(notesTagStore));
+	gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(notesTagView), FALSE);
+	gtk_tree_view_append_column(GTK_TREE_VIEW(notesTagView), gtk_tree_view_column_new_with_attributes("Tags", gtk_cell_renderer_text_new(), "text", 0, nullptr));
+	g_signal_connect(gtk_tree_view_get_selection(GTK_TREE_VIEW(notesTagView)), "changed", G_CALLBACK(+[](GtkTreeSelection *selection, gpointer self) {
+		App *a = static_cast<App *>(self);
+		if (a->syncingNotes) return;
+		GtkTreeIter iter;
+		GtkTreeModel *model = nullptr;
+		if (!gtk_tree_selection_get_selected(selection, &model, &iter)) return;
+		gchar *raw = nullptr;
+		gtk_tree_model_get(model, &iter, 1, &raw, -1);
+		const std::string tag = raw ? raw : "";
+		g_free(raw);
+		a->post([a, tag]() { a->workspace->setNotesTag(tag); });
+	}), this);
+	GtkWidget *tagScroll = gtk_scrolled_window_new(nullptr, nullptr);
+	gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(tagScroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+	gtk_widget_set_size_request(tagScroll, -1, 110);
+	gtk_container_add(GTK_CONTAINER(tagScroll), notesTagView);
+	gtk_box_pack_start(GTK_BOX(notesSidebar), tagScroll, FALSE, FALSE, 0);
+
+	notesStore = gtk_list_store_new(2, G_TYPE_STRING, G_TYPE_STRING);
+	notesList = gtk_tree_view_new_with_model(GTK_TREE_MODEL(notesStore));
+	gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(notesList), FALSE);
+	gtk_tree_view_set_enable_search(GTK_TREE_VIEW(notesList), FALSE);
+	GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
+	g_object_set(renderer, "ellipsize", PANGO_ELLIPSIZE_END, "ypad", 10, "xpad", 8, nullptr);
+	GtkTreeViewColumn *column = gtk_tree_view_column_new_with_attributes("Notes", renderer, "markup", 0, nullptr);
+	gtk_tree_view_column_set_expand(column, TRUE);
+	gtk_tree_view_column_set_sizing(column, GTK_TREE_VIEW_COLUMN_FIXED);
+	gtk_tree_view_append_column(GTK_TREE_VIEW(notesList), column);
+	g_signal_connect(gtk_tree_view_get_selection(GTK_TREE_VIEW(notesList)), "changed", G_CALLBACK(+[](GtkTreeSelection *selection, gpointer self) {
+		App *a = static_cast<App *>(self);
+		if (a->syncingNotes) return;
+		GtkTreeIter iter;
+		GtkTreeModel *model = nullptr;
+		if (!gtk_tree_selection_get_selected(selection, &model, &iter)) return;
+		gchar *raw = nullptr;
+		gtk_tree_model_get(model, &iter, 1, &raw, -1);
+		const std::string path = raw ? raw : "";
+		g_free(raw);
+		if (!path.empty() && path != a->notesUiState.selectedPath)
+			a->post([a, path]() { a->workspace->openNote(path); });
+	}), this);
+	notesListScroll = gtk_scrolled_window_new(nullptr, nullptr);
+	gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(notesListScroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+	gtk_container_add(GTK_CONTAINER(notesListScroll), notesList);
+	gtk_box_pack_start(GTK_BOX(notesSidebar), notesListScroll, TRUE, TRUE, 0);
+	notesEmpty = gtk_label_new("Your notes live here.\nChoose + New and start writing.");
+	gtk_label_set_line_wrap(GTK_LABEL(notesEmpty), TRUE);
+	gtk_label_set_justify(GTK_LABEL(notesEmpty), GTK_JUSTIFY_CENTER);
+	gtk_style_context_add_class(gtk_widget_get_style_context(notesEmpty), "dim-label");
+	gtk_box_pack_start(GTK_BOX(notesSidebar), notesEmpty, FALSE, FALSE, 8);
+
+	notesSaveBox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+	notesSaveStatus = gtk_label_new("");
+	gtk_label_set_xalign(GTK_LABEL(notesSaveStatus), 0);
+	gtk_label_set_line_wrap(GTK_LABEL(notesSaveStatus), TRUE);
+	gtk_label_set_max_width_chars(GTK_LABEL(notesSaveStatus), 32);
+	gtk_box_pack_start(GTK_BOX(notesSaveBox), notesSaveStatus, TRUE, TRUE, 0);
+	notesRetry = button(notesSaveBox, "Retry", "Retry saving unsaved notes", Cmd::NotesRetry);
+	gtk_box_pack_start(GTK_BOX(notesSidebar), notesSaveBox, FALSE, FALSE, 0);
+
+	notesPreview = gtk_text_view_new();
+	gtk_style_context_add_class(gtk_widget_get_style_context(notesPreview), "omapad-notes-preview");
+	gtk_text_view_set_editable(GTK_TEXT_VIEW(notesPreview), FALSE);
+	gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(notesPreview), FALSE);
+	gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(notesPreview), GTK_WRAP_WORD_CHAR);
+	gtk_text_view_set_left_margin(GTK_TEXT_VIEW(notesPreview), 28);
+	gtk_text_view_set_right_margin(GTK_TEXT_VIEW(notesPreview), 28);
+	gtk_text_view_set_top_margin(GTK_TEXT_VIEW(notesPreview), 24);
+	gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(notesPreview), 24);
+	gtk_text_view_set_pixels_below_lines(GTK_TEXT_VIEW(notesPreview), 8);
+	gtk_widget_set_tooltip_text(notesPreview, "Rendered Markdown. Select text to copy; links and HTML are inert.");
+	GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(notesPreview));
+	for (int level = 1; level <= 6; level++) {
+		const std::string name = "heading" + std::to_string(level);
+		gtk_text_buffer_create_tag(buffer, name.c_str(), "weight", PANGO_WEIGHT_BOLD, "scale", 1.9 - level * 0.13, "pixels-above-lines", 12, "pixels-below-lines", 8, nullptr);
+	}
+	gtk_text_buffer_create_tag(buffer, "quote", "left-margin", 18, "style", PANGO_STYLE_ITALIC, nullptr);
+	gtk_text_buffer_create_tag(buffer, "codeblock", "family", "monospace", "left-margin", 14, "right-margin", 14, "pixels-above-lines", 6, "pixels-below-lines", 6, nullptr);
+	for (unsigned style = 0; style < 16; style++) {
+		const std::string name = "inline" + std::to_string(style);
+		GtkTextTag *tag = gtk_text_buffer_create_tag(buffer, name.c_str(), nullptr);
+		if (style & 1) g_object_set(tag, "weight", PANGO_WEIGHT_BOLD, nullptr);
+		if (style & 2) g_object_set(tag, "style", PANGO_STYLE_ITALIC, nullptr);
+		if (style & 4) g_object_set(tag, "family", "monospace", nullptr);
+		if (style & 8) g_object_set(tag, "underline", PANGO_UNDERLINE_SINGLE, nullptr);
+	}
+	notesPreviewScroll = gtk_scrolled_window_new(nullptr, nullptr);
+	gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(notesPreviewScroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+	gtk_container_add(GTK_CONTAINER(notesPreviewScroll), notesPreview);
+	notesContentPaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+	gtk_paned_pack1(GTK_PANED(notesContentPaned), outerPaned, TRUE, FALSE);
+	gtk_paned_pack2(GTK_PANED(notesContentPaned), notesPreviewScroll, TRUE, FALSE);
+	notesRootPaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+	gtk_paned_pack1(GTK_PANED(notesRootPaned), notesSidebar, FALSE, FALSE);
+	gtk_paned_pack2(GTK_PANED(notesRootPaned), notesContentPaned, TRUE, FALSE);
+	gtk_paned_set_position(GTK_PANED(notesRootPaned), 300);
+	gtk_widget_show_all(notesRootPaned);
+	gtk_widget_show_all(notesBar);
+	gtk_widget_hide(notesSidebar);
+	gtk_widget_hide(notesBar);
+	gtk_widget_hide(notesPreviewScroll);
+	gtk_widget_hide(notesRetry);
+	gtk_widget_hide(notesBarRetry);
+}
+
+void App::applyNotesLayout() {
+	if (!notesBar) return;
+	const bool enabled = notesUiState.enabled;
+	gtk_widget_set_visible(notesBar, enabled);
+	gtk_widget_set_visible(notesSidebar, enabled && !notesUiState.focus);
+	gtk_widget_set_visible(notesPreviewScroll, enabled && notesUiState.viewMode != 0);
+	gtk_widget_set_visible(outerPaned, !enabled || notesUiState.viewMode != 2);
+	gtk_widget_set_visible(toolbar, !enabled && chromeState.toolbar);
+	for (int pane = 0; pane < 2; pane++) {
+		gtk_widget_set_visible(panes[pane].notebook, !enabled);
+		gtk_notebook_set_show_tabs(GTK_NOTEBOOK(panes[pane].notebook), !enabled && chromeState.tabs && !tabStyle.multiLine);
+		if (flowTabs[pane]) gtk_widget_set_visible(flowTabs[pane], !enabled && chromeState.tabs && tabStyle.multiLine);
+		if (enabled) gtk_widget_set_visible(panes[pane].box, pane == workspace->focusedPane());
+	}
+	if (enabled) {
+		gtk_widget_hide(folderBox);
+		gtk_widget_hide(sideBox);
+		gtk_widget_hide(results.widget);
+		gtk_widget_hide(incrementalBar);
+		gtk_widget_show(menubar); // Notes remains reachable even if the coding menu is hidden.
+	}
+}
+
+void App::renderNotesPreview(const NotesState &state) {
+	std::string signature = state.selectedPath + (state.activeNote ? "1\n" : "0\n");
+	for (const NoteBlock &block : state.preview) {
+		signature += std::to_string(static_cast<int>(block.kind)) + ":" + std::to_string(block.level) + (block.checked ? "1" : "0");
+		for (const NoteSpan &span : block.spans) signature += std::to_string(span.style) + ":" + span.text + '\0';
+	}
+	if (signature == notesPreviewSignature) return;
+	const bool sameNote = notesPreviewPath == state.selectedPath;
+	notesPreviewPath = state.selectedPath;
+	notesPreviewSignature = std::move(signature);
+	GtkAdjustment *scroll = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(notesPreviewScroll));
+	const double previous = sameNote ? gtk_adjustment_get_value(scroll) : 0;
+	GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(notesPreview));
+	GtkTextIter selectedStart, selectedEnd;
+	const bool hadSelection = sameNote && gtk_text_buffer_get_selection_bounds(buffer, &selectedStart, &selectedEnd);
+	const int selectionStart = hadSelection ? gtk_text_iter_get_offset(&selectedStart) : 0;
+	const int selectionEnd = hadSelection ? gtk_text_iter_get_offset(&selectedEnd) : 0;
+	gtk_text_buffer_set_text(buffer, "", 0);
+	if (!state.activeNote) gtk_text_buffer_set_text(buffer, "Choose a note from your library, or create a new one.", -1);
+	for (const NoteBlock &block : state.preview) {
+		GtkTextIter end;
+		gtk_text_buffer_get_end_iter(buffer, &end);
+		const int start = gtk_text_iter_get_offset(&end);
+		const char *prefix = block.kind == NoteBlock::Kind::List ? "•  " : block.kind == NoteBlock::Kind::Task ? (block.checked ? "☑  " : "☐  ") : block.kind == NoteBlock::Kind::Quote ? "│  " : block.kind == NoteBlock::Kind::Rule ? "──────────────" : "";
+		gtk_text_buffer_insert(buffer, &end, prefix, -1);
+		for (const NoteSpan &span : block.spans) {
+			const std::string name = "inline" + std::to_string(span.style & 15);
+			gtk_text_buffer_insert_with_tags_by_name(buffer, &end, span.text.c_str(), static_cast<gint>(span.text.size()), name.c_str(), nullptr);
+		}
+		gtk_text_buffer_insert(buffer, &end, "\n", 1);
+		GtkTextIter from;
+		gtk_text_buffer_get_iter_at_offset(buffer, &from, start);
+		std::string tag;
+		if (block.kind == NoteBlock::Kind::Heading) tag = "heading" + std::to_string(std::clamp(block.level, 1, 6));
+		else if (block.kind == NoteBlock::Kind::Quote) tag = "quote";
+		else if (block.kind == NoteBlock::Kind::Code) tag = "codeblock";
+		if (!tag.empty()) gtk_text_buffer_apply_tag_by_name(buffer, tag.c_str(), &from, &end);
+	}
+	if (hadSelection) {
+		const int length = gtk_text_buffer_get_char_count(buffer);
+		gtk_text_buffer_get_iter_at_offset(buffer, &selectedStart, std::min(selectionStart, length));
+		gtk_text_buffer_get_iter_at_offset(buffer, &selectedEnd, std::min(selectionEnd, length));
+		gtk_text_buffer_select_range(buffer, &selectedStart, &selectedEnd);
+	}
+	gtk_adjustment_set_value(scroll, previous);
+}
+
+void App::notesChanged(const NotesState &state) {
+	if (!notesBar) return; // Startup restores the state again after all widgets exist.
+	const bool entering = state.enabled && !notesUiState.enabled;
+	const bool leaving = !state.enabled && notesUiState.enabled;
+	const bool previewChanged = state.viewMode != notesUiState.viewMode;
+	const bool selectionChanged = state.selectedPath != notesUiState.selectedPath;
+	if (entering) {
+		notesSavedPositions = {gtk_paned_get_position(GTK_PANED(outerPaned)), gtk_paned_get_position(GTK_PANED(sidePaned)), gtk_paned_get_position(GTK_PANED(rightPaned)), gtk_paned_get_position(GTK_PANED(editorPaned))};
+		notesSavedResults = gtk_widget_get_visible(results.widget);
+		notesSavedIncremental = gtk_widget_get_visible(incrementalBar);
+	}
+	notesUiState = state;
+	syncingNotes = true;
+	if (state.query != gtk_entry_get_text(GTK_ENTRY(notesSearch))) gtk_entry_set_text(GTK_ENTRY(notesSearch), state.query.c_str());
+	gtk_label_set_text(GTK_LABEL(notesFolderLabel), fs::path(state.folder).filename().string().c_str());
+	gtk_widget_set_tooltip_text(notesFolderLabel, state.folder.c_str());
+	gtk_label_set_text(GTK_LABEL(notesTitle), (state.activeNote ? state.title : "Notes").c_str());
+	gtk_widget_set_sensitive(notesFormatButton, state.activeNote);
+	gtk_button_set_label(GTK_BUTTON(notesFocusButton), state.focus ? "Library" : "Focus");
+	for (int i = 0; i < 3; i++) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(notesViewButtons[i]), i == state.viewMode);
+	std::string tagSignature = std::to_string(state.total) + "|" + state.tag;
+	for (const auto &tag : state.tags) tagSignature += "|" + tag.first + ":" + std::to_string(tag.second);
+	if (tagSignature != notesTagSignature) {
+		notesTagSignature = std::move(tagSignature);
+		gtk_list_store_clear(notesTagStore);
+		const auto addTag = [&](const std::string &label, const std::string &value) {
+			GtkTreeIter row;
+			gtk_list_store_append(notesTagStore, &row);
+			gtk_list_store_set(notesTagStore, &row, 0, label.c_str(), 1, value.c_str(), -1);
+			if (state.tag == value) gtk_tree_selection_select_iter(gtk_tree_view_get_selection(GTK_TREE_VIEW(notesTagView)), &row);
+		};
+		addTag("All Notes  ·  " + std::to_string(state.total), "");
+		for (const auto &tag : state.tags) addTag("#" + tag.first + "  ·  " + std::to_string(tag.second), tag.first);
+	}
+	std::string listSignature;
+	for (const NoteSummary &note : state.notes) listSignature += note.path + '\0' + note.title + '\0' + note.preview + '\0';
+	if (listSignature != notesListSignature) {
+		notesListSignature = std::move(listSignature);
+		GtkAdjustment *scroll = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(notesListScroll));
+		const double previous = gtk_adjustment_get_value(scroll);
+		gtk_list_store_clear(notesStore);
+		for (const NoteSummary &note : state.notes) {
+			gchar *title = g_markup_escape_text(note.title.c_str(), -1);
+			gchar *preview = g_markup_escape_text(note.preview.c_str(), -1);
+			const std::string markup = std::string("<b>") + title + "</b>\n<small>" + preview + "</small>";
+			g_free(title);
+			g_free(preview);
+			GtkTreeIter row;
+			gtk_list_store_append(notesStore, &row);
+			gtk_list_store_set(notesStore, &row, 0, markup.c_str(), 1, note.path.c_str(), -1);
+		}
+		gtk_adjustment_set_value(scroll, previous);
+	}
+	GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(notesList));
+	gtk_tree_selection_unselect_all(selection);
+	GtkTreeIter row;
+	if (gtk_tree_model_get_iter_first(GTK_TREE_MODEL(notesStore), &row)) {
+		do {
+			gchar *path = nullptr;
+			gtk_tree_model_get(GTK_TREE_MODEL(notesStore), &row, 1, &path, -1);
+			if (path && state.selectedPath == path) gtk_tree_selection_select_iter(selection, &row);
+			g_free(path);
+		} while (gtk_tree_model_iter_next(GTK_TREE_MODEL(notesStore), &row));
+	}
+	gtk_widget_set_visible(notesEmpty, state.notes.empty());
+	gtk_label_set_text(GTK_LABEL(notesEmpty), state.total == 0 ? "Your notes live here.\nChoose + New and start writing." : "No notes match.\nTry another search or tag.");
+	gtk_label_set_text(GTK_LABEL(notesSaveStatus), (state.status + (state.activeNote ? " · " + std::to_string(state.words) + " words" : "")).c_str());
+	gtk_widget_set_tooltip_text(notesSaveStatus, state.status.c_str());
+	GtkStyleContext *statusStyle = gtk_widget_get_style_context(notesSaveStatus);
+	if (state.saveError) gtk_style_context_add_class(statusStyle, "error");
+	else gtk_style_context_remove_class(statusStyle, "error");
+	gtk_widget_set_visible(notesRetry, state.saveError);
+	gtk_label_set_text(GTK_LABEL(notesBarStatus), (state.saveError ? "Save failed" : state.status).c_str());
+	gtk_widget_set_tooltip_text(notesBarStatus, (state.status + (state.activeNote ? " · " + std::to_string(state.words) + " words" : "")).c_str());
+	GtkStyleContext *barStatusStyle = gtk_widget_get_style_context(notesBarStatus);
+	if (state.saveError) gtk_style_context_add_class(barStatusStyle, "error");
+	else gtk_style_context_remove_class(barStatusStyle, "error");
+	gtk_widget_set_visible(notesBarRetry, state.saveError);
+	renderNotesPreview(state);
+	syncingNotes = false;
+	if (leaving) {
+		setChrome(chromeState);
+		gtk_widget_show(panes[0].box);
+		gtk_widget_set_visible(panes[1].box, workspace->splitVisible());
+		gtk_widget_set_visible(results.widget, notesSavedResults);
+		gtk_widget_set_visible(incrementalBar, notesSavedIncremental);
+		if (notesSavedPositions.size() == 4) {
+			gtk_paned_set_position(GTK_PANED(outerPaned), notesSavedPositions[0]);
+			gtk_paned_set_position(GTK_PANED(sidePaned), notesSavedPositions[1]);
+			gtk_paned_set_position(GTK_PANED(rightPaned), notesSavedPositions[2]);
+			gtk_paned_set_position(GTK_PANED(editorPaned), notesSavedPositions[3]);
+		}
+	}
+	applyNotesLayout();
+	// A pane returning from Read view must be mapped before GTK can focus its editor.
+	if (state.enabled && (entering || previewChanged || selectionChanged))
+		post([this]() { if (notesUiState.enabled) focusPane(workspace->focusedPane()); });
+	if ((entering || previewChanged) && state.enabled && state.viewMode == 1) {
+		GtkAllocation allocation;
+		gtk_widget_get_allocation(notesContentPaned, &allocation);
+		if (allocation.width > 1) gtk_paned_set_position(GTK_PANED(notesContentPaned), allocation.width / 2);
+	}
 }
 
 #pragma mark - Window
@@ -2791,7 +3199,9 @@ void App::build() {
 	gtk_box_pack_start(GTK_BOX(root), menubar, FALSE, FALSE, 0);
 	buildToolbar();
 	gtk_box_pack_start(GTK_BOX(root), toolbar, FALSE, FALSE, 0);
-	gtk_box_pack_start(GTK_BOX(root), outerPaned, TRUE, TRUE, 0);
+	buildNotes();
+	gtk_box_pack_start(GTK_BOX(root), notesBar, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(root), notesRootPaned, TRUE, TRUE, 0);
 	buildIncrementalBar();
 	gtk_box_pack_start(GTK_BOX(root), incrementalBar, FALSE, FALSE, 0);
 	gtk_box_pack_start(GTK_BOX(root), status, FALSE, FALSE, 0);
@@ -2821,6 +3231,9 @@ void App::build() {
 	}, this);
 
 	gtk_widget_show_all(root);
+	gtk_widget_hide(notesBar);
+	gtk_widget_hide(notesSidebar);
+	gtk_widget_hide(notesPreviewScroll);
 	gtk_widget_hide(folderBox);
 	gtk_widget_hide(panes[1].box);
 	gtk_widget_hide(results.widget);
@@ -2834,6 +3247,7 @@ void App::build() {
 	workspace->prepareCommandLine(gCommandLine);
 	workspace->restoreSession();
 	workspace->afterStartup();
+	notesChanged(workspace->notesState());
 	splitChanged(workspace->splitVisible(), workspace->splitStacked());
 	setFolderPanelVisible(workspace->folderPanelVisible());
 	foldersChanged();
