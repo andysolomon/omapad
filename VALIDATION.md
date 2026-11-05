@@ -1,19 +1,53 @@
-# Validation — omapad 0.4.0
+# Validation — omapad 1.1.0
 
 Verified on 2026-11-04 on an Intel Mac and two x86_64 Linux machines running Omarchy.
 
 | Target | Build | Core tests |
 | --- | --- | --- |
-| macOS / AppKit | CMake Release | 2,272 checks, zero failures |
-| Omarchy machine 1 / GTK3 | GCC, GNUmakefile | 2,278 checks, zero failures |
-| Omarchy machine 2 / GTK3 | GCC, GNUmakefile | 2,278 checks, zero failures |
+| macOS / AppKit | CMake Release | 3,777 checks, zero failures |
+| Omarchy machine 1 / GTK3 | GCC, GNUmakefile | 3,867 checks, zero failures |
+| Omarchy machine 2 / GTK3 | GCC, GNUmakefile | 3,867 checks, zero failures |
 
-The tests exercise the real Scintilla editing widgets, including encodings, file operations,
-search and PCRE2 regex, split views, clones, folders, session restore, themes, language lexers,
-preferences, shortcuts, completion, hints, all 47 Function List rule files, multi-select, the
-Column Editor, change history, token styles, the Document Map, user-defined language files and
-colouring, and print pagination. On macOS they also write a real PDF through the app's print code.
-The totals differ by platform; all suites completed without failures.
+The tests exercise the real Scintilla editing widgets. `testInstallerAuditGaps` covers what the audit below found missing.
+
+## 1.1.0: audit of the real installer
+
+The installer `npp.8.9.8.1.Installer.x64.exe` has SHA-256 `26f3bcced788fadbac4e7e577b430ea2ce6060cf3bcad993ef4612ecd7d743da`, matching the official checksum list. It was read without running anything in it, and compared with the Notepad++ source for the same tag.
+
+- Its `notepad++.exe` and plugin DLLs are byte-identical to the portable build's.
+- Themes, `langs.model.xml` and `stylers.model.xml` match omapad's byte for byte. Other data files differ only in line endings, except our disclosed change to `functionList/rust.xml`. `overrideMap.xml` is left out on purpose.
+- Every preference in the table is now read by code outside the table. That is a check that nothing is left unused, not a test of each one's effect.
+- `Highlight comment/php/asp zone`: the 8.9.8.1 source stores this preference and never reads it. omapad's does what the label says, so here it goes beyond Notepad++.
+
+Linux, through GTK's Broadway backend and a headless browser: ghost typing, `-titleAdd`, `-monitoringMode`, `--help`, read-only and monitoring marks, alternate icons, pin button, buttons on the active tab only, the new, list and close buttons, a dark tone, toolbar colour, border width, Document List and Character Panel columns, Shortcut Mapper categories, the `<<` button and the Style Configurator's font columns.
+
+macOS, drawn offscreen without showing the window or taking focus: `-titleAdd`, filled and coloured toolbar, pin button, buttons on the active tab only, the new, list and close buttons, border width, and both panels' columns.
+
+**Not checked in 1.1.0 beyond the core tests, or not at all:**
+
+- The Mac tray icon, Edit with omapad in the Services menu, and File Association on either platform, which would change this machine's real settings.
+- Saving with administrator rights on either platform, which needs a real password prompt.
+- `doLocalConf.xml` and `asNotepad.xml` in a real install. `disableNppAutoUpdate.xml` is covered by a test.
+- Custom toolbar icons drawn in a real window, and `.ico` files on a Mac.
+- Peek on the Document Map, which has no test.
+- Shift+Enter in the Find window, in a real window.
+- Whether the new default keys clash with Hyprland's bindings on a real session.
+- Anything on a live Wayland session, or by hand in a live Mac window.
+
+## 1.0.0 results
+
+Linux, through GTK's Broadway backend and a headless browser, with isolated support directories: the toolbar, Document List, Character Panel, Project Panel, tab colour and pin, Incremental Search, Mark tab, Windows dialog, Post-It and Style Configurator chooser, plus `-n3` on the command line.
+
+macOS: the real window built offscreen and drawn to images, without showing it or taking focus: toolbar, side panels, tab colours and pins, vertical and multi-line tabs, reduced tabs, Incremental Search bar and status bar.
+
+**Not checked in 1.0.0:**
+
+- Any of the new Mac commands with real clicks in a live window. The window has never been used by hand.
+- Any of the new windows on a live Wayland session.
+- Printing on paper, Print Now, and Check for Updates against a real release.
+- Most commands reached only through their menus in the real windows. The core tests run them directly.
+- Installing a plugin through the Import dialog in a real window. The tests load the example plugin from the plugins folder.
+- Right-to-left text on either platform.
 
 ## 0.4.0 results
 

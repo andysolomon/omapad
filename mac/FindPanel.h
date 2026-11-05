@@ -10,5 +10,7 @@
 - (void)setStatus:(NSString *)status isError:(BOOL)isError;
 - (void)setDirectory:(NSString *)directory;
 - (void)setFindText:(NSString *)text;
+- (void)setInSelection:(BOOL)on;
 - (void)setFindInFilesRunning:(BOOL)running;
+- (void)close;
 @end

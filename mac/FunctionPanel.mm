@@ -59,6 +59,7 @@ static NSString *toNS(const std::string &s) {
 		_sort.buttonType = NSButtonTypePushOnPushOff;
 		_sort.bordered = NO;
 		_sort.toolTip = @"Sort by name";
+		_sort.state = workspace->settings.prefOn("functionListSorted") ? NSControlStateValueOn : NSControlStateValueOff;
 		NSButton *refresh = [NSButton buttonWithImage:[NSImage imageNamed:NSImageNameRefreshTemplate] target:self action:@selector(refresh:)];
 		refresh.bordered = NO;
 		refresh.toolTip = @"Refresh";
@@ -180,6 +181,8 @@ static NSString *toNS(const std::string &s) {
 		else _empty.stringValue = @"No functions found.";
 	}
 }
+
+- (NSView *)focusTarget { return _outline; }
 
 - (void)controlTextDidChange:(NSNotification *)note { [self reload]; }
 

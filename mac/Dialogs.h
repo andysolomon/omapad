@@ -17,3 +17,14 @@ void OmaApplyShortcut(const std::string &shortcut, NSMenuItem *item);
 
 // Runs a print job, or writes it to a PDF. Cancelling returns YES.
 BOOL OmaRunPrint(omapad::PrintJob &job, const omapad::PrintOutput &output, std::string &error);
+
+// A table with buttons along the bottom. Returns the button pressed, or -1 if it was closed.
+int OmaRunList(const omapad::ListDialog &list, std::vector<int> &selection);
+
+// A side panel showing one of the workspace's lists.
+@interface OmaSidePanel : NSView
+@property(nonatomic, copy) NSMenu *(^menuBuilder)(std::vector<omapad::MenuItem> items);
+- (instancetype)initWithWorkspace:(omapad::Workspace *)workspace panel:(int)panel title:(NSString *)title;
+- (void)reload;
+- (NSView *)focusTarget;
+@end

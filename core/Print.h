@@ -22,6 +22,8 @@ struct PrintOptions {
 	PrintPageText header, footer;  // May hold variables like $(FILE_NAME).
 	std::string title, path;
 	int marginTop = 15, marginBottom = 15, marginLeft = 15, marginRight = 15;  // In millimetres.
+	bool formFeedBreaks = true;
+	bool headerBold = false, headerItalic = false, footerBold = false, footerItalic = false;
 };
 
 // What to do with a job.
@@ -54,13 +56,14 @@ public:
 	const PrintOptions &settings() const { return options; }
 
 private:
-	intptr_t format(void *surface, bool draw, intptr_t from, int width, int height);
+	intptr_t format(void *surface, bool draw, intptr_t from, int width, int height, intptr_t to);
+	intptr_t formFeedAfter(intptr_t from) const;
 	PrintPageText expand(const PrintPageText &text, int page) const;
 	std::string expand(const std::string &text, int page) const;
 
 	SciView &view;
 	PrintOptions options;
-	std::vector<intptr_t> pageStarts;
+	std::vector<intptr_t> pageStarts, pageEnds;
 	std::time_t startedAt;
 	intptr_t savedColourMode, savedMargin;
 };

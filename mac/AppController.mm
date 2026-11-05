@@ -1,3 +1,4 @@
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import "AppController.h"
 #import "Dialogs.h"
 #import "FindPanel.h"
@@ -57,9 +58,11 @@ static void (^sFileDropHandler)(NSArray<NSString *> *);
 @end
 
 @interface OmaEditorView : ScintillaView
+@property(nonatomic, copy) NSMenu *(^contextMenu)(NSEvent *event);
 @end
 @implementation OmaEditorView
 + (Class)contentViewClass { return OmaContentView.class; }
+- (NSMenu *)menuForEvent:(NSEvent *)event { return self.contextMenu ? self.contextMenu(event) : nil; }
 @end
 
 // Reports system light and dark changes, so an automatic theme can follow them.
@@ -120,6 +123,15 @@ struct MacSciView : SciView {
 - (void)hostFunctionListVisible:(BOOL)visible;
 - (void)hostFunctionListChanged;
 - (void)hostDocumentMapVisible:(BOOL)visible;
+- (void)hostPanel:(int)panel title:(NSString *)title visible:(BOOL)visible;
+- (void)hostPanelChanged:(int)panel;
+- (void)hostIncrementalBar:(BOOL)visible;
+- (void)hostChrome:(const ChromeState &)chrome;
+- (void)hostTabStyle:(const TabStyle &)style;
+- (void)hostFocusPanel:(int)panel;
+- (void)hostSelectFolderPath:(NSString *)path;
+- (void)hostSetTray:(BOOL)visible;
+- (void)hostSetWindowX:(long)x y:(long)y;
 - (void)buildMenus;
 - (Workspace *)workspacePointer;
 - (void)hostFoldersChanged;
@@ -135,6 +147,12 @@ struct MacSciView : SciView {
 @end
 
 #pragma mark - Host
+
+static NSColor *colourFromHexString(const std::string &hex) {
+	if (hex.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) return nil;
+	const unsigned long rgb = std::strtoul(hex.c_str(), nullptr, 16);
+	return [NSColor colorWithSRGBRed:((rgb >> 16) & 0xFF) / 255.0 green:((rgb >> 8) & 0xFF) / 255.0 blue:(rgb & 0xFF) / 255.0 alpha:1];
+}
 
 struct MacHost : Host {
 	__unsafe_unretained AppController *controller = nil;
@@ -200,6 +218,73 @@ struct MacHost : Host {
 		if ([alert runModal] != NSAlertFirstButtonReturn) return false;
 		out = toStd(field.stringValue);
 		return true;
+	}
+	bool clipboardData(const std::string &format, std::string &out) override {
+		NSPasteboard *board = NSPasteboard.generalPasteboard;
+		if (format == "text") {
+			NSString *text = [board stringForType:NSPasteboardTypeString];
+			if (!text) return false;
+			out = toStd(text);
+			return true;
+		}
+		NSData *data = [board dataForType:format == "text/html" ? NSPasteboardTypeHTML : NSPasteboardTypeRTF];
+		if (!data) return false;
+		out.assign(static_cast<const char *>(data.bytes), data.length);
+		return true;
+	}
+	void setClipboardData(const std::string &format, const std::string &data) override {
+		NSPasteboard *board = NSPasteboard.generalPasteboard;
+		[board clearContents];
+		const auto put = [&](const std::string &value, NSPasteboardType type) {
+			[board setData:[NSData dataWithBytes:value.data() length:value.size()] forType:type];
+		};
+		if (format == "text/rtf") {
+			put(data, NSPasteboardTypeRTF);
+		} else if (format == "text/html") {
+			put(data, NSPasteboardTypeHTML);
+		} else {
+			const size_t split = data.find('\0');
+			put(data.substr(0, split), NSPasteboardTypeHTML);
+			if (split != std::string::npos) put(data.substr(split + 1), NSPasteboardTypeRTF);
+		}
+	}
+	void launch(const std::vector<std::string> &arguments, const std::string &directory) override {
+		std::string error;
+		if (!spawnDetached(arguments, directory, error)) flash(error);
+	}
+	int runList(const ListDialog &dialog, std::vector<int> &selection) override { return OmaRunList(dialog, selection); }
+	void setPanelVisible(int panel, const std::string &title, bool visible) override { [controller hostPanel:panel title:toNS(title) visible:visible]; }
+	void panelChanged(int panel) override { [controller hostPanelChanged:panel]; }
+	void setIncrementalBar(bool visible) override { [controller hostIncrementalBar:visible]; }
+	void setChrome(const ChromeState &chrome) override { [controller hostChrome:chrome]; }
+	void setTabStyle(const TabStyle &style) override { [controller hostTabStyle:style]; }
+	void closeFind() override { [controller.findPanel close]; }
+	void setFindInSelection(bool on) override { [controller.findPanel setInSelection:on]; }
+	void beep() override { NSBeep(); }
+	void focusPanel(int panel) override { [controller hostFocusPanel:panel]; }
+	void selectFolderPath(const std::string &path) override { [controller hostSelectFolderPath:toNS(path)]; }
+	void setTray(bool visible) override { [controller hostSetTray:visible]; }
+	void setWindowPosition(long x, long y) override { [controller hostSetWindowX:x y:y]; }
+	bool registerFileTypes(const std::vector<std::string> &extensions, std::string &error) override {
+		NSString *bundle = NSBundle.mainBundle.bundleIdentifier;
+		if (!bundle) {
+			error = "This copy isn't running from omapad.app.";
+			return false;
+		}
+		bool ok = true;
+		for (const std::string &extension : extensions) {
+			UTType *type = [UTType typeWithFilenameExtension:toNS(extension)];
+			if (!type) continue;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+			const OSStatus status = LSSetDefaultRoleHandlerForContentType((__bridge CFStringRef)type.identifier, kLSRolesAll, (__bridge CFStringRef)bundle);
+#pragma clang diagnostic pop
+			if (status != noErr) {
+				ok = false;
+				error = "macOS refused ." + extension + " (error " + std::to_string(status) + ").";
+			}
+		}
+		return ok;
 	}
 	void setClipboard(const std::string &text) override {
 		[NSPasteboard.generalPasteboard clearContents];
@@ -278,6 +363,22 @@ struct MacHost : Host {
 	BOOL _launched;
 	BOOL _settingFocus;
 	NSMenu *_builtMenus;
+	OmaSidePanel *_panels[kPanelCount];
+	NSStackView *_panelsBox;
+	NSStackView *_toolbar;
+	NSLayoutConstraint *_toolbarHeight, *_statusHeight, *_incrementalHeight;
+	NSView *_incrementalBar, *_statusBar;
+	NSSearchField *_incrementalField;
+	NSButton *_incrementalCase, *_incrementalAll;
+	NSTextField *_incrementalStatus;
+	NSLayoutConstraint *_barHeight[2], *_barWidth[2];
+	NSArray<NSLayoutConstraint *> *_barTop[2], *_barSide[2];
+	TabStyle _tabStyle;
+	NSStatusItem *_statusItem;
+	NSLayoutConstraint *_paneInsets[2][6];  // Four that grow inward from the top left, and two from the bottom right.
+	BOOL _tabsShown;  // Set from the first ChromeState.
+	BOOL _sidePanelsAllowed;
+	BOOL _postIt;
 }
 
 @synthesize findPanel = _findPanel;
@@ -330,6 +431,14 @@ struct MacHost : Host {
 	return editor;
 }
 
+- (NSMenu *)contextMenuForEditor:(int)pane event:(NSEvent *)event {
+	OmaEditorView *editor = _editors[pane];
+	const NSPoint point = [editor.content convertPoint:event.locationInWindow fromView:nil];
+	const long position = [editor message:SCI_POSITIONFROMPOINT wParam:static_cast<uintptr_t>(point.x) lParam:static_cast<intptr_t>(point.y)];
+	_workspace->editorRightClicked(pane, position);
+	return [self menuFromItems:_workspace->editorContextMenu() title:@""];
+}
+
 - (NSView *)makePaneBox:(int)index {
 	NSView *box = [NSView new];
 	TabBar *bar = [[TabBar alloc] initWithFrame:NSZeroRect];
@@ -341,16 +450,37 @@ struct MacHost : Host {
 	editor.translatesAutoresizingMaskIntoConstraints = NO;
 	[box addSubview:bar];
 	[box addSubview:editor];
-	[NSLayoutConstraint activateConstraints:@[
+	__weak AppController *weakSelf = self;
+	((OmaEditorView *)editor).contextMenu = ^NSMenu *(NSEvent *event) {
+		AppController *strong = weakSelf;
+		return strong ? [strong contextMenuForEditor:index event:event] : nil;
+	};
+	_barHeight[index] = [bar.heightAnchor constraintEqualToConstant:30];
+	_barWidth[index] = [bar.widthAnchor constraintEqualToConstant:170];
+	_paneInsets[index][0] = [editor.topAnchor constraintEqualToAnchor:bar.bottomAnchor];
+	_paneInsets[index][1] = [editor.leadingAnchor constraintEqualToAnchor:box.leadingAnchor];
+	_paneInsets[index][2] = [editor.topAnchor constraintEqualToAnchor:box.topAnchor];
+	_paneInsets[index][3] = [editor.leadingAnchor constraintEqualToAnchor:bar.trailingAnchor];
+	_paneInsets[index][4] = [editor.trailingAnchor constraintEqualToAnchor:box.trailingAnchor];
+	_paneInsets[index][5] = [editor.bottomAnchor constraintEqualToAnchor:box.bottomAnchor];
+	_barTop[index] = @[
 		[bar.topAnchor constraintEqualToAnchor:box.topAnchor],
 		[bar.leadingAnchor constraintEqualToAnchor:box.leadingAnchor],
 		[bar.trailingAnchor constraintEqualToAnchor:box.trailingAnchor],
-		[bar.heightAnchor constraintEqualToConstant:30],
-		[editor.topAnchor constraintEqualToAnchor:bar.bottomAnchor],
-		[editor.leadingAnchor constraintEqualToAnchor:box.leadingAnchor],
-		[editor.trailingAnchor constraintEqualToAnchor:box.trailingAnchor],
-		[editor.bottomAnchor constraintEqualToAnchor:box.bottomAnchor],
-	]];
+		_barHeight[index],
+		_paneInsets[index][0],
+		_paneInsets[index][1],
+	];
+	_barSide[index] = @[
+		[bar.topAnchor constraintEqualToAnchor:box.topAnchor],
+		[bar.leadingAnchor constraintEqualToAnchor:box.leadingAnchor],
+		[bar.bottomAnchor constraintEqualToAnchor:box.bottomAnchor],
+		_barWidth[index],
+		_paneInsets[index][2],
+		_paneInsets[index][3],
+	];
+	[NSLayoutConstraint activateConstraints:_barTop[index]];
+	[NSLayoutConstraint activateConstraints:@[_paneInsets[index][4], _paneInsets[index][5]]];
 	return box;
 }
 
@@ -382,7 +512,12 @@ struct MacHost : Host {
 	_editorSplit.dividerStyle = NSSplitViewDividerStyleThin;
 	[_editorSplit addArrangedSubview:_paneBoxes[0]];
 
-	_results = [[ScintillaView alloc] initWithFrame:NSMakeRect(0, 0, 1000, 180)];
+	OmaEditorView *resultsView = [[OmaEditorView alloc] initWithFrame:NSMakeRect(0, 0, 1000, 180)];
+	resultsView.contextMenu = ^NSMenu *(NSEvent *) {
+		AppController *strong = weakSelf;
+		return strong ? [strong menuFromItems:strong->_workspace->resultsMenu() title:@""] : nil;
+	};
+	_results = resultsView;
 	OmaSciDelegate *resultsDelegate = [OmaSciDelegate new];
 	resultsDelegate.handler = ^(SCNotification *n) {
 		AppController *strong = weakSelf;
@@ -455,18 +590,45 @@ struct MacHost : Host {
 	[status addSubview:_statusLeft];
 	[status addSubview:_statusMessage];
 	[status addSubview:_statusRight];
+	_statusBar = status;
+	// Clicking either end of the status bar offers what it shows.
+	for (NSTextField *label in @[_statusLeft, _statusRight]) {
+		NSClickGestureRecognizer *click = [[NSClickGestureRecognizer alloc] initWithTarget:self action:@selector(statusClicked:)];
+		[label addGestureRecognizer:click];
+	}
 
+	_sidePanelsAllowed = YES;
+	_panelsBox = [NSStackView new];
+	_panelsBox.orientation = NSUserInterfaceLayoutOrientationVertical;
+	_panelsBox.distribution = NSStackViewDistributionFillEqually;
+	_panelsBox.spacing = 1;
+
+	[self buildToolbar];
+	[self buildIncrementalBar];
+	[root addSubview:_toolbar];
+	[root addSubview:_incrementalBar];
 	[root addSubview:_outer];
 	[root addSubview:status];
+	_toolbarHeight = [_toolbar.heightAnchor constraintEqualToConstant:30];
+	_statusHeight = [status.heightAnchor constraintEqualToConstant:22];
+	_incrementalHeight = [_incrementalBar.heightAnchor constraintEqualToConstant:0];
 	[NSLayoutConstraint activateConstraints:@[
-		[_outer.topAnchor constraintEqualToAnchor:root.topAnchor],
+		[_toolbar.topAnchor constraintEqualToAnchor:root.topAnchor],
+		[_toolbar.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
+		[_toolbar.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
+		_toolbarHeight,
+		[_outer.topAnchor constraintEqualToAnchor:_toolbar.bottomAnchor],
 		[_outer.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
 		[_outer.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
-		[_outer.bottomAnchor constraintEqualToAnchor:status.topAnchor],
+		[_outer.bottomAnchor constraintEqualToAnchor:_incrementalBar.topAnchor],
+		[_incrementalBar.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
+		[_incrementalBar.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
+		[_incrementalBar.bottomAnchor constraintEqualToAnchor:status.topAnchor],
+		_incrementalHeight,
 		[status.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
 		[status.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
 		[status.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
-		[status.heightAnchor constraintEqualToConstant:22],
+		_statusHeight,
 		[_statusLeft.leadingAnchor constraintEqualToAnchor:status.leadingAnchor constant:10],
 		[_statusLeft.centerYAnchor constraintEqualToAnchor:status.centerYAnchor],
 		[_statusMessage.leadingAnchor constraintEqualToAnchor:_statusLeft.trailingAnchor constant:16],
@@ -475,6 +637,192 @@ struct MacHost : Host {
 		[_statusRight.trailingAnchor constraintEqualToAnchor:status.trailingAnchor constant:-10],
 		[_statusRight.centerYAnchor constraintEqualToAnchor:status.centerYAnchor],
 	]];
+}
+
+#pragma mark Toolbar and search bar
+
+- (void)buildToolbar {
+	NSMutableArray<NSView *> *views = [NSMutableArray array];
+	for (const ToolItem &item : _workspace->toolbarItems()) {
+		if (item.separator) {
+			NSBox *gap = [NSBox new];
+			gap.boxType = NSBoxSeparator;
+			[gap.widthAnchor constraintEqualToConstant:1].active = YES;
+			[gap.heightAnchor constraintEqualToConstant:18].active = YES;
+			[views addObject:gap];
+			continue;
+		}
+		NSImage *image = [NSImage imageWithSystemSymbolName:toNS(item.symbol) accessibilityDescription:toNS(item.title)];
+		NSButton *button = image ? [NSButton buttonWithImage:image target:self action:@selector(toolbarPressed:)]
+		                         : [NSButton buttonWithTitle:toNS(item.title) target:self action:@selector(toolbarPressed:)];
+		button.bordered = NO;
+		button.toolTip = toNS(item.title);
+		button.tag = static_cast<NSInteger>(views.count);
+		button.refusesFirstResponder = YES;
+		if (!item.customIcon.empty()) {
+			NSImage *custom = [[NSImage alloc] initWithContentsOfFile:toNS(item.customIcon)];
+			if (custom) {
+				custom.size = NSMakeSize(16, 16);
+				button.image = custom;
+				button.title = @"";
+			}
+		} else {
+			button.identifier = toNS(item.symbol);
+		}
+		OmaMenuAction *action = [OmaMenuAction new];
+		action->item.cmd = item.cmd;
+		action->item.arg = item.arg;
+		button.cell.representedObject = action;
+		[button.widthAnchor constraintEqualToConstant:24].active = YES;
+		[views addObject:button];
+	}
+	_toolbar = [NSStackView stackViewWithViews:views];
+	_toolbar.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+	_toolbar.alignment = NSLayoutAttributeCenterY;
+	_toolbar.spacing = 2;
+	_toolbar.edgeInsets = NSEdgeInsetsMake(0, 8, 0, 8);
+	_toolbar.translatesAutoresizingMaskIntoConstraints = NO;
+	[_toolbar setHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+}
+
+- (void)toolbarPressed:(NSButton *)button {
+	OmaMenuAction *action = button.cell.representedObject;
+	if (action) _workspace->run(action->item.cmd, action->item.arg, action->item.text);
+}
+
+- (void)statusClicked:(NSClickGestureRecognizer *)click {
+	NSMenu *menu = [self menuFromItems:_workspace->statusMenu(click.view == _statusRight) title:@""];
+	[menu popUpMenuPositioningItem:nil atLocation:[click locationInView:click.view] inView:click.view];
+}
+
+- (void)buildIncrementalBar {
+	_incrementalField = [NSSearchField new];
+	_incrementalField.target = self;
+	_incrementalField.action = @selector(incrementalChanged:);
+	[_incrementalField.widthAnchor constraintEqualToConstant:260].active = YES;
+	NSButton *close = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"xmark" accessibilityDescription:@"Close"] target:self action:@selector(incrementalClose:)];
+	close.bordered = NO;
+	NSButton *previous = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"chevron.up" accessibilityDescription:@"Previous"] target:self action:@selector(incrementalPrevious:)];
+	NSButton *next = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"chevron.down" accessibilityDescription:@"Next"] target:self action:@selector(incrementalNext:)];
+	_incrementalAll = [NSButton checkboxWithTitle:@"Highlight all" target:self action:@selector(incrementalChanged:)];
+	_incrementalAll.state = NSControlStateValueOn;
+	_incrementalCase = [NSButton checkboxWithTitle:@"Match case" target:self action:@selector(incrementalChanged:)];
+	_incrementalStatus = [NSTextField labelWithString:@""];
+	NSStackView *row = [NSStackView stackViewWithViews:@[close, [NSTextField labelWithString:@"Find:"], _incrementalField, previous, next, _incrementalAll, _incrementalCase, _incrementalStatus]];
+	row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+	row.spacing = 8;
+	row.edgeInsets = NSEdgeInsetsMake(0, 8, 0, 8);
+	row.hidden = YES;
+	row.translatesAutoresizingMaskIntoConstraints = NO;
+	_incrementalBar = row;
+}
+
+- (void)runIncremental:(BOOL)backward next:(BOOL)next {
+	const std::string status = _workspace->incrementalSearch(toStd(_incrementalField.stringValue), backward, next, _incrementalCase.state == NSControlStateValueOn, _incrementalAll.state == NSControlStateValueOn);
+	_incrementalStatus.stringValue = toNS(status);
+}
+- (void)incrementalChanged:(id)sender { [self runIncremental:NO next:NO]; }
+- (void)incrementalNext:(id)sender { [self runIncremental:NO next:YES]; }
+- (void)incrementalPrevious:(id)sender { [self runIncremental:YES next:YES]; }
+- (void)incrementalClose:(id)sender { _workspace->closeIncrementalSearch(); }
+
+- (void)hostIncrementalBar:(BOOL)visible {
+	_incrementalBar.hidden = !visible;
+	_incrementalHeight.constant = visible ? 34 : 0;
+	if (visible) [_window makeFirstResponder:_incrementalField];
+}
+
+#pragma mark Panels and modes
+
+- (void)hostPanel:(int)panel title:(NSString *)title visible:(BOOL)visible {
+	if (!_panels[panel]) {
+		_panels[panel] = [[OmaSidePanel alloc] initWithWorkspace:_workspace.get() panel:panel title:title];
+		__weak AppController *weakSelf = self;
+		_panels[panel].menuBuilder = ^NSMenu *(std::vector<MenuItem> items) {
+			AppController *strong = weakSelf;
+			return strong ? [strong menuFromItems:items title:@""] : nil;
+		};
+	}
+	if (visible) [_panelsBox addArrangedSubview:_panels[panel]];
+	else [_panels[panel] removeFromSuperview];
+	[self hostPanelChanged:panel];
+	[self updatePanelsBox];
+}
+
+- (void)updatePanelsBox {
+	const BOOL needed = _panelsBox.arrangedSubviews.count > 0 && _sidePanelsAllowed;
+	if (needed && !_panelsBox.superview) [_outer insertArrangedSubview:_panelsBox atIndex:[_outer.arrangedSubviews indexOfObject:_rightSplit] + 1];
+	else if (!needed && _panelsBox.superview) [_panelsBox removeFromSuperview];
+	[self arrangeSidePanels];
+}
+
+- (void)hostPanelChanged:(int)panel {
+	if (_panels[panel].superview) [_panels[panel] reload];
+}
+
+- (void)hostChrome:(const ChromeState &)chrome {
+	_toolbar.hidden = !chrome.toolbar;
+	_toolbarHeight.constant = chrome.toolbar ? (chrome.largeToolbar ? 38 : 30) : 0;
+	for (NSView *view in _toolbar.arrangedSubviews) {
+		if (![view isKindOfClass:NSButton.class]) continue;
+		NSButton *button = (NSButton *)view;
+		if (button.identifier.length) {
+			// Filled icons are the same symbols with ".fill", where the symbol has that form.
+			NSImage *plain = [NSImage imageWithSystemSymbolName:button.identifier accessibilityDescription:button.toolTip];
+			NSImage *filled = chrome.filledToolbar ? [NSImage imageWithSystemSymbolName:[button.identifier stringByAppendingString:@".fill"] accessibilityDescription:button.toolTip] : nil;
+			if (filled ?: plain) button.image = filled ?: plain;
+		}
+		button.contentTintColor = chrome.toolbarColour.size() == 6 ? colourFromHexString(chrome.toolbarColour) : nil;
+		if (button.image) button.symbolConfiguration = [NSImageSymbolConfiguration configurationWithScale:chrome.largeToolbar ? NSImageSymbolScaleLarge : NSImageSymbolScaleMedium];
+	}
+	for (int pane = 0; pane < 2; pane++) {
+		for (int side = 0; side < 6; side++) {
+			if (_paneInsets[pane][side]) _paneInsets[pane][side].constant = side < 4 ? chrome.borderWidth : -chrome.borderWidth;
+		}
+	}
+	_statusBar.hidden = !chrome.status;
+	_statusHeight.constant = chrome.status ? 22 : 0;
+	_tabsShown = chrome.tabs;
+	[self hostTabStyle:_tabStyle];
+	_sidePanelsAllowed = chrome.panels;
+	[self updatePanelsBox];
+	[self hostFolderVisible:chrome.panels && _workspace->folderPanelVisible()];
+	[self hostFunctionListVisible:chrome.panels && _workspace->functionListVisible()];
+	[self hostDocumentMapVisible:chrome.panels && _workspace->documentMapVisible()];
+	if (chrome.frameless != _postIt) {
+		_postIt = chrome.frameless;
+		_window.titleVisibility = _postIt ? NSWindowTitleHidden : NSWindowTitleVisible;
+		_window.titlebarAppearsTransparent = _postIt;
+		for (NSWindowButton which : {NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton}) [_window standardWindowButton:which].hidden = _postIt;
+		_window.level = _postIt ? NSFloatingWindowLevel : NSNormalWindowLevel;
+	}
+	if (chrome.appearance == "light") NSApp.appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
+	else if (chrome.appearance == "dark") NSApp.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+	else NSApp.appearance = nil;
+}
+
+- (void)hostTabStyle:(const TabStyle &)style {
+	_tabStyle = style;
+	for (int pane = 0; pane < 2; pane++) {
+		TabBar *bar = _tabBars[pane];
+		bar.vertical = style.vertical;
+		bar.multiLine = style.multiLine && !style.vertical;
+		bar.locked = style.locked;
+		bar.reduced = style.reduced;
+		bar.showClose = style.closeButton;
+		bar.activeBar = style.activeBar;
+		bar.inactiveColour = style.inactiveColour;
+		bar.showPin = style.pinButton;
+		bar.buttonsOnInactive = style.buttonsOnInactive;
+		bar.rightShortcuts = style.rightShortcuts;
+		[NSLayoutConstraint deactivateConstraints:_barTop[pane]];
+		[NSLayoutConstraint deactivateConstraints:_barSide[pane]];
+		[NSLayoutConstraint activateConstraints:style.vertical ? _barSide[pane] : _barTop[pane]];
+		bar.hidden = !_tabsShown;
+		_barWidth[pane].constant = _tabsShown ? 170 : 0;
+		_barHeight[pane].constant = !_tabsShown ? 0 : [bar heightForWidth:MAX(NSWidth(_paneBoxes[pane].bounds), 400)];
+		bar.needsDisplay = YES;
+	}
 }
 
 #pragma mark Host callbacks
@@ -487,8 +835,12 @@ struct MacHost : Host {
 			item.title = toNS(info.title);
 			item.toolTip = toNS(info.toolTip);
 			item.dirty = info.dirty;
+			item.pinned = info.pinned;
+			item.colour = info.colour;
+			item.display = toNS(tabDisplayTitle(info, _tabStyle));
 			[items addObject:item];
 		}
+		if (_tabStyle.multiLine && _tabsShown) _barHeight[pane].constant = [_tabBars[pane] heightForWidth:MAX(NSWidth(_paneBoxes[pane].bounds), 400)];
 		[_tabBars[pane] setItems:items activeIndex:_workspace->activeTab(pane) focused:_workspace->focusedPane() == pane];
 	}
 	const std::string path = _workspace->windowPath();
@@ -555,9 +907,11 @@ struct MacHost : Host {
 	const NSUInteger editors = [views indexOfObject:_rightSplit];
 	for (NSUInteger i = 0; i < views.count; i++) [_outer setHoldingPriority:views[i] == _rightSplit ? 240 : 260 forSubviewAtIndex:i];
 	const CGFloat total = NSWidth(_outer.bounds);
-	const BOOL hasMap = _mapBox.superview != nil, hasFunctions = _functionPanel.superview != nil;
+	const BOOL hasMap = _mapBox.superview != nil, hasFunctions = _functionPanel.superview != nil, hasPanels = _panelsBox.superview != nil;
 	const CGFloat mapWidth = hasMap ? 120 : 0;
-	if (hasFunctions) [_outer setPosition:total - mapWidth - 250 ofDividerAtIndex:editors];
+	const CGFloat functionWidth = hasFunctions ? 250 : 0;
+	if (hasPanels) [_outer setPosition:total - mapWidth - functionWidth - 250 ofDividerAtIndex:editors];
+	if (hasFunctions) [_outer setPosition:total - mapWidth - 250 ofDividerAtIndex:hasPanels ? editors + 1 : editors];
 	if (hasMap) [_outer setPosition:total - mapWidth ofDividerAtIndex:views.count - 2];
 }
 
@@ -632,6 +986,94 @@ struct MacHost : Host {
 - (void)tabBar:(TabBar *)bar didSelectIndex:(NSInteger)index { _workspace->clickTab([self paneOf:bar], static_cast<int>(index)); }
 - (void)tabBar:(TabBar *)bar didRequestCloseIndex:(NSInteger)index { _workspace->closeTab([self paneOf:bar], static_cast<int>(index)); }
 - (void)tabBar:(TabBar *)bar didMoveIndex:(NSInteger)from toIndex:(NSInteger)to { _workspace->moveTab([self paneOf:bar], static_cast<int>(from), static_cast<int>(to)); }
+- (void)tabBar:(TabBar *)bar didHoverIndex:(NSInteger)index { _workspace->tabHovered([self paneOf:bar], static_cast<int>(index)); }
+
+- (void)tabBar:(TabBar *)bar didTogglePinIndex:(NSInteger)index {
+	_workspace->run(Cmd::TabPin, [self paneOf:bar] * 10000 + static_cast<int>(index));
+}
+
+- (void)tabBarDidRequestList:(TabBar *)bar sender:(NSButton *)button {
+	NSMenu *menu = [NSMenu new];
+	for (const MenuItem &item : _workspace->dynamicMenu(MenuItem::Dynamic::Documents)) [menu addItem:[self nativeItem:item]];
+	[menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, NSHeight(button.bounds)) inView:button];
+}
+
+- (void)tabBarDidRequestCloseActive:(TabBar *)bar {
+	_workspace->paneFocused([self paneOf:bar]);
+	_workspace->run(Cmd::Close);
+}
+
+- (void)hostFocusPanel:(int)panel {
+	NSView *target = panel == omapad::kPanelFolders ? _folderPanel.focusTarget : panel == omapad::kPanelFunctions ? _functionPanel.focusTarget : panel >= 0 && panel < omapad::kPanelCount ? _panels[panel].focusTarget : nil;
+	if (target) [_window makeFirstResponder:target];
+}
+
+- (void)hostSelectFolderPath:(NSString *)path { [_folderPanel selectPath:path]; }
+
+- (void)hostSetWindowX:(long)x y:(long)y {
+	const NSRect frame = _window.frame;
+	const NSRect screen = (_window.screen ?: NSScreen.mainScreen).frame;
+	// Notepad++ counts from the top left, and macOS from the bottom left.
+	[_window setFrameTopLeftPoint:NSMakePoint(x >= 0 ? NSMinX(screen) + x : NSMinX(frame), y >= 0 ? NSMaxY(screen) - y : NSMaxY(frame))];
+}
+
+#pragma mark System tray
+
+- (void)hostSetTray:(BOOL)visible {
+	if (!visible) {
+		if (_statusItem) [NSStatusBar.systemStatusBar removeStatusItem:_statusItem];
+		_statusItem = nil;
+		return;
+	}
+	if (_statusItem) return;
+	_statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSSquareStatusItemLength];
+	_statusItem.button.image = [NSImage imageWithSystemSymbolName:@"doc.text" accessibilityDescription:@"omapad"];
+	_statusItem.button.toolTip = @"omapad";
+	NSMenu *menu = [NSMenu new];
+	const auto add = [&](NSString *title, SEL action) {
+		NSMenuItem *item = [menu addItemWithTitle:title action:action keyEquivalent:@""];
+		item.target = self;
+	};
+	add(@"Activate omapad", @selector(trayActivate:));
+	[menu addItem:NSMenuItem.separatorItem];
+	add(@"New", @selector(trayNew:));
+	add(@"New and Paste", @selector(trayNewPaste:));
+	add(@"Open…", @selector(trayOpen:));
+	add(@"Find in Files…", @selector(trayFindInFiles:));
+	[menu addItem:NSMenuItem.separatorItem];
+	add(@"Close Tray Icon", @selector(trayClose:));
+	_statusItem.menu = menu;
+}
+
+- (void)showFromTray {
+	[_window makeKeyAndOrderFront:nil];
+	[NSApp activateIgnoringOtherApps:YES];
+}
+- (void)trayActivate:(id)sender { [self showFromTray]; }
+- (void)trayNew:(id)sender { [self showFromTray]; _workspace->run(Cmd::New); }
+- (void)trayNewPaste:(id)sender { [self showFromTray]; _workspace->run(Cmd::New); _workspace->run(Cmd::Paste); }
+- (void)trayOpen:(id)sender { [self showFromTray]; _workspace->run(Cmd::Open); }
+- (void)trayFindInFiles:(id)sender { [self showFromTray]; _workspace->run(Cmd::ShowFindInFiles); }
+- (void)trayClose:(id)sender { [self showFromTray]; [self hostSetTray:NO]; }
+
+- (void)windowDidMiniaturize:(NSNotification *)note {
+	if (_workspace->settings.pref("systemTray") != "minimize") return;
+	[self hostSetTray:YES];
+	[_window deminiaturize:nil];
+	[_window orderOut:nil];
+}
+
+#pragma mark Edit with omapad
+
+// The Services menu entry, from the Finder and other programs.
+- (void)editWithOmapad:(NSPasteboard *)pasteboard userData:(NSString *)userData error:(NSString **)error {
+	NSArray<NSURL *> *urls = [pasteboard readObjectsForClasses:@[NSURL.class] options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+	NSMutableArray<NSString *> *paths = [NSMutableArray array];
+	for (NSURL *url in urls) [paths addObject:url.path];
+	[self openPaths:paths];
+	[self showFromTray];
+}
+
 - (void)tabBarDidRequestNewTab:(TabBar *)bar {
 	_workspace->paneFocused([self paneOf:bar]);
 	_workspace->createUntitledDocument();
@@ -640,29 +1082,41 @@ struct MacHost : Host {
 	return [self menuFromItems:_workspace->tabMenu([self paneOf:bar], static_cast<int>(index)) title:@""];
 }
 
+- (void)tabBar:(TabBar *)bar didDoubleClickIndex:(NSInteger)index {
+	_workspace->tabDoubleClicked([self paneOf:bar], static_cast<int>(index));
+}
+
 #pragma mark Application
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
+	std::vector<std::string> incoming;
+	NSArray *arguments = NSProcessInfo.processInfo.arguments;
+	for (NSUInteger i = 1; i < arguments.count; i++) {
+		NSString *argument = arguments[i];
+		// AppKit's own "-Key value" pairs aren't for us, but omapad's switches are.
+		if ([argument hasPrefix:@"-Apple"] || [argument hasPrefix:@"-NS"] || [argument hasPrefix:@"-psn"]) {
+			i++;
+			continue;
+		}
+		incoming.push_back(toStd(argument));
+	}
+	const CommandLine line = parseCommandLine(incoming);
+	NSApp.servicesProvider = self;
+	_workspace->prepareCommandLine(line);
 	_workspace->restoreSession();
+	_workspace->afterStartup();
 	[self hostSplitChanged:_workspace->splitVisible() stacked:_workspace->splitStacked()];
 	_launched = YES;
 	[self openPaths:_pendingOpens];
 	[_pendingOpens removeAllObjects];
-	NSArray *arguments = NSProcessInfo.processInfo.arguments;
-	for (NSUInteger i = 1; i < arguments.count; i++) {
-		NSString *argument = arguments[i];
-		if ([argument hasPrefix:@"-"]) {
-			i++;  // AppKit passes "-Key value" pairs here. Neither is a file.
-			continue;
-		}
-		BOOL isDirectory = NO;
-		if (![NSFileManager.defaultManager fileExistsAtPath:argument isDirectory:&isDirectory]) continue;
-		if (isDirectory) _workspace->addFolder(toStd(argument));
-		else _workspace->openPath(toStd(argument));
+	_workspace->applyCommandLine(line);
+	if (line.systemTray) {
+		[_window orderOut:nil];
+	} else {
+		[_window makeKeyAndOrderFront:nil];
+		[self hostFocusPane:_workspace->focusedPane()];
+		[NSApp activateIgnoringOtherApps:YES];
 	}
-	[_window makeKeyAndOrderFront:nil];
-	[self hostFocusPane:_workspace->focusedPane()];
-	[NSApp activateIgnoringOtherApps:YES];
 	_backupTimer = [NSTimer scheduledTimerWithTimeInterval:1 target:self selector:@selector(backupTick:) userInfo:nil repeats:YES];
 }
 
@@ -693,6 +1147,11 @@ struct MacHost : Host {
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender { return YES; }
 
 - (BOOL)windowShouldClose:(NSWindow *)window {
+	if (_workspace->settings.pref("systemTray") == "close") {
+		[self hostSetTray:YES];
+		[_window orderOut:nil];
+		return NO;
+	}
 	[NSApp terminate:nil];
 	return NO;  // Only reached if quitting was cancelled.
 }

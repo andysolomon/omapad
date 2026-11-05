@@ -18,6 +18,8 @@ struct Encoding {
 	const char *name;        // Display name.
 	const char *iconvName;
 	bool bom;
+	const char *group = "";          // The Character Sets submenu it belongs in. Empty for the main list.
+	const char16_t *table = nullptr; // Set for OEM code pages, which not every system's iconv has.
 };
 const std::vector<Encoding> &allEncodings();
 const Encoding *encodingWithIdentifier(const std::string &identifier);
@@ -35,6 +37,10 @@ bool decodeAs(const std::string &bytes, const Encoding *encoding, std::string &u
 // Returns false if any character can't be represented. Callers must never silently lose text.
 bool encode(const std::string &utf8, const Encoding *encoding, std::string &bytesOut);
 bool isValidUtf8(const char *bytes, size_t length);
+// What a statistical detector makes of bytes that aren't Unicode. Null if it has no useful answer.
+const Encoding *detectLegacyEncoding(const std::string &bytes);
+// What an XML declaration or HTML meta tag says the file is. Null if it says nothing.
+const Encoding *declaredEncoding(const std::string &bytes);
 
 enum class LineOp {
 	SortLexAsc, SortLexDesc, SortFoldAsc, SortFoldDesc,
@@ -44,6 +50,7 @@ enum class LineOp {
 	RemoveDuplicates, RemoveConsecutiveDuplicates,
 	RemoveEmpty, RemoveBlank,
 	TrimTrailing, TrimLeading, TrimBoth,
+	SortLocaleAsc, SortLocaleDesc,
 };
 // Applies `op` to the lines of `text`. A final line ending stays final rather than
 // being treated as an empty line, so sorting never moves it to the top.
@@ -58,6 +65,10 @@ std::string convertCase(const std::string &text, CaseOp op);
 // Turns \n \r \t \0 \\ \a \b \f \v \xHH \dNNN \oNNN \uNNNN into characters for Extended
 // search mode. Invalid or incomplete sequences stay literal.
 std::string unescapeExtended(const std::string &text);
+
+// Formats a time with Notepad++'s date tokens: yyyy MM MMM MMMM dd ddd dddd HH hh mm ss tt.
+std::string formatDateTime(const std::string &format, long long secondsSinceEpoch);
+std::string percentEncode(const std::string &text);
 
 // Comments or uncomments lines. If every non-blank line is already commented it
 // uncomments them, otherwise it comments them. Blank lines are left alone.

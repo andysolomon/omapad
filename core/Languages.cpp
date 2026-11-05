@@ -48,6 +48,8 @@ ThemeStyle parseStyle(const pugi::xml_node &e) {
 	style.bg = e.attribute("bgColor").as_string();
 	const std::string fontStyle = e.attribute("fontStyle").as_string();
 	style.fontStyle = fontStyle.empty() ? -1 : e.attribute("fontStyle").as_int();
+	style.fontName = e.attribute("fontName").as_string();
+	style.fontSize = e.attribute("fontSize").as_int();
 	return style;
 }
 
@@ -326,16 +328,136 @@ const Language *LanguageCatalog::languageForFirstLine(const std::string &line) c
 }
 
 const Theme *LanguageCatalog::themeNamed(const std::string &name) const {
-	if (name.empty()) return defaultTheme.get();
+	if (name.empty()) {
+		// The default theme can be edited too, which leaves a personal copy called Default.
+		if (!personalThemes.empty() && fs::exists(fs::path(personalThemes) / "Default.xml")) {
+			const auto personal = loadedThemes.find("Default");
+			if (personal != loadedThemes.end() && personal->second) return personal->second.get();
+			auto theme = loadThemeFile((fs::path(personalThemes) / "Default.xml").string());
+			if (theme) {
+				const Theme *result = theme.get();
+				loadedThemes["Default"] = std::move(theme);
+				return result;
+			}
+		}
+		return defaultTheme.get();
+	}
 	if (name == "Omarchy" && omarchyTheme) return omarchyTheme.get();
 	const auto found = loadedThemes.find(name);
 	if (found != loadedThemes.end()) return found->second ? found->second.get() : defaultTheme.get();
 	// Names come from a directory listing or settings, so never let one leave the folder.
 	const std::string safe = fs::path(name).filename().string();
-	auto theme = loadThemeFile((fs::path(directory) / "themes" / (safe + ".xml")).string());
+	std::unique_ptr<Theme> theme;
+	if (!personalThemes.empty()) theme = loadThemeFile((fs::path(personalThemes) / (safe + ".xml")).string());
+	if (!theme) theme = loadThemeFile((fs::path(directory) / "themes" / (safe + ".xml")).string());
 	const Theme *result = theme ? theme.get() : defaultTheme.get();
 	loadedThemes[name] = std::move(theme);
 	return result;
+}
+
+void LanguageCatalog::setPersonalThemeFolder(const std::string &folder) {
+	personalThemes = folder;
+	loadedThemes.clear();
+	std::error_code error;
+	for (const auto &entry : fs::directory_iterator(folder, error)) {
+		if (entry.path().extension() != ".xml") continue;
+		const std::string name = entry.path().stem().string();
+		if (name != "Default" && std::find(themes.begin(), themes.end(), name) == themes.end()) themes.push_back(name);
+	}
+	std::sort(themes.begin(), themes.end(), [](const std::string &a, const std::string &b) { return lowercase(a) < lowercase(b); });
+}
+
+std::vector<ThemeStyle> LanguageCatalog::editableStyles(const std::string &themeName, const std::string &lexer) const {
+	const Theme *theme = themeNamed(themeName == "Default" ? std::string() : themeName);
+	std::vector<ThemeStyle> out;
+	if (!theme) return out;
+	if (lexer == "global") {
+		for (const auto &widget : theme->widgets) out.push_back(widget.second);
+		return out;
+	}
+	const auto found = theme->lexers.find(lexer);
+	if (found != theme->lexers.end()) out = found->second;
+	return out;
+}
+
+bool LanguageCatalog::saveStyles(const std::string &themeName, const std::string &lexer, const std::vector<ThemeStyle> &styles, std::string &error) {
+	if (personalThemes.empty()) {
+		error = "There's no folder to keep it in.";
+		return false;
+	}
+	std::error_code fsError;
+	fs::create_directories(personalThemes, fsError);
+	const std::string safe = fs::path(themeName).filename().string();
+	const fs::path personal = fs::path(personalThemes) / (safe + ".xml");
+	pugi::xml_document doc;
+	bool loaded = doc.load_file(personal.c_str());
+	if (!loaded) loaded = doc.load_file((safe == "Default" ? fs::path(directory) / "stylers.model.xml" : fs::path(directory) / "themes" / (safe + ".xml")).c_str());
+	if (!loaded) {
+		error = "The theme file could not be read.";
+		return false;
+	}
+	pugi::xml_node root = doc.first_element_by_path("NotepadPlus");
+	const auto write = [](pugi::xml_node node, const ThemeStyle &style) {
+		const auto set = [&](const char *name, const std::string &value) {
+			pugi::xml_attribute attribute = node.attribute(name);
+			if (!attribute) attribute = node.append_attribute(name);
+			attribute.set_value(value.c_str());
+		};
+		if (!style.fg.empty()) set("fgColor", style.fg);
+		if (!style.bg.empty()) set("bgColor", style.bg);
+		if (style.fontStyle >= 0) set("fontStyle", std::to_string(style.fontStyle));
+		set("fontName", style.fontName);
+		set("fontSize", style.fontSize > 0 ? std::to_string(style.fontSize) : std::string());
+	};
+	if (lexer == "global") {
+		for (const ThemeStyle &style : styles)
+			write(root.child("GlobalStyles").find_child_by_attribute("WidgetStyle", "name", style.name.c_str()), style);
+	} else {
+		pugi::xml_node type = root.child("LexerStyles").find_child_by_attribute("LexerType", "name", lexer.c_str());
+		for (const ThemeStyle &style : styles)
+			write(type.find_child_by_attribute("WordsStyle", "styleID", std::to_string(style.styleID).c_str()), style);
+	}
+	if (!doc.save_file(personal.c_str())) {
+		error = "The theme file could not be written.";
+		return false;
+	}
+	loadedThemes.erase(safe);
+	if (safe != "Default" && std::find(themes.begin(), themes.end(), safe) == themes.end()) themes.push_back(safe);
+	return true;
+}
+
+bool LanguageCatalog::importTheme(const std::string &path, std::string &error) {
+	pugi::xml_document doc;
+	if (!doc.load_file(path.c_str()) || !doc.first_element_by_path("NotepadPlus/LexerStyles")) {
+		error = "It isn't a Notepad++ theme file.";
+		return false;
+	}
+	std::error_code fsError;
+	fs::create_directories(personalThemes, fsError);
+	const std::string name = fs::path(path).stem().string();
+	if (!doc.save_file((fs::path(personalThemes) / (name + ".xml")).c_str())) {
+		error = "The theme file could not be written.";
+		return false;
+	}
+	loadedThemes.erase(name);
+	if (std::find(themes.begin(), themes.end(), name) == themes.end()) themes.push_back(name);
+	std::sort(themes.begin(), themes.end(), [](const std::string &a, const std::string &b) { return lowercase(a) < lowercase(b); });
+	return true;
+}
+
+void LanguageCatalog::setLanguageCustomisation(const std::map<std::string, std::string> &extensions, const std::map<std::string, std::string> &keywords) {
+	extraExtensions = extensions;
+	extraKeywords = keywords;
+	for (const auto &entry : extensions) {
+		const auto language = languagesByName.find(entry.first);
+		if (language == languagesByName.end()) continue;
+		std::istringstream words(lowercase(entry.second));
+		std::string word;
+		while (words >> word) {
+			languagesByExtension[word] = language->second;
+			builtinExtensions[word] = language->second;
+		}
+	}
 }
 
 void LanguageCatalog::setOmarchyPalette(const Palette &p) {
@@ -421,6 +543,11 @@ void LanguageCatalog::applyStyle(const ThemeStyle &style, SciView &view) const {
 		view.send(SCI_STYLESETITALIC, id, (style.fontStyle & 2) != 0);
 		view.send(SCI_STYLESETUNDERLINE, id, (style.fontStyle & 4) != 0);
 	}
+	// A theme's Default Style names a Windows font. The editor font in Preferences wins over that one.
+	if (id != STYLE_DEFAULT) {
+		if (!style.fontName.empty()) view.send(SCI_STYLESETFONT, id, reinterpret_cast<intptr_t>(style.fontName.c_str()));
+		if (style.fontSize > 0) view.send(SCI_STYLESETSIZE, id, style.fontSize);
+	}
 }
 
 void LanguageCatalog::applyLexerStyles(const std::string &lexer, const Theme &theme, SciView &view) const {
@@ -505,6 +632,32 @@ void LanguageCatalog::apply(const Language &language, SciView &view, const std::
 	}
 	for (const char *property : {"fold", "fold.comment", "fold.preprocessor"}) setProperty(property, "1");
 	setProperty("fold.compact", "0");
+	const auto extra = extraKeywords.find(name);
+	if (extra != extraKeywords.end() && !extra->second.empty()) {
+		const std::string *words = own("instre1");
+		const std::string combined = (words ? *words + " " : std::string()) + extra->second;
+		setKeywords(&combined, cppFamily.count(name) ? 0 : htmlFamily.count(name) ? 0 : 0);
+	}
+
+	if (globalOverride.any()) {
+		const auto found = theme.widgets.find("Global override");
+		if (found != theme.widgets.end()) {
+			const ThemeStyle &style = found->second;
+			int colour = 0;
+			for (int id = 0; id <= STYLE_LASTPREDEFINED + 200 && id < 256; id++) {
+				if (id >= STYLE_LINENUMBER && id <= STYLE_LASTPREDEFINED) continue;
+				if (globalOverride.fg && parseColour(style.fg, &colour)) view.send(SCI_STYLESETFORE, id, colour);
+				if (globalOverride.bg && parseColour(style.bg, &colour)) view.send(SCI_STYLESETBACK, id, colour);
+				if (globalOverride.font) view.send(SCI_STYLESETFONT, id, reinterpret_cast<intptr_t>(fontName.c_str()));
+				if (globalOverride.size) view.send(SCI_STYLESETSIZEFRACTIONAL, id, static_cast<intptr_t>(fontSize * SC_FONT_SIZE_MULTIPLIER));
+				if (style.fontStyle >= 0) {
+					if (globalOverride.bold) view.send(SCI_STYLESETBOLD, id, (style.fontStyle & 1) != 0);
+					if (globalOverride.italic) view.send(SCI_STYLESETITALIC, id, (style.fontStyle & 2) != 0);
+					if (globalOverride.underline) view.send(SCI_STYLESETUNDERLINE, id, (style.fontStyle & 4) != 0);
+				}
+			}
+		}
+	}
 
 	applyChrome(theme, view);
 }

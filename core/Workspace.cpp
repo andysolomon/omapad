@@ -1,4 +1,4 @@
-#include "Workspace.h"
+#include "WorkspaceInternal.h"
 
 #include "SciLexer.h"
 #include "Scintilla.h"
@@ -29,15 +29,6 @@ namespace omapad {
 
 namespace {
 
-const int kMarginNumber = 0;
-const int kMarginBookmark = 1;
-const int kMarginFold = 2;
-const int kMarginHistory = 3;
-const int kMarkerBookmark = 20;  // Change history uses markers 21 to 24.
-const int kIndicatorMap = 19;    // The Document Map's visible range. Only the map draws it.
-const int kIndicatorSmart = 30;
-const int kIndicatorMark = 31;
-
 // Beyond this a text editor stops being the right tool, and loading could exhaust memory.
 const unsigned long long kMaxOpenBytes = 2ULL * 1024 * 1024 * 1024;
 const unsigned long long kMaxSearchBytes = 256ULL * 1024 * 1024;
@@ -52,6 +43,47 @@ bool fileMTime(const std::string &path, int64_t &out) {
 	out = static_cast<int64_t>(time.time_since_epoch().count());
 	return true;
 }
+
+
+std::string randomId() {
+	static const char *hex = "0123456789abcdef";
+	std::ifstream random("/dev/urandom", std::ios::binary);
+	std::string id;
+	for (int i = 0; i < 16; i++) {
+		char c = 0;
+		random.get(c);
+		id += hex[(c >> 4) & 0xF];
+		id += hex[c & 0xF];
+	}
+	return id;
+}
+
+bool validName(const std::string &name, std::string &error) {
+	if (name.empty() || name == "." || name == ".." || name.find('/') != std::string::npos || name.find('\0') != std::string::npos) {
+		error = "That isn't a valid name.";
+		return false;
+	}
+	return true;
+}
+
+// Cuts at a character boundary, so a long result line never ends in half a character.
+std::string truncateUtf8(const std::string &text, size_t limit) {
+	if (text.size() <= limit) return text;
+	size_t end = limit;
+	while (end > 0 && (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80) end--;
+	return text.substr(0, end) + "…";
+}
+
+size_t utf8Size(char32_t cp) {
+	if (cp < 0x80) return 1;
+	if (cp < 0x800) return 2;
+	if (cp < 0x10000) return 3;
+	return 4;
+}
+
+}  // namespace
+
+#pragma mark - Helpers shared with Features.cpp
 
 std::string baseName(const std::string &path) { return fs::path(path).filename().string(); }
 std::string directoryOf(const std::string &path) { return fs::path(path).parent_path().string(); }
@@ -145,119 +177,11 @@ bool atomicWrite(const std::string &bytes, const std::string &rawPath, int mode,
 	return ok;
 }
 
-std::string randomId() {
-	static const char *hex = "0123456789abcdef";
-	std::ifstream random("/dev/urandom", std::ios::binary);
-	std::string id;
-	for (int i = 0; i < 16; i++) {
-		char c = 0;
-		random.get(c);
-		id += hex[(c >> 4) & 0xF];
-		id += hex[c & 0xF];
-	}
-	return id;
-}
-
-std::string jsonString(const json &j, const char *key, const std::string &fallback = std::string()) {
-	const auto found = j.find(key);
-	return (found != j.end() && found->is_string()) ? found->get<std::string>() : fallback;
-}
-
-long jsonLong(const json &j, const char *key, long fallback = 0) {
-	const auto found = j.find(key);
-	return (found != j.end() && found->is_number_integer()) ? found->get<long>() : fallback;
-}
-
-bool jsonBool(const json &j, const char *key, bool fallback = false) {
-	const auto found = j.find(key);
-	return (found != j.end() && found->is_boolean()) ? found->get<bool>() : fallback;
-}
-
-std::vector<std::string> jsonStrings(const json &j, const char *key) {
-	std::vector<std::string> out;
-	const auto found = j.find(key);
-	if (found != j.end() && found->is_array())
-		for (const json &value : *found)
-			if (value.is_string()) out.push_back(value.get<std::string>());
-	return out;
-}
-
-bool validName(const std::string &name, std::string &error) {
-	if (name.empty() || name == "." || name == ".." || name.find('/') != std::string::npos || name.find('\0') != std::string::npos) {
-		error = "That isn't a valid name.";
-		return false;
-	}
-	return true;
-}
-
-// Cuts at a character boundary, so a long result line never ends in half a character.
-std::string truncateUtf8(const std::string &text, size_t limit) {
-	if (text.size() <= limit) return text;
-	size_t end = limit;
-	while (end > 0 && (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80) end--;
-	return text.substr(0, end) + "…";
-}
-
-size_t utf8Size(char32_t cp) {
-	if (cp < 0x80) return 1;
-	if (cp < 0x800) return 2;
-	if (cp < 0x10000) return 3;
-	return 4;
-}
-
-}  // namespace
-
 #pragma mark - Model
-
-struct Document {
-	intptr_t sciDoc = 0;
-	std::string path, untitledName;
-	const Encoding *encoding = nullptr;
-	Eol eol = Eol::LF;
-	const Language *language = nullptr;
-	bool languageChosen = false;
-	bool modified = false;    // Differs from Scintilla's save point.
-	bool forceDirty = false;  // Unsaved for another reason, like an encoding change.
-	bool hasMtime = false;
-	int64_t mtime = 0;
-	bool missing = false;
-	std::string backupId;
-	unsigned long editGeneration = 0, backupGeneration = 0;
-	bool dirty() const { return modified || forceDirty; }
-	std::string title() const { return path.empty() ? untitledName : baseName(path); }
-};
-
-struct Tab {
-	std::shared_ptr<Document> document;
-	long anchor = 0, caret = 0, firstLine = 0, xOffset = 0;
-	std::vector<long> folds;
-};
-
-struct Pane {
-	std::vector<Tab> tabs;
-	int active = -1;
-	int lineDigits = 0;
-	bool smartActive = false;
-};
-
-struct ResultEntry {
-	std::string path;
-	std::weak_ptr<Document> document;
-	long line = -1, offset = 0, length = 0;
-};
-
-// Points the hidden view at a document for as long as this lives. This reads and changes
-// documents without disturbing what either visible pane is showing.
-struct BackgroundDocument {
-	SciView &view;
-	BackgroundDocument(Host &host, const Document &document) : view(host.backgroundView()) {
-		view.send(SCI_SETDOCPOINTER, 0, document.sciDoc);
-	}
-	~BackgroundDocument() { view.send(SCI_SETDOCPOINTER, 0, 0); }
-};
 
 Workspace::Workspace(Host &h, const std::string &resources, const std::string &settingsDirectory, const std::string &stateDirectory)
 	: host(h), catalog(resources), completion(resources), functionCatalog(resources), settingsDir(settingsDirectory), stateDir(stateDirectory), alive(std::make_shared<bool>(true)) {
+	resourceDir = resources;
 	panes[0] = std::make_unique<Pane>();
 	panes[1] = std::make_unique<Pane>();
 	std::error_code error;
@@ -266,7 +190,31 @@ Workspace::Workspace(Host &h, const std::string &resources, const std::string &s
 	chmod(stateDir.c_str(), 0700);
 	chmod((fs::path(stateDir) / "backup").c_str(), 0700);
 	loadSettings();
+	// Settings can live in a synced folder. The note saying where stays here.
+	{
+		std::ifstream note(fs::path(settingsDir) / "cloud.txt");
+		std::string cloud;
+		std::getline(note, cloud);
+		std::error_code cloudError;
+		if (!cloud.empty() && fs::is_directory(cloud, cloudError)) {
+			homeSettingsDir = settingsDir;
+			settingsDir = cloud;
+			loadSettings();
+		}
+	}
 	catalog.loadUserLanguages(userLanguageFolder());
+	loadMacros();
+	loadRunCommands();
+	syncPrefsToFields();
+	catalog.setPersonalThemeFolder((fs::path(settingsDir) / "themes").string());
+	applyGlobalOverride();
+	applyLanguageCustomisation();
+	loadPlugins();
+	loadMenuLanguage();
+	for (ProjectPanel &project : projectPanels) {
+		project.root.name = "Workspace";
+		project.root.expanded = true;
+	}
 }
 
 Workspace::~Workspace() {
@@ -390,6 +338,22 @@ void Workspace::loadSettings() {
 	printMargin("printMarginBottom", settings.printMarginBottom);
 	printMargin("printMarginLeft", settings.printMarginLeft);
 	printMargin("printMarginRight", settings.printMarginRight);
+	settings.dateTimeFormat = jsonString(j, "dateTimeFormat", settings.dateTimeFormat);
+	settings.dateTimeReverse = jsonBool(j, "dateTimeReverse", settings.dateTimeReverse);
+	settings.searchEngine = jsonString(j, "searchEngine", settings.searchEngine);
+	settings.updateProxy = jsonString(j, "updateProxy", settings.updateProxy);
+	settings.sessionExtension = jsonString(j, "sessionExtension", settings.sessionExtension);
+	settings.showNonPrinting = jsonBool(j, "showNonPrinting", settings.showNonPrinting);
+	settings.showControlChars = jsonBool(j, "showControlChars", settings.showControlChars);
+	settings.npcCodepoint = jsonBool(j, "npcCodepoint", settings.npcCodepoint);
+	settings.syncZoom = jsonBool(j, "syncZoom", settings.syncZoom);
+	settings.switcherMru = jsonBool(j, "switcherMru", settings.switcherMru);
+	settings.folderDropOpensFiles = jsonBool(j, "folderDropOpensFiles", settings.folderDropOpensFiles);
+	settings.tabHide = jsonBool(j, "tabHide", settings.tabHide);
+	const auto savedPrefs = j.find("prefs");
+	if (savedPrefs != j.end() && savedPrefs->is_object())
+		for (const auto &entry : savedPrefs->items())
+			if (entry.value().is_string()) settings.prefs[entry.key()] = entry.value().get<std::string>();
 }
 
 void Workspace::saveSettings() const {
@@ -439,6 +403,19 @@ void Workspace::saveSettings() const {
 	j["printMarginBottom"] = settings.printMarginBottom;
 	j["printMarginLeft"] = settings.printMarginLeft;
 	j["printMarginRight"] = settings.printMarginRight;
+	j["dateTimeFormat"] = settings.dateTimeFormat;
+	j["dateTimeReverse"] = settings.dateTimeReverse;
+	j["searchEngine"] = settings.searchEngine;
+	j["updateProxy"] = settings.updateProxy;
+	j["sessionExtension"] = settings.sessionExtension;
+	j["showNonPrinting"] = settings.showNonPrinting;
+	j["showControlChars"] = settings.showControlChars;
+	j["npcCodepoint"] = settings.npcCodepoint;
+	j["syncZoom"] = settings.syncZoom;
+	j["switcherMru"] = settings.switcherMru;
+	j["folderDropOpensFiles"] = settings.folderDropOpensFiles;
+	j["tabHide"] = settings.tabHide;
+	j["prefs"] = settings.prefs;
 	std::string error;
 	atomicWrite(j.dump(1, '\t', false, json::error_handler_t::replace), (fs::path(settingsDir) / "settings.json").string(), 0600, error);
 }
@@ -460,6 +437,9 @@ void Workspace::configureView(int pane) {
 	v.send(SCI_SETMARGINS, 4);
 	v.send(SCI_SETMARGINTYPEN, kMarginHistory, SC_MARGIN_SYMBOL);
 	v.send(SCI_SETMARGINMASKN, kMarginHistory, 0xF << SC_MARKNUM_HISTORY_REVERTED_TO_ORIGIN);
+	v.send(SCI_SETMARGINMASKN, kMarginBookmark, (1 << kMarkerBookmark) | (1 << kMarkerHiddenBegin) | (1 << kMarkerHiddenEnd));
+	v.send(SCI_MARKERDEFINE, kMarkerHiddenBegin, SC_MARK_ARROWDOWN);
+	v.send(SCI_MARKERDEFINE, kMarkerHiddenEnd, SC_MARK_ARROW);
 	v.send(SCI_MARKERDEFINE, kMarkerBookmark, SC_MARK_BOOKMARK);
 	v.send(SCI_MARKERSETBACK, kMarkerBookmark, 0xD07020);
 	v.send(SCI_MARKERSETFORE, kMarkerBookmark, 0xD07020);
@@ -480,6 +460,7 @@ void Workspace::configureView(int pane) {
 	v.send(SCI_SETSCROLLWIDTH, 1);
 	v.send(SCI_SETSCROLLWIDTHTRACKING, 1);
 	v.send(SCI_SETMODEVENTMASK, SC_MOD_INSERTTEXT | SC_MOD_DELETETEXT);
+	v.send(SCI_USEPOPUP, SC_POPUP_NEVER);
 	v.send(SCI_INDICSETSTYLE, kIndicatorMap, INDIC_HIDDEN);
 	for (int indicator : {kIndicatorSmart, kIndicatorMark, 25, 24, 23, 22, 21}) {
 		v.send(SCI_INDICSETSTYLE, indicator, INDIC_ROUNDBOX);
@@ -509,6 +490,8 @@ void Workspace::applyViewPreferences(int pane) {
 	if (!settings.matchBraces) v.send(SCI_BRACEHIGHLIGHT, INVALID_POSITION, INVALID_POSITION);
 	paneAt(pane).lineDigits = 0;
 	updateLineNumberMargin(pane);
+	applyExtraViewPreferences(pane);
+	applyScintillaShortcuts(pane);
 }
 
 void Workspace::applyChangeHistoryTo(SciView &target) {
@@ -540,6 +523,41 @@ bool Workspace::themeIsDark() const { return catalog.themeIsDark(effectiveTheme(
 
 ChromeColors Workspace::chromeColors() const {
 	ChromeColors c;
+	// A dark tone tints the window, whatever the editor's theme is.
+	const std::string tone = settings.pref("darkTone");
+	if (!tone.empty() && tone != "none") {
+		static const std::map<std::string, std::array<const char *, 5>> tones = {
+			{"black", {"000000", "1A1A1A", "333333", "0A0A0A", "2A2A2A"}},
+			{"red", {"2A1215", "3F1B20", "6B2C33", "1E0D0F", "4A2228"}},
+			{"green", {"122A16", "1B3F21", "2C6B36", "0D1E10", "224A29"}},
+			{"blue", {"12202A", "1B303F", "2C506B", "0D171E", "22394A"}},
+			{"purple", {"20122A", "301B3F", "502C6B", "170D1E", "39224A"}},
+			{"cyan", {"122A2A", "1B3F3F", "2C6B6B", "0D1E1E", "224A4A"}},
+			{"olive", {"26280F", "393C17", "5F6426", "1B1C0B", "43461C"}},
+		};
+		const auto hex = [](const std::string &value) {
+			return value.size() == 6 && value.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos;
+		};
+		const auto found = tones.find(tone);
+		if (found != tones.end()) {
+			c.valid = true;
+			c.background = found->second[0];
+			c.lighterBackground = found->second[4];
+			c.selection = found->second[2];
+			c.darkBackground = found->second[3];
+			c.foreground = "E6E6E6";
+			c.dim = "A0A0A0";
+			c.accent = found->second[2];
+			return c;
+		}
+		if (tone == "custom" && hex(settings.pref("darkToneBackground"))) {
+			c.valid = true;
+			c.background = settings.pref("darkToneBackground");
+			c.lighterBackground = c.selection = c.darkBackground = c.accent = c.background;
+			c.foreground = c.dim = hex(settings.pref("darkToneText")) ? settings.pref("darkToneText") : std::string("E6E6E6");
+			return c;
+		}
+	}
 	if (effectiveTheme() != "Omarchy" || !palette.valid()) return c;
 	c.valid = true;
 	c.background = palette.get("background");
@@ -599,8 +617,21 @@ void Workspace::applyLanguageTo(int pane) {
 	if (!settings.highlightCurrentLine) view(pane).send(SCI_SETCARETLINEVISIBLE, 0);
 	const int tabWidth = document.language->tabSize > 0 ? document.language->tabSize : settings.tabWidth;
 	const bool spaces = document.language->tabSize > 0 ? document.language->tabsToSpaces : settings.tabsToSpaces;
-	view(pane).send(SCI_SETTABWIDTH, tabWidth);
-	view(pane).send(SCI_SETUSETABS, !spaces);
+	int customWidth = tabWidth;
+	bool customSpaces = spaces;
+	std::istringstream languageTabs(settings.pref("languageTabs"));
+	std::string languageTab;
+	while (languageTabs >> languageTab) {
+		const size_t equals = languageTab.find('=');
+		if (equals == std::string::npos || languageTab.substr(0, equals) != document.language->name) continue;
+		const int width = std::atoi(languageTab.c_str() + equals + 1);
+		if (width > 0) customWidth = width;
+		customSpaces = languageTab.back() == 's';
+	}
+	view(pane).send(SCI_SETTABWIDTH, customWidth);
+	view(pane).send(SCI_SETUSETABS, !customSpaces);
+	if (document.language->name == "sql")
+		view(pane).send(SCI_SETPROPERTY, reinterpret_cast<uintptr_t>("sql.backslash.escapes"), reinterpret_cast<intptr_t>(settings.prefOn("sqlBackslash") ? "1" : "0"));
 	p.lineDigits = 0;
 	updateLineNumberMargin(pane);
 }
@@ -633,6 +664,7 @@ void Workspace::updateLineNumberMargin(int pane) {
 		digits++;
 	}
 	if (digits < 3) digits = 3;
+	if (settings.pref("lineNumberWidth") == "constant") digits = std::max(digits, 6);
 	Pane &p = paneAt(pane);
 	if (digits == p.lineDigits) return;
 	p.lineDigits = digits;
@@ -702,6 +734,7 @@ void Workspace::activate(int pane, int index) {
 	SciView &v = view(pane);
 	v.send(SCI_SETDOCPOINTER, 0, tab.document->sciDoc);
 	p.active = index;
+	notifyPlugins("tabChanged", tab.document->path);
 	v.send(SCI_SETCODEPAGE, SC_CP_UTF8);
 	v.send(SCI_SETEOLMODE, static_cast<int>(tab.document->eol));
 	applyLanguageTo(pane);
@@ -710,16 +743,22 @@ void Workspace::activate(int pane, int index) {
 	v.send(SCI_SETFIRSTVISIBLELINE, v.send(SCI_VISIBLEFROMDOCLINE, tab.firstLine));
 	v.send(SCI_SETXOFFSET, tab.xOffset);
 	p.smartActive = false;
+	for (const auto &range : tab.hiddenLines) v.send(SCI_HIDELINES, range.first, range.second);
+	v.send(SCI_SETBIDIRECTIONAL, tab.document->rightToLeft ? SC_BIDIRECTIONAL_R2L : SC_BIDIRECTIONAL_DISABLED);
 	if (pane == focus) {
 		hint.active = false;
 		syncDocumentMap(true);
 		functionsPending = 1;
+		noteTabUsed();
 	}
 	refreshChrome();
 }
 
 void Workspace::createUntitledDocument() {
-	addTab(focus, addDocument());
+	std::shared_ptr<Document> created = addDocument();
+	const std::string defaultLanguage = settings.pref("defaultLanguage");
+	if (!defaultLanguage.empty()) created->language = catalog.languageNamed(defaultLanguage);
+	addTab(focus, created);
 	activate(focus, static_cast<int>(paneAt(focus).tabs.size()) - 1);
 	host.focusPane(focus);
 }
@@ -738,8 +777,12 @@ void Workspace::updateStatus() {
 	const long start = s(SCI_GETSELECTIONSTART);
 	const long end = s(SCI_GETSELECTIONEND);
 	const long selected = end > start ? s(SCI_COUNTCHARACTERS, start, end) : 0;
+	const long selectedLines = end > start ? s(SCI_LINEFROMPOSITION, end) - s(SCI_LINEFROMPOSITION, start) + 1 : 0;
 	std::string left = document->language->displayName + "    length: " + std::to_string(s(SCI_GETLENGTH)) + "    lines: " + std::to_string(s(SCI_GETLINECOUNT));
-	std::string right = "Ln " + std::to_string(line + 1) + ", Col " + std::to_string(column + 1) + ", Sel " + std::to_string(selected) + "    " +
+	const long ranges = s(SCI_GETSELECTIONS);
+	std::string selection = "Sel " + std::to_string(selected) + " | " + std::to_string(selectedLines);
+	if (ranges > 1) selection = "Sel " + std::to_string(ranges) + " : " + std::to_string(selected);
+	std::string right = "Ln " + std::to_string(line + 1) + ", Col " + std::to_string(column + 1) + ", Pos " + std::to_string(position) + ", " + selection + "    " +
 		eolName(document->eol) + "    " + document->encoding->name + "    " + (s(SCI_GETOVERTYPE) ? "OVR" : "INS");
 	host.statusChanged(left, right);
 }
@@ -753,12 +796,41 @@ std::vector<TabInfo> Workspace::tabs(int pane) const {
 		info.title = tab.document->title();
 		info.toolTip = tab.document->path.empty() ? tab.document->title() : tab.document->path;
 		info.dirty = tab.document->dirty();
+		info.monitoring = tab.document->monitoring;
+		{
+			BackgroundDocument background(host, *tab.document);
+			info.readOnly = background.view.send(SCI_GETREADONLY) != 0;
+		}
+		info.pinned = tab.pinned;
+		info.colour = tab.colour;
+		if (tab.document->path.empty() && settings.prefOn("firstLineTitle")) {
+			const std::string text = textOf(*tab.document);
+			const std::string line = text.substr(0, text.find_first_of("\r\n"));
+			if (!line.empty()) info.title = line.substr(0, 60);
+		}
+		const long maxLabel = settings.prefInt("tabMaxLabel");
+		if (maxLabel > 0 && static_cast<long>(info.title.size()) > maxLabel) info.title = truncateUtf8(info.title, static_cast<size_t>(maxLabel));
+		if (settings.prefOn("peekTab")) {
+			std::string text = textOf(*tab.document).substr(0, 1200);
+			info.toolTip += "\n\n" + text;
+		}
 		out.push_back(info);
 	}
 	return out;
 }
 
 int Workspace::activeTab(int pane) const { return paneAt(pane).active; }
+
+void Workspace::tabHovered(int pane, int index) {
+	if (!settings.prefOn("peekMap") || !mapVisible) return;
+	if (pane < 0 || pane > 1 || index < 0 || index >= static_cast<int>(paneAt(pane).tabs.size())) {
+		syncDocumentMap(true);
+		return;
+	}
+	const intptr_t document = paneAt(pane).tabs[static_cast<size_t>(index)].document->sciDoc;
+	host.mapView().send(SCI_SETDOCPOINTER, 0, document);
+	mapDocument = document;
+}
 
 void Workspace::paneFocused(int pane) {
 	if (pane < 0 || pane > 1 || paneAt(pane).tabs.empty() || pane == focus) return;
@@ -828,13 +900,32 @@ bool Workspace::closeTab(int pane, int index) {
 	if (document->dirty() && !documentOpenElsewhere(document.get(), pane, index)) {
 		focus = pane;
 		activate(pane, index);
-		const int choice = host.ask("Save changes to “" + document->title() + "”?",
-		                            "Your changes will be lost if you don't save them.",
-		                            {"Save", "Cancel", "Don't Save"});
-		if (choice == 1) return false;
-		if (choice == 0 && !saveActive()) return false;
+		if (closeAllDecision == 1) {
+			if (!saveActive()) return false;
+		} else if (closeAllDecision == 0) {
+			std::vector<std::string> buttons = {"Save", "Cancel", "Don't Save"};
+			if (closingSeveral) {
+				buttons.push_back("Save All");
+				buttons.push_back("Don't Save Any");
+			}
+			const int choice = host.ask("Save changes to “" + document->title() + "”?", "Your changes will be lost if you don't save them.", buttons);
+			if (choice == 1) return false;
+			if (choice == 3) closeAllDecision = 1;
+			if (choice == 4) closeAllDecision = 2;
+			if ((choice == 0 || choice == 3) && !saveActive()) return false;
+		}
 	}
+	if (!document->path.empty()) {
+		recentlyClosed.erase(std::remove(recentlyClosed.begin(), recentlyClosed.end(), document->path), recentlyClosed.end());
+		recentlyClosed.push_back(document->path);
+		if (recentlyClosed.size() > 50) recentlyClosed.erase(recentlyClosed.begin());
+	}
+	notifyPlugins("fileClosed", document->path);
 	// The first view always has a tab, so its last one is replaced by a new empty document.
+	if (pane == 0 && p.tabs.size() == 1 && paneAt(1).tabs.empty() && settings.prefOn("tabExitOnLast")) {
+		host.quit();
+		return true;
+	}
 	if (pane == 0 && p.tabs.size() == 1) addTab(0, addDocument());
 	if (p.tabs.size() == 1) {
 		detachPane(pane);
@@ -858,15 +949,23 @@ bool Workspace::closeTab(int pane, int index) {
 bool Workspace::closeActive() { return closeTab(focus, paneAt(focus).active); }
 
 void Workspace::closeTabs(std::vector<std::pair<int, std::shared_ptr<Document>>> targets) {
+	closingSeveral = targets.size() > 1;
+	closeAllDecision = 0;
 	for (const auto &target : targets) {
 		const auto &list = paneAt(target.first).tabs;
 		for (int i = 0; i < static_cast<int>(list.size()); i++) {
 			if (list[i].document == target.second) {
-				if (!closeTab(target.first, i)) return;
+				if (!closeTab(target.first, i)) {
+					closingSeveral = false;
+					closeAllDecision = 0;
+					return;
+				}
 				break;
 			}
 		}
 	}
+	closingSeveral = false;
+	closeAllDecision = 0;
 }
 
 bool Workspace::moveTabToOtherView(int pane, int index) {
@@ -936,7 +1035,12 @@ std::string Workspace::activeEncodingIdentifier() const { const Document *d = ac
 std::string Workspace::activeLanguageName() const { const Document *d = activeDocument(); return d ? d->language->name : std::string(); }
 bool Workspace::activeIsDirty() const { const Document *d = activeDocument(); return d && d->dirty(); }
 std::string Workspace::activeEolName() const { const Document *d = activeDocument(); return d ? eolName(d->eol) : ""; }
-std::string Workspace::windowTitle() const { return activeTitle(); }
+std::string Workspace::windowTitle() const {
+	const std::string path = activePath();
+	std::string title = settings.prefOn("titleFileOnly") || path.empty() ? activeTitle() : path;
+	if (!titleSuffix.empty()) title += " - " + titleSuffix;
+	return title;
+}
 std::string Workspace::windowPath() const { return activePath(); }
 bool Workspace::windowDirty() const { return activeIsDirty(); }
 
@@ -1030,9 +1134,44 @@ bool Workspace::openPath(const std::string &rawPath) {
 		host.focusPane(openPane);
 		return true;
 	}
+	std::error_code existsError;
+	if (!fs::exists(path, existsError) && offerCreatingMissing) {
+		if (host.ask("“" + path + "” doesn't exist. Create it?", "", {"Cancel", "Create"}) != 1) return false;
+		std::error_code directoryError;
+		fs::create_directories(fs::path(path).parent_path(), directoryError);
+		std::ofstream created(path, std::ios::binary);
+		if (!created) {
+			host.ask("The file could not be created.", path, {"OK"});
+			return false;
+		}
+	}
 	std::string bytes;
 	if (!readFile(path, bytes, true)) return false;
 	Decoded decoded = decodeAuto(bytes);
+	// Bytes that aren't Unicode could be many things, so look closer before settling on Windows-1252.
+	if (settings.prefOn("autoDetectEncoding") && !isUtf8Encoding(decoded.encoding) && !decoded.encoding->bom) {
+		const Encoding *better = declaredEncoding(bytes);
+		if (!better && bytes.size() >= 32) better = detectLegacyEncoding(bytes);
+		std::string text;
+		if (better && better != decoded.encoding && decodeAs(bytes, better, text)) {
+			decoded.utf8 = text;
+			decoded.encoding = better;
+		}
+	}
+	if (!settings.prefOn("autoDetectEncoding")) {
+		const Encoding *chosen = encodingWithIdentifier(settings.defaultEncoding);
+		std::string text;
+		if (chosen && decoded.encoding != chosen && decodeAs(bytes, chosen, text)) {
+			decoded.utf8 = text;
+			decoded.encoding = chosen;
+		}
+	}
+	// A file with nothing but ASCII reads the same in any of them, so it can follow the default.
+	if (settings.prefOn("applyToAnsi") && isUtf8Encoding(decoded.encoding) && !decoded.encoding->bom) {
+		const bool ascii = std::all_of(bytes.begin(), bytes.end(), [](char c) { return static_cast<unsigned char>(c) < 0x80; });
+		const Encoding *chosen = encodingWithIdentifier(settings.defaultEncoding);
+		if (ascii && chosen && !chosen->bom) decoded.encoding = chosen;
+	}
 
 	// A single empty, untouched tab is just a placeholder, so the file takes its place.
 	Document *current = activeDocument();
@@ -1055,13 +1194,22 @@ bool Workspace::openPath(const std::string &rawPath) {
 	Tab &tab = reuse ? *activeTabPointer() : paneAt(focus).tabs.back();
 	tab.anchor = tab.caret = tab.firstLine = tab.xOffset = 0;
 	tab.folds.clear();
+	if (settings.prefOn("largeFile") && bytes.size() >= static_cast<size_t>(settings.prefInt("largeFileMb")) * 1024 * 1024) {
+		document->language = catalog.plainText();
+		host.flash("Large file: syntax highlighting is off");
+	}
 	activate(focus, reuse ? paneAt(focus).active : static_cast<int>(paneAt(focus).tabs.size()) - 1);
+	if (isLargeDocument() && settings.prefOn("largeNoWrap")) s(SCI_SETWRAPMODE, SC_WRAP_NONE);
 	addRecent(path);
+	if (allFilesReadOnly) s(SCI_SETREADONLY, 1);
+	if (allFilesMonitored && !document->monitoring) toggleMonitoring();
+	notifyPlugins("fileOpened", path);
 	host.focusPane(focus);
 	return true;
 }
 
 void Workspace::openFiles(const std::vector<std::string> &paths) {
+	if (paths.size() > 200 && host.ask("Open " + std::to_string(paths.size()) + " files?", "That's a lot to open at once.", {"Cancel", "Open Them"}) != 1) return;
 	for (const std::string &path : paths) openPath(path);
 }
 
@@ -1070,6 +1218,7 @@ bool Workspace::writeFileAtomically(const std::string &bytes, const std::string 
 }
 
 bool Workspace::saveDocument(Document &document, const std::string &path) {
+	backupBeforeSave(path);
 	const std::string content = textOf(document);
 	std::string bytes;
 	if (!encode(content, document.encoding, bytes)) {
@@ -1078,8 +1227,17 @@ bool Workspace::saveDocument(Document &document, const std::string &path) {
 		         ". Nothing was written. Convert the document to UTF-8 from the Encoding menu, then save again.", {"OK"});
 		return false;
 	}
+	if (savingForbidden) {
+		host.ask("Saving is turned off.", "omapad was started with -fullReadOnlySavingForbidden.", {"OK"});
+		return false;
+	}
 	std::string error;
-	if (!writeFileAtomically(bytes, path, error)) {
+	if (!writeFileAtomically(bytes, path, error) && access(fs::path(path).parent_path().c_str(), W_OK) != 0) {
+		// Declining is an answer, so it doesn't need a second message on top.
+		if (host.ask("You don't have permission to save “" + baseName(path) + "”.", "Try again with administrator rights?\n\nYour text is still open here.", {"Cancel", "Save as Administrator"}) != 1) return false;
+		saveWithAdminRights(bytes, path, error);
+	}
+	if (!error.empty()) {
 		host.ask("The file could not be saved.", path + "\n\n" + error + "\n\nYour text is still open here. Try Save As to choose another location.", {"OK"});
 		return false;
 	}
@@ -1104,6 +1262,7 @@ bool Workspace::saveDocument(Document &document, const std::string &path) {
 	removeBackup(document);
 	addRecent(path);
 	refreshChrome();
+	notifyPlugins("fileSaved", path);
 	return true;
 }
 
@@ -1126,7 +1285,7 @@ bool Workspace::saveAsDialog(Document &document) {
 }
 
 void Workspace::checkExternalChanges() {
-	if (checkingExternal) return;
+	if (checkingExternal || settings.pref("fileDetection") == "off") return;
 	checkingExternal = true;
 	const auto snapshot = documents;
 	for (const auto &document : snapshot) {
@@ -1153,13 +1312,23 @@ void Workspace::checkExternalChanges() {
 		if (document->hasMtime && current == document->mtime) continue;
 		document->missing = false;
 		show();
+		if (settings.prefOn("updateSilently") && !document->dirty()) {
+			document->mtime = current;
+			document->hasMtime = true;
+			reloadActive();
+			if (settings.prefOn("scrollToEnd")) s(SCI_DOCUMENTEND);
+			continue;
+		}
 		const std::string detail = document->dirty()
 			? "Reloading discards your unsaved changes here. This can't be undone."
 			: "Reload it to see the new contents?";
 		const int choice = host.ask("“" + document->title() + "” was changed by another program.", detail, {"Keep Current Text", "Reload"});
 		document->mtime = current;
 		document->hasMtime = true;
-		if (choice == 1) reloadActive();
+		if (choice == 1) {
+			reloadActive();
+			if (settings.prefOn("scrollToEnd")) s(SCI_DOCUMENTEND);
+		}
 	}
 	checkingExternal = false;
 	refreshChrome();
@@ -1188,14 +1357,17 @@ void Workspace::addRecent(const std::string &path) {
 	auto &recent = settings.recent;
 	recent.erase(std::remove(recent.begin(), recent.end(), path), recent.end());
 	recent.insert(recent.begin(), path);
-	if (recent.size() > 15) recent.resize(15);
+	const size_t limit = static_cast<size_t>(settings.prefInt("recentMax"));
+	if (recent.size() > limit) recent.resize(limit);
 	saveSettings();
+	if (!settings.prefOn("recentInSubmenu")) host.menusChanged();
 }
 
 #pragma mark - Session and backups
 
 std::string Workspace::backupPath(const Document &document) const {
-	return (fs::path(stateDir) / "backup" / (document.backupId + ".txt")).string();
+	const std::string custom = settings.pref("backupPath");
+	return (custom.empty() ? fs::path(stateDir) / "backup" / (document.backupId + ".txt") : fs::path(custom) / (document.backupId + ".txt")).string();
 }
 
 void Workspace::removeBackup(Document &document) {
@@ -1205,6 +1377,7 @@ void Workspace::removeBackup(Document &document) {
 }
 
 bool Workspace::writeSession() {
+	if (sessionDisabled) return true;
 	saveViewState(0);
 	saveViewState(1);
 	bool ok = true;
@@ -1267,6 +1440,15 @@ bool Workspace::writeSession() {
 	}
 	json session;
 	session["version"] = 2;
+	{
+		json shown = json::array();
+		for (int panel = 0; panel < kPanelCount; panel++)
+			if (panelShown[panel]) shown.push_back(panel);
+		session["panels"] = shown;
+		json projects = json::array();
+		for (const ProjectPanel &project : projectPanels) projects.push_back(project.file);
+		session["projects"] = projects;
+	}
 	session["documents"] = documentList;
 	session["panes"] = paneList;
 	session["focus"] = focus;
@@ -1293,13 +1475,42 @@ bool Workspace::writeSession() {
 }
 
 bool Workspace::restoreSession() {
-	if (!settings.restoreSessionOnStart) return false;
+	if ((!settings.restoreSessionOnStart || !settings.prefOn("rememberSession")) && !sessionDisabled) return false;
 	std::ifstream in(fs::path(stateDir) / "session.json", std::ios::binary);
 	if (!in) return false;
 	std::stringstream buffer;
 	buffer << in.rdbuf();
 	const json session = json::parse(buffer.str(), nullptr, false);
 	if (session.is_discarded() || !session.is_object()) return false;
+	if (sessionDisabled) {
+		// Without the session, panels can still come back as they were, if that's wanted.
+		if (!settings.prefOn("rememberPanels")) return false;
+		const auto shownPanels = session.find("panels");
+		if (shownPanels != session.end() && shownPanels->is_array()) {
+			for (const json &panel : *shownPanels) {
+				if (!panel.is_number_integer()) continue;
+				const int id = panel.get<int>();
+				const bool wanted = id == kPanelClipboard ? settings.prefOn("rememberPanelClipboard") : id == kPanelDocuments ? settings.prefOn("rememberPanelDocuments")
+					: id == kPanelCharacters ? settings.prefOn("rememberPanelCharacters") : settings.prefOn("rememberPanelProjects");
+				if (wanted && !panelVisible(id)) togglePanel(id);
+			}
+		}
+		if (settings.prefOn("rememberPanelFunctions") && jsonBool(session, "functionList")) {
+			functionPanel = true;
+			host.setFunctionListVisible(true);
+		}
+		if (settings.prefOn("rememberPanelMap")) showDocumentMap(jsonBool(session, "documentMap"));
+		if (settings.prefOn("rememberPanelFolders")) {
+			for (const std::string &folder : jsonStrings(session, "folders")) {
+				std::error_code folderError;
+				if (fs::is_directory(folder, folderError)) folderRoots.push_back(folder);
+			}
+			folderPanel = !folderRoots.empty() && jsonBool(session, "folderPanel");
+			host.setFolderPanelVisible(folderPanel);
+			host.foldersChanged();
+		}
+		return false;
+	}
 
 	// Folders first, so they're back even when there are no documents to restore.
 	for (const std::string &folder : jsonStrings(session, "folders")) {
@@ -1315,6 +1526,21 @@ bool Workspace::restoreSession() {
 	host.setFunctionListVisible(functionPanel);
 	showDocumentMap(jsonBool(session, "documentMap"));
 	functionsPending = 1;
+	{
+		const auto projectFiles = session.find("projects");
+		if (projectFiles != session.end() && projectFiles->is_array()) {
+			int panel = kPanelProject1;
+			for (const json &file : *projectFiles) {
+				if (file.is_string() && !file.get<std::string>().empty() && panel <= kPanelProject3) loadWorkspaceFile(panel, file.get<std::string>());
+				panel++;
+			}
+		}
+		const auto shown = session.find("panels");
+		if (shown != session.end() && shown->is_array()) {
+			for (const json &panel : *shown)
+				if (panel.is_number_integer() && !panelVisible(panel.get<int>())) togglePanel(panel.get<int>());
+		}
+	}
 
 	const auto documentList = session.find("documents");
 	const auto paneList = session.find("panes");
@@ -1344,7 +1570,18 @@ bool Workspace::restoreSession() {
 		}
 		std::string fileBytes;
 		const bool haveFile = !haveBackup && !path.empty() && readFile(path, fileBytes, false);
-		if (!haveBackup && !haveFile) continue;
+		if (!haveBackup && !haveFile) {
+			// The file may be on something that isn't plugged in right now.
+			if (!settings.prefOn("rememberInaccessible") || path.empty()) continue;
+			std::shared_ptr<Document> placeholder = canReuse ? documents[0] : addDocument();
+			canReuse = false;
+			placeholder->path = path;
+			placeholder->untitledName.clear();
+			placeholder->missing = true;
+			placeholder->language = catalog.languageNamed(jsonString(entry, "language", "normal"));
+			restored.back() = placeholder;
+			continue;
+		}
 
 		std::shared_ptr<Document> document;
 		if (canReuse) {
@@ -1445,8 +1682,29 @@ bool Workspace::restoreSession() {
 	return true;
 }
 
+void Workspace::afterStartup() {
+	if (settings.prefOn("recentCheck")) {
+		auto &recent = settings.recent;
+		recent.erase(std::remove_if(recent.begin(), recent.end(), [](const std::string &path) {
+			std::error_code error;
+			return !fs::exists(path, error);
+		}), recent.end());
+	}
+	if (settings.prefOn("openNewAtStart") && documents.size() > 1) createUntitledDocument();
+	applyChromeState();
+	setPrintableSymbols();
+}
+
 bool Workspace::tick() {
 	tickCount++;
+	updateMonitoredDocuments();
+	pollClipboard();
+	notePanelsChanged();
+	// Cycling through documents stops when the keys do.
+	if (switcherPosition > 0 && tickCount - switcherTick > 2) {
+		switcherPosition = 0;
+		noteTabUsed();
+	}
 	// A pending refresh waits for a pause in typing, so parsing never gets in its way.
 	if (functionPanel) {
 		const Document *document = activeDocument();
@@ -1456,7 +1714,7 @@ bool Workspace::tick() {
 		else if (changed && ++functionsPending >= 2) refreshFunctionList();
 		else if (!changed) functionsPending = 0;
 	}
-	if (settings.backupSeconds > 0 && tickCount - lastBackupTick >= settings.backupSeconds) {
+	if (settings.prefOn("snapshot") && settings.backupSeconds > 0 && tickCount - lastBackupTick >= settings.backupSeconds) {
 		lastBackupTick = tickCount;
 		return writeSession();
 	}
@@ -1464,6 +1722,7 @@ bool Workspace::tick() {
 }
 
 bool Workspace::prepareToQuit() {
+	if (!offerSavingWorkspaces()) return false;
 	if (writeSession()) return true;
 	return host.ask("Your unsaved work couldn't be backed up.", "Quitting now could lose changes that haven't been saved.",
 	                {"Don't Quit", "Quit Anyway"}) == 1;
@@ -1505,6 +1764,8 @@ void Workspace::editorNotification(int pane, const SCNotification &n) {
 		if (pane == focus && (n.updated & (SC_UPDATE_SELECTION | SC_UPDATE_CONTENT))) updateStatus();
 		if (n.updated & (SC_UPDATE_SELECTION | SC_UPDATE_CONTENT)) updateBraceHighlight(pane);
 		if (n.updated & SC_UPDATE_SELECTION) updateSmartHighlight(pane);
+		if (n.updated & (SC_UPDATE_V_SCROLL | SC_UPDATE_CONTENT)) updateLinks(pane);
+		if (n.updated & (SC_UPDATE_SELECTION | SC_UPDATE_CONTENT)) updateMatchingTags(pane);
 		if (n.updated & (SC_UPDATE_V_SCROLL | SC_UPDATE_H_SCROLL)) syncScroll(pane);
 		if (pane == focus && (n.updated & (SC_UPDATE_V_SCROLL | SC_UPDATE_CONTENT))) syncDocumentMap(false);
 		// Moving away from a call's arguments ends its hint.
@@ -1516,6 +1777,23 @@ void Workspace::editorNotification(int pane, const SCNotification &n) {
 	case SCN_CHARADDED:
 		if (pane == focus) afterCharacter(pane, n.ch);
 		break;
+	case SCN_DOUBLECLICK:
+		if (n.modifiers & SCMOD_CTRL) delimiterSelect(pane, n.position);
+		else if (openLinkAt(pane, n.position)) view(pane).send(SCI_SETEMPTYSELECTION, n.position);
+		break;
+	case SCN_ZOOM:
+		if (settings.syncZoom) {
+			const intptr_t zoom = view(pane).send(SCI_GETZOOM);
+			if (view(1 - pane).send(SCI_GETZOOM) != zoom) view(1 - pane).send(SCI_SETZOOM, zoom);
+		}
+		break;
+	case SCN_AUTOCSELECTION:
+		// A list can be set not to take Tab or Enter, which then do what they normally do.
+		if ((n.listCompletionMethod == SC_AC_TAB && !(completionKeys & 1)) || (n.listCompletionMethod == SC_AC_NEWLINE && !(completionKeys & 2))) {
+			view(pane).send(SCI_AUTOCCANCEL);
+			view(pane).send(n.listCompletionMethod == SC_AC_TAB ? SCI_TAB : SCI_NEWLINE);
+		}
+		break;
 	case SCN_CALLTIPCLICK:
 		if (hint.active && n.position == 1) run(Cmd::PreviousHint);
 		else if (hint.active && n.position == 2) run(Cmd::NextHint);
@@ -1523,6 +1801,7 @@ void Workspace::editorNotification(int pane, const SCNotification &n) {
 	case SCN_MARGINCLICK:
 		if (n.margin == kMarginBookmark) {
 			focus = pane;
+			if (showHiddenLinesAt(view(pane).send(SCI_LINEFROMPOSITION, n.position))) break;
 			toggleBookmark(view(pane).send(SCI_LINEFROMPOSITION, n.position));
 		}
 		break;
@@ -1615,7 +1894,13 @@ void Workspace::syncDocumentMap(bool documentChanged) {
 }
 
 void Workspace::afterCharacter(int pane, int ch) {
-	if (settings.autoIndent) autoIndent(pane, ch);
+	if (ch > 0 && ch < 0x20 && ch != '\t' && ch != '\r' && ch != '\n' && settings.prefOn("preventC0")) {
+		s(SCI_DELETEBACK);
+		return;
+	}
+	autoInsertAfter(pane, ch);
+	if (settings.autoIndent && settings.pref("autoIndentMode") != "none") autoIndent(pane, ch);
+	if (isLargeDocument() && !settings.prefOn("largeComplete")) return;
 	updateHintAfterCharacter(ch);
 	if (!settings.autoComplete) return;
 	const unsigned char c = static_cast<unsigned char>(ch);
@@ -1672,7 +1957,10 @@ bool Workspace::showCompletion(bool functionNames, bool words, bool explicitRequ
 	long start = 0;
 	const std::string prefix = wordBeforeCaret(start);
 	if (!explicitRequest && static_cast<int>(prefix.size()) < settings.completeThreshold) return false;
-	const std::vector<std::string> candidates = completionCandidates(prefix, functionNames, words, static_cast<size_t>(s(SCI_GETCURRENTPOS)));
+	if (settings.prefOn("completeIgnoreNumbers") && !prefix.empty() && std::all_of(prefix.begin(), prefix.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) return false;
+	// A full list scrolls to what's typed. A brief one only shows what matches.
+	const std::string listPrefix = settings.prefOn("completeBrief") || !functionNames ? prefix : std::string();
+	const std::vector<std::string> candidates = completionCandidates(listPrefix, functionNames, words, static_cast<size_t>(s(SCI_GETCURRENTPOS)));
 	if (candidates.empty()) {
 		s(SCI_AUTOCCANCEL);
 		if (explicitRequest) host.flash("No completions");
@@ -1832,6 +2120,7 @@ void Workspace::autoIndent(int pane, int ch) {
 
 void Workspace::updateBraceHighlight(int pane) {
 	if (!settings.matchBraces) return;
+	if (isLargeDocument() && !settings.prefOn("largeBrace")) return;
 	SciView &v = view(pane);
 	const auto isBrace = [](int c) { return c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}'; };
 	const long position = v.send(SCI_GETCURRENTPOS);
@@ -1859,6 +2148,7 @@ void Workspace::updateSmartHighlight(int pane) {
 	}
 	const long start = v.send(SCI_GETSELECTIONSTART);
 	const long end = v.send(SCI_GETSELECTIONEND);
+	if (isLargeDocument() && !settings.prefOn("largeSmart")) return;
 	if (!settings.smartHighlight || end <= start || end - start > 256 || v.send(SCI_GETSELECTIONS) != 1) return;
 	if (v.send(SCI_WORDSTARTPOSITION, start, 1) != start || v.send(SCI_WORDENDPOSITION, start, 1) != end) return;
 	const char *pointer = reinterpret_cast<const char *>(v.send(SCI_GETRANGEPOINTER, start, end - start));
@@ -1870,7 +2160,29 @@ void Workspace::updateSmartHighlight(int pane) {
 	const long rangeEnd = lastLine < v.send(SCI_GETLINECOUNT) ? v.send(SCI_POSITIONFROMLINE, lastLine) : length;
 	const long savedStart = v.send(SCI_GETTARGETSTART);
 	const long savedEnd = v.send(SCI_GETTARGETEND);
-	v.send(SCI_SETSEARCHFLAGS, SCFIND_WHOLEWORD | SCFIND_MATCHCASE);
+	int smartFlags = (settings.prefOn("smartCase") ? SCFIND_MATCHCASE : 0) | (settings.prefOn("smartWord") ? SCFIND_WHOLEWORD : 0);
+	if (settings.prefOn("smartUseFind")) {
+		const FindOptions find = host.currentFindOptions();
+		smartFlags = (find.matchCase ? SCFIND_MATCHCASE : 0) | (find.wholeWord ? SCFIND_WHOLEWORD : 0);
+	}
+	v.send(SCI_SETSEARCHFLAGS, smartFlags);
+	// The other view can show the same word too, if the preference says so.
+	if (settings.prefOn("smartOtherView") && splitVisible()) {
+		SciView &other = view(1 - pane);
+		const long otherLength = other.send(SCI_GETLENGTH);
+		other.send(SCI_SETINDICATORCURRENT, kIndicatorSmart);
+		other.send(SCI_INDICATORCLEARRANGE, 0, otherLength);
+		other.send(SCI_SETSEARCHFLAGS, smartFlags);
+		long at = 0;
+		while (at < otherLength) {
+			other.send(SCI_SETTARGETRANGE, at, otherLength);
+			const long hit = other.send(SCI_SEARCHINTARGET, word.size(), reinterpret_cast<intptr_t>(word.data()));
+			if (hit < 0) break;
+			const long hitEnd = other.send(SCI_GETTARGETEND);
+			other.send(SCI_INDICATORFILLRANGE, hit, hitEnd - hit);
+			at = hitEnd > hit ? hitEnd : hit + 1;
+		}
+	}
 	while (position < rangeEnd) {
 		v.send(SCI_SETTARGETRANGE, position, rangeEnd);
 		const long found = v.send(SCI_SEARCHINTARGET, word.size(), reinterpret_cast<intptr_t>(word.data()));
@@ -2096,6 +2408,7 @@ SearchResult Workspace::replaceOne(const FindOptions &options) {
 		if (found == start && v.send(SCI_GETTARGETEND) == end) {
 			const long replaced = replaceTarget(v, options);
 			v.send(SCI_SETSEL, start + replaced, start + replaced);
+			if (settings.prefOn("replaceNoMove")) return SearchResult::Found;
 		}
 	}
 	return findNext(options);
@@ -2125,6 +2438,7 @@ long Workspace::markAll(const FindOptions &options) {
 	SciView &v = view();
 	v.send(SCI_SETSEARCHFLAGS, flagsFrom(options));
 	v.send(SCI_SETINDICATORCURRENT, kIndicatorMark);
+	if (options.purge) v.send(SCI_INDICATORCLEARRANGE, 0, v.send(SCI_GETLENGTH));
 	long position, end;
 	searchRange(options, v, position, end);
 	long count = 0;
@@ -2135,6 +2449,7 @@ long Workspace::markAll(const FindOptions &options) {
 		const long matchEnd = v.send(SCI_GETTARGETEND);
 		if (matchEnd > found) {
 			v.send(SCI_INDICATORFILLRANGE, found, matchEnd - found);
+			if (options.bookmarkLine) v.send(SCI_MARKERADD, v.send(SCI_LINEFROMPOSITION, found), kMarkerBookmark);
 			count++;
 			position = matchEnd;
 		} else {
@@ -2158,13 +2473,47 @@ void Workspace::showResults(bool visible) {
 void Workspace::setResults(const std::string &value, std::vector<ResultEntry> entries, bool append) {
 	SciView &results = host.resultsView();
 	results.send(SCI_SETREADONLY, 0);
+	const bool keepEarlier = !settings.prefOn("resultsPurge") && !append && !value.empty() && !resultEntries.empty();
+	if (keepEarlier) {
+		// Earlier searches stay above, folded away.
+		append = true;
+		results.send(SCI_FOLDALL, SC_FOLDACTION_CONTRACT);
+	}
 	if (!append) {
 		results.send(SCI_CLEARALL);
 		resultEntries.clear();
 	}
+	const long firstNewLine = results.send(SCI_GETLINECOUNT) - 1;
 	results.send(SCI_APPENDTEXT, value.size(), reinterpret_cast<intptr_t>(value.data()));
 	results.send(SCI_SETREADONLY, 1);
 	resultEntries.insert(resultEntries.end(), entries.begin(), entries.end());
+	// Search headings and file names fold what's under them, and the matches themselves stand out.
+	results.send(SCI_SETINDICATORCURRENT, kIndicatorMark);
+	results.send(SCI_INDICSETSTYLE, kIndicatorMark, INDIC_ROUNDBOX);
+	results.send(SCI_INDICSETALPHA, kIndicatorMark, 110);
+	results.send(SCI_INDICSETFORE, kIndicatorMark, 0x00C0FF);
+	results.send(SCI_SETMARGINWIDTHN, kMarginFold, 14);
+	results.send(SCI_SETMARGINTYPEN, kMarginFold, SC_MARGIN_SYMBOL);
+	results.send(SCI_SETMARGINMASKN, kMarginFold, SC_MASK_FOLDERS);
+	results.send(SCI_SETMARGINSENSITIVEN, kMarginFold, 1);
+	results.send(SCI_SETAUTOMATICFOLD, SC_AUTOMATICFOLD_CLICK | SC_AUTOMATICFOLD_SHOW);
+	for (const int marker : {SC_MARKNUM_FOLDER, SC_MARKNUM_FOLDEROPEN}) results.send(SCI_MARKERDEFINE, marker, marker == SC_MARKNUM_FOLDER ? SC_MARK_BOXPLUS : SC_MARK_BOXMINUS);
+	const long lines = results.send(SCI_GETLINECOUNT);
+	for (long line = firstNewLine; line < lines; line++) {
+		const long start = results.send(SCI_POSITIONFROMLINE, line), end = results.send(SCI_GETLINEENDPOSITION, line);
+		const char *pointer = reinterpret_cast<const char *>(results.send(SCI_GETRANGEPOINTER, start, end - start));
+		const std::string text = pointer && end > start ? std::string(pointer, static_cast<size_t>(end - start)) : std::string();
+		const bool heading = text.rfind("Search ", 0) == 0;
+		const bool file = !heading && !text.empty() && text[0] != ' ';
+		int level = SC_FOLDLEVELBASE + (heading ? 0 : file ? 1 : 2);
+		if (heading || file) level |= SC_FOLDLEVELHEADERFLAG;
+		results.send(SCI_SETFOLDLEVEL, line, level);
+		if (line < static_cast<long>(resultEntries.size()) && resultEntries[static_cast<size_t>(line)].line >= 0) {
+			const size_t colon = text.find(": ");
+			const ResultEntry &entry = resultEntries[static_cast<size_t>(line)];
+			if (colon != std::string::npos && entry.length > 0) results.send(SCI_INDICATORFILLRANGE, start + static_cast<long>(colon) + 2 + entry.offset, entry.length);
+		}
+	}
 }
 
 std::string Workspace::resultsText() const {
@@ -2219,6 +2568,7 @@ long Workspace::findAllInDocument(const FindOptions &options) {
 	std::string out = "Search \"" + options.what + "\" in " + document->title() + "\n";
 	std::vector<ResultEntry> entries(1);
 	long count = 0;
+	long lastResultLine = -1;
 	while (position <= end && count < kMaxResultLines) {
 		const long found = searchIn(view(), pattern, position, end);
 		if (found == -2) return -1;
@@ -2226,6 +2576,13 @@ long Workspace::findAllInDocument(const FindOptions &options) {
 		const long matchEnd = s(SCI_GETTARGETEND);
 		const long line = s(SCI_LINEFROMPOSITION, found);
 		const long lineStart = s(SCI_POSITIONFROMLINE, line);
+		if (settings.prefOn("resultsOnePerLine") && line == lastResultLine) {
+			count++;
+			position = matchEnd > found ? matchEnd : s(SCI_POSITIONAFTER, found);
+			if (matchEnd == found && found >= end) break;
+			continue;
+		}
+		lastResultLine = line;
 		out += "  Line " + std::to_string(line + 1) + ": " + truncateUtf8(rangeOf(lineStart, s(SCI_GETLINEENDPOSITION, line)), 400) + "\n";
 		ResultEntry entry;
 		entry.document = document;
@@ -2241,7 +2598,7 @@ long Workspace::findAllInDocument(const FindOptions &options) {
 			position = matchEnd;
 		}
 	}
-	setResults(out, std::move(entries), false);
+	setResults(out, std::move(entries), findAllAppends);
 	showResults(true);
 	return count;
 }
@@ -2319,10 +2676,106 @@ void searchLine(const SearchJob &job, const std::string &lineBytes, long lineNum
 	}
 }
 
+// Searches one file and reports what it finds.
+void searchListedFile(SearchJob &jobReference, const std::string &path, long &matches, long &filesWithMatches, bool &hitLimit) {
+	SearchJob *job = &jobReference;
+	const FindOptions &o = job->options;
+	(void)hitLimit;
+	const auto open = o.openDocuments.find(path);
+	std::string bytes;
+	if (open != o.openDocuments.end()) {
+		bytes = open->second;
+	} else {
+		std::ifstream in(path, std::ios::binary);
+		if (!in) return;
+		std::stringstream buffer;
+		buffer << in.rdbuf();
+		bytes = buffer.str();
+	}
+	if (bytes.empty()) return;
+	const unsigned char *u = reinterpret_cast<const unsigned char *>(bytes.data());
+	const bool hasBom = bytes.size() >= 2 && ((u[0] == 0xFF && u[1] == 0xFE) || (u[0] == 0xFE && u[1] == 0xFF));
+	if (!hasBom && std::memchr(bytes.data(), 0, std::min<size_t>(bytes.size(), 8192))) return;  // Binary.
+	const Decoded decoded = decodeAuto(bytes);
+	// A quick whole-file check avoids decoding every line of files that can't match.
+	if (!job->regex && o.matchCase && decoded.utf8.find(job->literalBytes) == std::string::npos) return;
+
+	std::string block;
+	std::vector<ResultEntry> entries;
+	long fileMatches = 0;
+	long lineNumber = 0;
+	const std::string &contents = decoded.utf8;
+	if (job->regex) {
+		// The whole file at once, so a pattern can span lines.
+		size_t lineStart = 0, offset = 0;
+		long currentLine = 0;
+		Regex::Match match;
+		while (offset <= contents.size() && !job->cancel->load() && fileMatches < kMaxResultLines) {
+			if (job->regex->search(contents.data(), contents.size(), offset, match) != Regex::Result::Found) break;
+			if (match.end == match.start) {
+				offset = match.end + 1;
+				continue;
+			}
+			for (size_t i = lineStart; i < match.start; i++) {
+				const char c = contents[i];
+				if (c != '\n' && c != '\r') continue;
+				if (c == '\r' && i + 1 < contents.size() && contents[i + 1] == '\n') i++;
+				currentLine++;
+				lineStart = i + 1;
+			}
+			size_t lineEnd = contents.find_first_of("\r\n", match.start);
+			if (lineEnd == std::string::npos) lineEnd = contents.size();
+			if (fileMatches == 0) {
+				block += path + "\n";
+				entries.emplace_back();
+			}
+			block += "  Line " + std::to_string(currentLine + 1) + ": " + truncateUtf8(contents.substr(lineStart, lineEnd - lineStart), 400) + "\n";
+			ResultEntry result;
+			result.path = path;
+			result.line = currentLine;
+			result.offset = static_cast<long>(match.start - lineStart);
+			result.length = static_cast<long>(match.end - match.start);
+			entries.push_back(result);
+			fileMatches++;
+			offset = match.end;
+		}
+		if (fileMatches > 0) {
+			matches += fileMatches;
+			filesWithMatches++;
+			job->emit(block, std::move(entries));
+		}
+		return;
+	}
+	size_t start = 0;
+	while (start <= contents.size() && !job->cancel->load()) {
+		size_t end = contents.find_first_of("\r\n", start);
+		const bool last = end == std::string::npos;
+		if (last) end = contents.size();
+		if (!(last && start == contents.size())) searchLine(*job, contents.substr(start, end - start), lineNumber, path, block, entries, fileMatches);
+		if (last) break;
+		start = end + ((contents[end] == '\r' && end + 1 < contents.size() && contents[end + 1] == '\n') ? 2 : 1);
+		lineNumber++;
+	}
+	if (fileMatches > 0) {
+		matches += fileMatches;
+		filesWithMatches++;
+		job->emit(block, std::move(entries));
+	}
+}
+
 void *searchThreadMain(void *argument) {
 	std::unique_ptr<SearchJob> job(static_cast<SearchJob *>(argument));
 	long matches = 0, filesWithMatches = 0;
 	bool hitLimit = false;
+	if (!job->options.files.empty()) {
+		for (const std::string &file : job->options.files) {
+			if (job->cancel->load()) break;
+			searchListedFile(*job, file, matches, filesWithMatches, hitLimit);
+			if (hitLimit) break;
+		}
+		job->finish(matches, filesWithMatches, hitLimit);
+		return nullptr;
+	}
 	const FindOptions &o = job->options;
 
 	std::error_code error;
@@ -2364,80 +2817,7 @@ void *searchThreadMain(void *argument) {
 		walker.increment(error);
 		if (!accepted) continue;
 
-		std::ifstream in(path, std::ios::binary);
-		if (!in) continue;
-		std::stringstream buffer;
-		buffer << in.rdbuf();
-		const std::string bytes = buffer.str();
-		if (bytes.empty()) continue;
-		const unsigned char *u = reinterpret_cast<const unsigned char *>(bytes.data());
-		const bool hasBom = bytes.size() >= 2 && ((u[0] == 0xFF && u[1] == 0xFE) || (u[0] == 0xFE && u[1] == 0xFF));
-		if (!hasBom && std::memchr(bytes.data(), 0, std::min<size_t>(bytes.size(), 8192))) continue;  // Binary.
-		const Decoded decoded = decodeAuto(bytes);
-		// A quick whole-file check avoids decoding every line of files that can't match.
-		if (!job->regex && o.matchCase && decoded.utf8.find(job->literalBytes) == std::string::npos) continue;
-
-		std::string block;
-		std::vector<ResultEntry> entries;
-		long fileMatches = 0;
-		long lineNumber = 0;
-		const std::string &contents = decoded.utf8;
-		if (job->regex) {
-			// The whole file at once, so a pattern can span lines.
-			size_t lineStart = 0, offset = 0;
-			long currentLine = 0;
-			Regex::Match match;
-			while (offset <= contents.size() && !job->cancel->load() && fileMatches < kMaxResultLines) {
-				if (job->regex->search(contents.data(), contents.size(), offset, match) != Regex::Result::Found) break;
-				if (match.end == match.start) {
-					offset = match.end + 1;
-					continue;
-				}
-				for (size_t i = lineStart; i < match.start; i++) {
-					const char c = contents[i];
-					if (c != '\n' && c != '\r') continue;
-					if (c == '\r' && i + 1 < contents.size() && contents[i + 1] == '\n') i++;
-					currentLine++;
-					lineStart = i + 1;
-				}
-				size_t lineEnd = contents.find_first_of("\r\n", match.start);
-				if (lineEnd == std::string::npos) lineEnd = contents.size();
-				if (fileMatches == 0) {
-					block += path + "\n";
-					entries.emplace_back();
-				}
-				block += "  Line " + std::to_string(currentLine + 1) + ": " + truncateUtf8(contents.substr(lineStart, lineEnd - lineStart), 400) + "\n";
-				ResultEntry result;
-				result.path = path;
-				result.line = currentLine;
-				result.offset = static_cast<long>(match.start - lineStart);
-				result.length = static_cast<long>(match.end - match.start);
-				entries.push_back(result);
-				fileMatches++;
-				offset = match.end;
-			}
-			if (fileMatches > 0) {
-				matches += fileMatches;
-				filesWithMatches++;
-				job->emit(block, std::move(entries));
-			}
-			continue;
-		}
-		size_t start = 0;
-		while (start <= contents.size() && !job->cancel->load()) {
-			size_t end = contents.find_first_of("\r\n", start);
-			const bool last = end == std::string::npos;
-			if (last) end = contents.size();
-			if (!(last && start == contents.size())) searchLine(*job, contents.substr(start, end - start), lineNumber, path, block, entries, fileMatches);
-			if (last) break;
-			start = end + ((contents[end] == '\r' && end + 1 < contents.size() && contents[end + 1] == '\n') ? 2 : 1);
-			lineNumber++;
-		}
-		if (fileMatches > 0) {
-			matches += fileMatches;
-			filesWithMatches++;
-			job->emit(block, std::move(entries));
-		}
+		searchListedFile(*job, path, matches, filesWithMatches, hitLimit);
 	}
 	job->finish(matches, filesWithMatches, hitLimit);
 	return nullptr;
@@ -2461,6 +2841,10 @@ void Workspace::findInFiles(const FindOptions &options, std::function<void(long,
 	joinSearchThread();
 	auto job = std::make_unique<SearchJob>();
 	job->options = options;
+	if (!settings.prefOn("preferDisk")) {
+		for (const auto &document : documents)
+			if (!document->path.empty() && document->dirty()) job->options.openDocuments[document->path] = textOf(*document);
+	}
 	if (options.mode == SearchMode::Regex) {
 		Regex::Options regexFlags;
 		regexFlags.ignoreCase = !options.matchCase;
@@ -2520,9 +2904,20 @@ std::string matchCount(const char *prefix, long count) {
 }  // namespace
 
 void Workspace::findPanelFindNext() {
-	switch (findNext(host.currentFindOptions())) {
-	case SearchResult::Found: host.setFindStatus("", false); break;
-	case SearchResult::NotFound: host.setFindStatus("Can't find that text.", true); break;
+	const FindOptions options = host.currentFindOptions();
+	const long before = s(SCI_GETSELECTIONSTART);
+	switch (findNext(options)) {
+	case SearchResult::Found: {
+		const long after = s(SCI_GETSELECTIONSTART);
+		// It went round the end of the document to get here.
+		if (options.backward ? after > before : after < before) host.setFindStatus(options.backward ? "Found from the bottom: the start of the document was reached." : "Found from the top: the end of the document was reached.", false);
+		else host.setFindStatus("", false);
+		break;
+	}
+	case SearchResult::NotFound:
+		host.setFindStatus("Can't find that text.", true);
+		if (!settings.prefOn("muteSounds")) host.beep();
+		break;
 	case SearchResult::InvalidPattern: host.setFindStatus("That regular expression isn't valid.", true); break;
 	}
 }
@@ -2537,6 +2932,178 @@ void Workspace::findPanelFindAll() {
 	const long count = findAllInDocument(host.currentFindOptions());
 	if (count < 0) host.setFindStatus("That regular expression isn't valid.", true);
 	else host.setFindStatus(matchCount("", count) + ". Double-click a result to go to it.", false);
+	if (count >= 0 && !settings.prefOn("findStaysOpen")) host.closeFind();
+}
+
+void Workspace::findPanelFindAllOpen() {
+	const FindOptions options = host.currentFindOptions();
+	const int startPane = focus, startTab = paneAt(focus).active;
+	long total = 0;
+	bool first = true;
+	std::set<const Document *> done;
+	for (int pn = 0; pn < 2; pn++) {
+		for (int i = 0; i < static_cast<int>(paneAt(pn).tabs.size()); i++) {
+			if (!done.insert(paneAt(pn).tabs[i].document.get()).second) continue;
+			focus = pn;
+			activate(pn, i);
+			findAllAppends = !first;
+			const long count = findAllInDocument(options);
+			first = false;
+			if (count < 0) {
+				findAllAppends = false;
+				focus = startPane;
+				activate(startPane, startTab);
+				host.setFindStatus("That regular expression isn't valid.", true);
+				return;
+			}
+			total += count;
+		}
+	}
+	findAllAppends = false;
+	focus = startPane;
+	activate(startPane, startTab);
+	host.setFindStatus(matchCount("", total) + " in all open documents.", false);
+	if (!settings.prefOn("findStaysOpen")) host.closeFind();
+}
+
+long Workspace::replaceInFileList(const FindOptions &source, const std::vector<std::string> &files) {
+	FindOptions options = source;
+	options.inSelection = false;
+	long total = 0;
+	std::string failures;
+	SciView &worker = host.backgroundView();
+	for (const std::string &path : files) {
+		int pane, index;
+		findOpen(path, pane, index);
+		if (pane >= 0) {
+			// Open files change in their tab, as unsaved edits.
+			BackgroundDocument background(host, *paneAt(pane).tabs[index].document);
+			const long count = replaceAllIn(background.view, options);
+			if (count < 0) return -1;
+			total += count;
+			continue;
+		}
+		std::string bytes;
+		if (!readFile(path, bytes, false) || bytes.empty()) continue;
+		if (std::memchr(bytes.data(), 0, std::min<size_t>(bytes.size(), 8192)) && static_cast<unsigned char>(bytes[0]) < 0xFE) continue;  // Binary.
+		const Decoded decoded = decodeAuto(bytes);
+		const intptr_t temporary = worker.send(SCI_CREATEDOCUMENT, 0, SC_DOCUMENTOPTION_DEFAULT);
+		worker.send(SCI_SETDOCPOINTER, 0, temporary);
+		worker.send(SCI_SETCODEPAGE, SC_CP_UTF8);
+		worker.send(SCI_ADDTEXT, decoded.utf8.size(), reinterpret_cast<intptr_t>(decoded.utf8.data()));
+		const long count = replaceAllIn(worker, options);
+		std::string changed;
+		if (count > 0) {
+			const long length = worker.send(SCI_GETLENGTH);
+			const char *pointer = reinterpret_cast<const char *>(worker.send(SCI_GETCHARACTERPOINTER));
+			changed.assign(pointer ? pointer : "", static_cast<size_t>(length));
+		}
+		worker.send(SCI_SETDOCPOINTER, 0, 0);
+		worker.send(SCI_RELEASEDOCUMENT, 0, temporary);
+		if (count < 0) return -1;
+		if (count == 0) continue;
+		std::string encoded, error;
+		if (!encode(changed, decoded.encoding, encoded) || !atomicWrite(encoded, path, -1, error)) {
+			failures += path + "\n";
+			continue;
+		}
+		total += count;
+	}
+	if (!failures.empty()) host.ask("Some files could not be changed.", failures, {"OK"});
+	return total;
+}
+
+std::vector<std::string> Workspace::filesMatching(const FindOptions &options) const {
+	std::vector<std::string> out, filters;
+	std::istringstream words(options.filters);
+	std::string word;
+	while (words >> word) filters.push_back(word);
+	std::error_code error;
+	fs::recursive_directory_iterator walker(options.directory, fs::directory_options::skip_permission_denied, error), end;
+	while (!error && walker != end) {
+		const fs::directory_entry entry = *walker;
+		const std::string name = entry.path().filename().string();
+		const bool hidden = !name.empty() && name[0] == '.';
+		std::error_code entryError;
+		if (entry.is_directory(entryError)) {
+			if ((hidden && !options.includeHidden) || !options.recursive) walker.disable_recursion_pending();
+		} else if (entry.is_regular_file(entryError) && (!hidden || options.includeHidden)) {
+			bool wanted = filters.empty();
+			for (const std::string &filter : filters)
+				if (fnmatch(filter.c_str(), name.c_str(), 0) == 0) wanted = true;
+			if (wanted) out.push_back(entry.path().string());
+		}
+		walker.increment(error);
+	}
+	return out;
+}
+
+void Workspace::findPanelReplaceInFiles() {
+	FindOptions options = host.currentFindOptions();
+	if (options.what.empty()) return;
+	const std::vector<std::string> files = filesMatching(options);
+	if (host.ask("Replace in " + std::to_string(files.size()) + " files?", "Files in " + options.directory + " that aren't open change on disk straight away, and this can't be undone.", {"Cancel", "Replace"}) != 1) return;
+	const long count = replaceInFileList(options, files);
+	if (count < 0) host.setFindStatus("That regular expression isn't valid.", true);
+	else host.setFindStatus(matchCount("Replaced ", count), false);
+	refreshChrome();
+}
+
+void Workspace::searchInResults(const FindOptions &options, bool onlyFoundLines) {
+	if (options.what.empty()) return;
+	SciView &results = host.resultsView();
+	Regex::Options regexFlags;
+	regexFlags.ignoreCase = !options.matchCase;
+	regexFlags.dotMatchesNewline = options.dotMatchesNewline;
+	regexFlags.wholeWord = options.wholeWord;
+	std::unique_ptr<Regex> regex;
+	if (options.mode == SearchMode::Regex) {
+		regex = std::make_unique<Regex>(options.what, regexFlags);
+		if (!regex->valid()) {
+			host.flash("That regular expression isn't valid");
+			return;
+		}
+	}
+	const std::string literal = options.mode == SearchMode::Extended ? unescapeExtended(options.what) : options.what;
+	const std::u32string needle = [&] {
+		std::u32string out = utf8ToCodePoints(literal);
+		if (!options.matchCase) for (char32_t &c : out) c = foldCodePoint(c);
+		return out;
+	}();
+	const auto matches = [&](const std::string &text) {
+		if (regex) {
+			Regex::Match match;
+			return regex->search(text.data(), text.size(), 0, match) == Regex::Result::Found;
+		}
+		std::u32string haystack = utf8ToCodePoints(text);
+		if (!options.matchCase) for (char32_t &c : haystack) c = foldCodePoint(c);
+		for (size_t at = haystack.find(needle); at != std::u32string::npos; at = haystack.find(needle, at + 1)) {
+			if (!options.wholeWord) return true;
+			const bool left = at > 0 && isWordCodePoint(haystack[at - 1]);
+			const bool right = at + needle.size() < haystack.size() && isWordCodePoint(haystack[at + needle.size()]);
+			if (!left && !right) return true;
+		}
+		return false;
+	};
+	std::string out = "Search \"" + options.what + "\" in the found lines\n";
+	std::vector<ResultEntry> entries(1);
+	const std::vector<ResultEntry> source = resultEntries;
+	const long lines = results.send(SCI_GETLINECOUNT);
+	for (long line = 0; line < lines && line < static_cast<long>(source.size()); line++) {
+		const ResultEntry &entry = source[static_cast<size_t>(line)];
+		if (entry.line < 0) continue;
+		const long start = results.send(SCI_POSITIONFROMLINE, line), end = results.send(SCI_GETLINEENDPOSITION, line);
+		const char *pointer = reinterpret_cast<const char *>(results.send(SCI_GETRANGEPOINTER, start, end - start));
+		std::string text = pointer ? std::string(pointer, static_cast<size_t>(end - start)) : std::string();
+		const size_t colon = text.find(": ");
+		const std::string body = colon == std::string::npos ? text : text.substr(colon + 2);
+		if (!matches(onlyFoundLines ? body : text)) continue;
+		out += text + "\n";
+		ResultEntry kept = entry;
+		kept.length = 0;
+		entries.push_back(kept);
+	}
+	setResults(out, std::move(entries), false);
 }
 
 void Workspace::findPanelReplace() {
@@ -2554,7 +3121,7 @@ void Workspace::findPanelReplaceAll() {
 }
 
 void Workspace::findPanelReplaceAllOpen() {
-	const int choice = host.ask("Replace in all open documents?",
+	const int choice = !settings.prefOn("confirmReplaceAllOpen") ? 0 : host.ask("Replace in all open documents?",
 	                            "This changes up to " + std::to_string(documents.size()) + " open documents. You can undo it in each tab.",
 	                            {"Replace All", "Cancel"});
 	if (choice != 0) return;
@@ -2677,6 +3244,11 @@ void Workspace::printActive(bool selectionOnly, const PrintOutput &output) {
 	options.marginBottom = settings.printMarginBottom;
 	options.marginLeft = settings.printMarginLeft;
 	options.marginRight = settings.printMarginRight;
+	options.formFeedBreaks = settings.prefOn("printFormFeed");
+	options.headerBold = settings.prefOn("printHeaderBold");
+	options.headerItalic = settings.prefOn("printHeaderItalic");
+	options.footerBold = settings.prefOn("printFooterBold");
+	options.footerItalic = settings.prefOn("printFooterItalic");
 
 	SciView &printer = host.printView();
 	printer.send(SCI_SETDOCPOINTER, 0, document->sciDoc);
@@ -2912,6 +3484,7 @@ std::vector<FolderEntry> Workspace::listFolder(const std::string &path) const {
 		entry.path = it->path().string();
 		std::error_code statusError;
 		entry.isSymlink = it->is_symlink(statusError);
+		if (entry.isSymlink && !settings.prefOn("folderSymlinks")) continue;
 		// A link to a folder lists as a file, so a link loop can't expand forever.
 		entry.isDirectory = !entry.isSymlink && it->is_directory(statusError);
 		out.push_back(entry);
@@ -3182,14 +3755,24 @@ void Workspace::summary() {
 		if (word && !inWord) words++;
 		inWord = word;
 	}
+	std::string times;
+	struct stat info;
+	if (!document->path.empty() && stat(document->path.c_str(), &info) == 0) {
+#ifdef __APPLE__
+		times = "\nCreated: " + formatDateTime("yyyy-MM-dd HH:mm:ss", info.st_birthtime);
+#endif
+		times += "\nModified: " + formatDateTime("yyyy-MM-dd HH:mm:ss", info.st_mtime);
+	}
+	const long selectionStart = s(SCI_GETSELECTIONSTART), selectionEnd = s(SCI_GETSELECTIONEND);
+	const std::string selectionText = selectionEnd > selectionStart ? "\nSelected characters: " + std::to_string(s(SCI_COUNTCHARACTERS, selectionStart, selectionEnd)) + "\nSelected bytes: " + std::to_string(selectionEnd - selectionStart) + "\nSelected ranges: " + std::to_string(s(SCI_GETSELECTIONS)) : std::string();
 	host.ask("Summary",
-	         "Path: " + (document->path.empty() ? std::string("(not saved)") : document->path) +
+	         "Path: " + (document->path.empty() ? std::string("(not saved)") : document->path) + times +
 	         "\nCharacters: " + std::to_string(s(SCI_COUNTCHARACTERS, 0, s(SCI_GETLENGTH))) +
 	         "\nWords: " + std::to_string(words) +
 	         "\nLines: " + std::to_string(s(SCI_GETLINECOUNT)) +
 	         "\nBytes in memory (UTF-8): " + std::to_string(content.size()) +
 	         "\nEncoding: " + document->encoding->name +
-	         "\nLine endings: " + eolName(document->eol), {"OK"});
+	         "\nLine endings: " + eolName(document->eol) + selectionText, {"OK"});
 }
 
 void Workspace::goToLine() {
@@ -3245,6 +3828,15 @@ void Workspace::macroPlayOnce() {
 		s(step.message, step.w, step.text.empty() ? step.l : reinterpret_cast<intptr_t>(step.text.c_str()));
 }
 
+std::string Workspace::findPrefill() const {
+	if (!settings.prefOn("fillFindFromSelection")) return std::string();
+	const std::string selected = selectedText();
+	const size_t limit = static_cast<size_t>(settings.prefInt("fillMaxChars"));
+	if (selected.size() > limit) return std::string();
+	if (!selected.empty()) return selected;
+	return settings.prefOn("fillSelectWord") ? selectionOrWord() : std::string();
+}
+
 std::string Workspace::selectionOrWord() const {
 	const std::string selected = selectedText();
 	if (!selected.empty()) return selected;
@@ -3265,7 +3857,10 @@ void Workspace::runFromMenu(bool backward, bool useSelection) {
 	options.backward = backward;
 	options.inSelection = false;
 	const SearchResult result = findNext(options);
-	if (result == SearchResult::NotFound) host.flash("Can't find “" + options.what + "”");
+	if (result == SearchResult::NotFound) {
+		host.flash("Can't find “" + options.what + "”");
+		if (!settings.prefOn("muteSounds")) host.beep();
+	}
 	else if (result == SearchResult::InvalidPattern) host.flash("That regular expression isn't valid");
 }
 
@@ -3273,6 +3868,12 @@ void Workspace::runFromMenu(bool backward, bool useSelection) {
 
 std::vector<FormField> Workspace::preferenceFields() const {
 	std::vector<FormField> fields;
+	{
+		FormField page;
+		page.kind = FormField::Kind::Page;
+		page.label = "Editor";
+		fields.push_back(page);
+	}
 	const auto heading = [&](const char *label) {
 		FormField field;
 		field.kind = FormField::Kind::Heading;
@@ -3377,6 +3978,7 @@ std::vector<FormField> Workspace::preferenceFields() const {
 	number("printMarginBottom", "Bottom margin (mm)", settings.printMarginBottom, 0, 100);
 	number("printMarginLeft", "Left margin (mm)", settings.printMarginLeft, 0, 100);
 	number("printMarginRight", "Right margin (mm)", settings.printMarginRight, 0, 100);
+	appendPrefFields(fields);
 	return fields;
 }
 
@@ -3426,7 +4028,21 @@ void Workspace::applyPreferenceFields(const std::vector<FormField> &fields) {
 		else if (key == "printMarginBottom") settings.printMarginBottom = clamped(field);
 		else if (key == "printMarginLeft") settings.printMarginLeft = clamped(field);
 		else if (key == "printMarginRight") settings.printMarginRight = clamped(field);
+		else applyPrefField(field);
 	}
+	syncPrefsToFields();
+	{
+		const std::string cloud = settings.pref("cloudPath");
+		const std::string home = homeSettingsDir.empty() ? settingsDir : homeSettingsDir;
+		std::string writeError;
+		std::error_code cloudError;
+		if (!cloud.empty()) fs::create_directories(cloud, cloudError);
+		if (cloud.empty()) fs::remove(fs::path(home) / "cloud.txt", cloudError);
+		else atomicWrite(cloud + "\n", (fs::path(home) / "cloud.txt").string(), 0644, writeError);
+	}
+	loadMenuLanguage();
+	applyChromeState();
+	host.menusChanged();
 	applyPreferencesEverywhere();
 	applyThemeEverywhere();
 }
@@ -3446,7 +4062,9 @@ void walkMenu(std::vector<MenuItem> &items, const std::string &prefix, const std
 
 std::vector<MenuItem> Workspace::mainMenu() const {
 	std::vector<MenuItem> menu = baseMenu();
+	const bool lineCopy = settings.prefOn("copyLineNoSelection");
 	walkMenu(menu, "", [&](MenuItem &item, const std::string &id) {
+		if (lineCopy && (item.cmd == Cmd::Copy || item.cmd == Cmd::Cut)) item.macAction.clear();
 		const auto custom = settings.shortcuts.find(id);
 		if (custom == settings.shortcuts.end()) return;
 		item.shortcut = custom->second;
@@ -3455,6 +4073,25 @@ std::vector<MenuItem> Workspace::mainMenu() const {
 		item.macAction.clear();
 #endif
 	});
+	// Recent files can sit directly in the File menu rather than a submenu.
+	if (!settings.prefOn("recentInSubmenu") && !menu.empty()) {
+		for (MenuItem &top : menu) {
+			for (size_t i = 0; i < top.children.size(); i++) {
+				if (top.children[i].dynamic != MenuItem::Dynamic::Recent) continue;
+				const std::vector<MenuItem> flat = dynamicMenu(MenuItem::Dynamic::Recent);
+				top.children.erase(top.children.begin() + static_cast<long>(i));
+				top.children.insert(top.children.begin() + static_cast<long>(i), flat.begin(), flat.end());
+				break;
+			}
+		}
+	}
+	// Someone who manages updates another way can leave this file next to the program.
+	std::error_code updateError;
+	if (fs::exists(fs::path(programDirectory()) / "disableNppAutoUpdate.xml", updateError)) {
+		for (MenuItem &top : menu)
+			top.children.erase(std::remove_if(top.children.begin(), top.children.end(), [](const MenuItem &item) { return item.cmd == Cmd::CheckUpdates; }), top.children.end());
+	}
+	translateMenu(menu);
 	return menu;
 }
 
@@ -3462,13 +4099,18 @@ std::vector<ShortcutEntry> Workspace::shortcutEntries() const {
 	std::vector<ShortcutEntry> entries;
 	std::vector<MenuItem> menu = baseMenu();
 	walkMenu(menu, "", [&](MenuItem &item, const std::string &id) {
+		if (item.cmd == Cmd::OpenRecent || item.cmd == Cmd::ClearRecent) return;
 		ShortcutEntry entry;
+		if (item.cmd == Cmd::MacroRunSaved) entry.category = "Macros";
+		else if (item.cmd == Cmd::RunSaved) entry.category = "Run commands";
+		else if (item.cmd == Cmd::PluginCommand) entry.category = "Plugin commands";
 		entry.id = id;
 		entry.defaultShortcut = normalizeShortcut(item.shortcut);
 		const auto custom = settings.shortcuts.find(id);
 		entry.shortcut = custom != settings.shortcuts.end() ? custom->second : entry.defaultShortcut;
 		entries.push_back(entry);
 	});
+	appendScintillaShortcuts(entries);
 	return entries;
 }
 
@@ -3487,6 +4129,8 @@ bool Workspace::assignShortcut(const std::string &id, const std::string &raw) {
 	if (shortcut == self->defaultShortcut) settings.shortcuts.erase(id);
 	else settings.shortcuts[id] = shortcut;
 	saveSettings();
+	applyScintillaShortcuts(0);
+	applyScintillaShortcuts(1);
 	host.menusChanged();
 	return true;
 }
@@ -3558,7 +4202,7 @@ bool Workspace::columnInsertText(const std::string &value) {
 	return true;
 }
 
-bool Workspace::columnInsertNumbers(long initial, long increment, long repeat, bool leadingZeros, int base) {
+bool Workspace::columnInsertNumbers(long initial, long increment, long repeat, int leading, int base) {
 	if (repeat < 1) repeat = 1;
 	const long selectionStart = s(SCI_GETSELECTIONSTART);
 	const long firstLine = s(SCI_LINEFROMPOSITION, selectionStart);
@@ -3575,11 +4219,13 @@ bool Workspace::columnInsertNumbers(long initial, long increment, long repeat, b
 	// Numbers line up on the right, padded with zeros or spaces.
 	for (std::string &value : values) {
 		if (value.size() >= width) continue;
-		if (leadingZeros) {
+		if (leading == 1) {
 			const bool negative = value[0] == '-';
 			value.insert(negative ? 1 : 0, width - value.size(), '0');
-		} else {
+		} else if (leading == 2) {
 			value.insert(0, width - value.size(), ' ');
+		} else {
+			value.append(width - value.size(), ' ');  // No padding in front, but the column still lines up.
 		}
 	}
 	columnInsert(values);
@@ -3604,7 +4250,8 @@ void Workspace::columnEditorDialog() {
 	add("initial", "Initial number", FormField::Kind::Int, "1", -1000000000, 1000000000);
 	add("increment", "Increase by", FormField::Kind::Int, "1", -1000000, 1000000);
 	add("repeat", "Repeat", FormField::Kind::Int, "1", 1, 1000000);
-	add("zeros", "Leading zeros", FormField::Kind::Bool, "0");
+	add("zeros", "Leading", FormField::Kind::Choice, "0");
+	fields.back().choices = {{"0", "None"}, {"1", "Zeros"}, {"2", "Spaces"}};
 	FormField base;
 	base.key = "base";
 	base.label = "Format";
@@ -3619,7 +4266,7 @@ void Workspace::columnEditorDialog() {
 		columnInsertText(values["text"]);
 	} else {
 		const auto number = [&](const char *key) { return std::strtol(values[key].c_str(), nullptr, 10); };
-		columnInsertNumbers(number("initial"), number("increment"), number("repeat"), values["zeros"] == "1", static_cast<int>(number("base")));
+		columnInsertNumbers(number("initial"), number("increment"), number("repeat"), std::atoi(values["zeros"].c_str()), static_cast<int>(number("base")));
 	}
 }
 
@@ -3644,7 +4291,7 @@ void Workspace::styleOccurrences(int style) {
 	const std::string word = selectionOrWord();
 	if (word.empty()) return;
 	s(SCI_SETINDICATORCURRENT, styleIndicator(style));
-	s(SCI_SETSEARCHFLAGS, SCFIND_MATCHCASE | (selectedText().empty() ? SCFIND_WHOLEWORD : 0));
+	s(SCI_SETSEARCHFLAGS, (settings.prefOn("tokenMatchCase") ? SCFIND_MATCHCASE : 0) | (settings.prefOn("tokenWholeWord") ? SCFIND_WHOLEWORD : 0));
 	const long length = s(SCI_GETLENGTH);
 	long position = 0;
 	while (position <= length) {
@@ -3831,12 +4478,16 @@ void Workspace::run(Cmd cmd, int arg, const std::string &argument) {
 	const auto copyToClipboardIfAny = [&](const std::string &value) {
 		if (!value.empty()) host.setClipboard(value);
 	};
+	if (runFeature(cmd, arg, argument)) return;
 	switch (cmd) {
 	case Cmd::None: break;
 	case Cmd::New: createUntitledDocument(); break;
 	case Cmd::Open: {
 		std::vector<std::string> paths;
-		if (host.chooseFilesToOpen(document->path.empty() ? std::string() : directoryOf(document->path), paths)) openFiles(paths);
+		if (host.chooseFilesToOpen(dialogDirectory(), paths)) {
+			lastDialogDirectory = paths.empty() ? lastDialogDirectory : directoryOf(paths[0]);
+			openFiles(paths);
+		}
 		break;
 	}
 	case Cmd::OpenRecent:
@@ -3869,6 +4520,14 @@ void Workspace::run(Cmd cmd, int arg, const std::string &argument) {
 		break;
 	}
 	case Cmd::SaveAll: {
+		if (settings.prefOn("saveAllConfirm")) {
+			const int choice = host.ask("Save all open documents?", "", {"Cancel", "Save All", "Always Yes"});
+			if (choice < 1) break;
+			if (choice == 2) {
+				settings.prefs["saveAllConfirm"] = "0";
+				saveSettings();
+			}
+		}
 		const auto snapshot = documents;
 		for (const auto &d : snapshot) {
 			if (!d->dirty()) continue;
@@ -3929,19 +4588,17 @@ void Workspace::run(Cmd cmd, int arg, const std::string &argument) {
 
 	case Cmd::Undo: s(SCI_UNDO); break;
 	case Cmd::Redo: s(SCI_REDO); break;
-	case Cmd::Cut: s(SCI_CUT); break;
-	case Cmd::Copy: s(SCI_COPY); break;
+	case Cmd::Cut:
+		if (settings.prefOn("copyLineNoSelection") && s(SCI_GETSELECTIONSTART) == s(SCI_GETSELECTIONEND)) s(SCI_LINECUT);
+		else s(SCI_CUT);
+		break;
+	case Cmd::Copy:
+		if (settings.prefOn("copyLineNoSelection")) s(SCI_COPYALLOWLINE);
+		else s(SCI_COPY);
+		break;
 	case Cmd::Paste: s(SCI_PASTE); break;
 	case Cmd::SelectAll: s(SCI_SELECTALL); break;
-	case Cmd::InsertDate: {
-		char buffer[128];
-		const time_t now = time(nullptr);
-		struct tm local;
-		localtime_r(&now, &local);
-		strftime(buffer, sizeof(buffer), arg == 0 ? "%x %H:%M" : "%A, %B %e, %Y %H:%M:%S", &local);
-		s(SCI_REPLACESEL, 0, reinterpret_cast<intptr_t>(buffer));
-		break;
-	}
+	case Cmd::InsertDate: insertDate(arg); break;
 	case Cmd::CopyPath:
 		if (arg == 0) copyToClipboardIfAny(document->path.empty() ? document->title() : document->path);
 		else if (arg == 1) copyToClipboardIfAny(document->title());
@@ -4003,13 +4660,20 @@ void Workspace::run(Cmd cmd, int arg, const std::string &argument) {
 		break;
 	}
 
-	case Cmd::ShowFind: host.showFind(FindTab::Find, selectionOrWord(), std::string()); break;
-	case Cmd::ShowReplace: host.showFind(FindTab::Replace, selectionOrWord(), std::string()); break;
+	case Cmd::ShowFind:
+	case Cmd::ShowReplace: {
+		const long threshold = settings.prefInt("fillInSelection");
+		const long length = s(SCI_GETSELECTIONEND) - s(SCI_GETSELECTIONSTART);
+		host.setFindInSelection(threshold > 0 && length >= threshold);
+		host.showFind(cmd == Cmd::ShowFind ? FindTab::Find : FindTab::Replace, length >= threshold && threshold > 0 ? std::string() : findPrefill(), std::string());
+		break;
+	}
 	case Cmd::ShowFindInFiles: {
 		std::string directory;
 		if (!document->path.empty()) directory = directoryOf(document->path);
 		if (!folderRoots.empty() && directory.empty()) directory = folderRoots.front();
-		host.showFind(FindTab::Files, selectionOrWord(), directory);
+		if (!settings.prefOn("fillFilesDirectory")) directory.clear();
+		host.showFind(FindTab::Files, findPrefill(), directory);
 		break;
 	}
 	case Cmd::FindNext: runFromMenu(false, false); break;
@@ -4134,6 +4798,11 @@ void Workspace::run(Cmd cmd, int arg, const std::string &argument) {
 	case Cmd::FoldCurrent:
 	case Cmd::UnfoldCurrent: {
 		const long line = currentLine();
+		if (settings.prefOn("foldToggle")) {
+			const long toggleLine = (s(SCI_GETFOLDLEVEL, line) & SC_FOLDLEVELHEADERFLAG) ? line : s(SCI_GETFOLDPARENT, line);
+			if (toggleLine >= 0) s(SCI_TOGGLEFOLD, toggleLine);
+			break;
+		}
 		const long header = (s(SCI_GETFOLDLEVEL, line) & SC_FOLDLEVELHEADERFLAG) ? line : s(SCI_GETFOLDPARENT, line);
 		if (header >= 0) s(SCI_FOLDLINE, header, cmd == Cmd::FoldCurrent ? SC_FOLDACTION_CONTRACT : SC_FOLDACTION_EXPAND);
 		break;
@@ -4204,6 +4873,7 @@ void Workspace::run(Cmd cmd, int arg, const std::string &argument) {
 		break;
 	}
 	case Cmd::About:
+		if (aboutEasterEgg()) break;
 		host.ask("omapad",
 		         "A native text editor modelled on Notepad++, built on Scintilla and Lexilla. Language keywords, style data and themes come from Notepad++ 8.9.8.1 under the GNU GPL v3.\n\n"
 		         "omapad is an independent project. It is not Notepad++, and isn't affiliated with or endorsed by its authors or by Omarchy.", {"OK"});
@@ -4338,8 +5008,18 @@ void Workspace::run(Cmd cmd, int arg, const std::string &argument) {
 	case Cmd::DeleteSelection: s(SCI_CLEAR); break;
 	case Cmd::ToggleReadOnly: s(SCI_SETREADONLY, !s(SCI_GETREADONLY)); break;
 	case Cmd::Rename: {
-		if (document->path.empty()) break;
 		std::string name, error;
+		if (document->path.empty()) {
+			// An untitled tab has no file to rename, so this just names the tab.
+			if (host.promptText("Rename Tab", "New name:", document->title(), name) && !name.empty()) {
+				bool taken = false;
+				for (const auto &other : documents) taken = taken || (other.get() != document && other->title() == name);
+				if (taken) host.ask("A tab already has that name.", name, {"OK"});
+				else document->untitledName = name;
+				refreshChrome();
+			}
+			break;
+		}
 		const std::string current = document->path;
 		if (host.promptText("Rename", "New name:", baseName(current), name) && !renamePath(current, name, error))
 			host.ask("That could not be renamed.", error, {"OK"});
@@ -4401,7 +5081,7 @@ MenuState Workspace::stateOf(const MenuItem &item) {
 	case Cmd::ToggleFunctionList: state.checked = functionPanel; break;
 	case Cmd::ToggleDocumentMap: state.checked = mapVisible; break;
 	case Cmd::ToggleReadOnly: state.checked = s(SCI_GETREADONLY) != 0; break;
-	case Cmd::Rename: state.enabled = saved; break;
+	case Cmd::RestoreClosed: state.enabled = !recentlyClosed.empty(); break;
 	case Cmd::PrintSelection: state.enabled = s(SCI_GETSELECTIONSTART) != s(SCI_GETSELECTIONEND); break;
 	case Cmd::RemoveLanguage: {
 		state.enabled = false;
@@ -4410,6 +5090,27 @@ MenuState Workspace::stateOf(const MenuItem &item) {
 		break;
 	}
 	case Cmd::ToggleHiddenInFolders: state.checked = settings.showHiddenInFolders; break;
+	case Cmd::TogglePanel: state.checked = panelVisible(item.arg); break;
+	case Cmd::PostIt: state.checked = postIt; break;
+	case Cmd::DistractionFree: state.checked = distractionFree; break;
+	case Cmd::ToggleNonPrinting: state.checked = settings.showNonPrinting; break;
+	case Cmd::ToggleControlChars: state.checked = settings.showControlChars; break;
+	case Cmd::ToggleZoomSync: state.checked = settings.syncZoom; break;
+	case Cmd::ToggleMonitoring: state.checked = document->monitoring; state.enabled = saved; break;
+	case Cmd::TextDirection: state.checked = document->rightToLeft == (item.arg == 1); break;
+	case Cmd::TabColour: state.checked = activeTabPointer() && activeTabPointer()->colour == item.arg; break;
+	case Cmd::PinActive: state.checked = activeTabPointer() && activeTabPointer()->pinned; break;
+	case Cmd::FileReadOnly:
+		state.enabled = saved;
+		state.checked = saved && access(document->path.c_str(), W_OK) != 0;
+		break;
+	case Cmd::OpenTerminal:
+	case Cmd::OpenFolderOfFile:
+	case Cmd::OpenDefaultViewer:
+	case Cmd::ViewInBrowser:
+	case Cmd::MoveToNewInstance:
+	case Cmd::OpenInNewInstance: state.enabled = saved; break;
+	case Cmd::MacroSave: state.enabled = !recording && !macro.empty(); break;
 	case Cmd::CloseAllFolders:
 	case Cmd::RefreshFolders: state.enabled = !folderRoots.empty(); break;
 	case Cmd::SelectDocument:
@@ -4426,7 +5127,10 @@ std::vector<MenuItem> Workspace::dynamicMenu(MenuItem::Dynamic kind) const {
 	if (kind == MenuItem::Dynamic::Recent) {
 		for (const std::string &path : settings.recent) {
 			MenuItem item;
-			item.title = baseName(path);
+			const std::string display = settings.pref("recentDisplay");
+			item.title = display == "name" ? baseName(path) : path;
+			const size_t maxLength = static_cast<size_t>(settings.prefInt("recentMaxLength"));
+			if (display == "custom" && item.title.size() > maxLength) item.title = "…" + item.title.substr(item.title.size() - maxLength);
 			item.cmd = Cmd::OpenRecent;
 			item.text = path;
 			out.push_back(item);
@@ -4453,7 +5157,22 @@ std::vector<MenuItem> Workspace::dynamicMenu(MenuItem::Dynamic kind) const {
 	return out;
 }
 
-std::vector<MenuItem> Workspace::tabMenu(int pane, int index) const {
+std::vector<MenuItem> Workspace::tabMenu(int pane, int index) {
+	std::string custom;
+	{
+		std::ifstream in(fs::path(settingsDir) / "tabContextMenu.xml", std::ios::binary);
+		std::stringstream buffer;
+		buffer << in.rdbuf();
+		custom = buffer.str();
+	}
+	if (!custom.empty()) {
+		// These are ordinary commands, and they act on the active tab. Right-clicking activates it first.
+		std::vector<MenuItem> configured = menuFromXml(custom, "TabContextMenu", nullptr, pane, index);
+		if (!configured.empty()) {
+			clickTab(pane, index);
+			return configured;
+		}
+	}
 	std::vector<MenuItem> out;
 	const auto add = [&](const char *title, Cmd cmd) {
 		MenuItem item;
@@ -4474,6 +5193,39 @@ std::vector<MenuItem> Workspace::tabMenu(int pane, int index) const {
 	separator();
 	add(pane == 0 ? "Move to Second View" : "Move to First View", Cmd::TabMoveToOther);
 	add(pane == 0 ? "Clone to Second View" : "Clone to First View", Cmd::TabCloneToOther);
+	{
+		const auto action = [&](const char *title, const char *name) {
+			MenuItem item;
+			item.title = title;
+			item.cmd = Cmd::TabAction;
+			item.arg = encodeTab(pane, index);
+			item.text = name;
+			return item;
+		};
+		separator();
+		out.push_back(action("Save", "save"));
+		out.push_back(action("Save As…", "saveAs"));
+		out.push_back(action("Rename…", "rename"));
+		out.push_back(action("Reload", "reload"));
+		out.push_back(action("Print…", "print"));
+		out.push_back(action("Read-Only", "readOnly"));
+		out.push_back(action("Open in New Instance", "newInstance"));
+		out.push_back(action("Move to New Instance", "moveInstance"));
+		out.push_back(action("Move to Trash", "trash"));
+		separator();
+		out.push_back(action("Copy File Name", "copyName"));
+		out.push_back(action("Copy Folder Path", "copyFolder"));
+		MenuItem colours;
+		colours.title = "Tab Color";
+		for (int c = 1; c <= 5; c++) colours.children.push_back(action(("Apply Color " + std::to_string(c)).c_str(), ("colour" + std::to_string(c)).c_str()));
+		colours.children.push_back(action("Remove Color", "colour0"));
+		out.push_back(colours);
+	}
+	separator();
+	{
+		const auto &tabList = paneAt(pane).tabs;
+		if (settings.prefOn("tabPinEnabled")) add(index >= 0 && index < static_cast<int>(tabList.size()) && tabList[index].pinned ? "Unpin Tab" : "Pin Tab", Cmd::TabPin);
+	}
 	const auto &list = paneAt(pane).tabs;
 	if (index >= 0 && index < static_cast<int>(list.size()) && !list[index].document->path.empty()) {
 		separator();
@@ -4502,6 +5254,11 @@ std::vector<MenuItem> Workspace::folderMenu(const std::string &path, bool isDire
 		out.push_back(item);
 	};
 	const std::string directory = isDirectory ? path : directoryOf(path);
+	if (!isDirectory) {
+		add("Open", Cmd::FolderOpen, path);
+		add("Run by System", Cmd::FolderRunBySystem, path);
+		separator();
+	}
 	add("New File…", Cmd::FolderNewFile, directory);
 	add("New Folder…", Cmd::FolderNewFolder, directory);
 	add("Find in Files…", Cmd::FolderFindInFiles, directory);
@@ -4516,6 +5273,8 @@ std::vector<MenuItem> Workspace::folderMenu(const std::string &path, bool isDire
 		separator();
 	}
 	add("Copy Path", Cmd::FolderCopyPath, path);
+	add("Copy File Name", Cmd::FolderCopyName, path);
+	add("Terminal Here", Cmd::FolderTerminal, directory);
 #ifdef __APPLE__
 	add("Reveal in Finder", Cmd::FolderReveal, path);
 #else
@@ -4524,9 +5283,72 @@ std::vector<MenuItem> Workspace::folderMenu(const std::string &path, bool isDire
 	if (isRoot) {
 		separator();
 		add("Remove from Workspace", Cmd::FolderRemoveRoot, path);
+		add("Remove All", Cmd::FolderRemoveAll, path);
 	}
+	separator();
+	add("Unfold All", Cmd::FolderExpandAll, path);
+	add("Fold All", Cmd::FolderCollapseAll, path);
+	add("Locate Current File", Cmd::FolderLocate, path);
 	return out;
 }
+
+#ifndef __APPLE__
+namespace {
+// Notepad++'s own default keys, for the commands where omapad had a different one or none.
+// A key taken here is removed from whatever held it, which keeps every default unique.
+void adoptNotepadKeys(std::vector<MenuItem> &menu) {
+	struct Key { std::string title; Cmd cmd; int arg; std::string shortcut; };
+	std::vector<Key> table = {
+		{"Begin/End Select", Cmd::None, 0, "Mod+Shift+B"},
+		{"Begin/End Select in Column Mode", Cmd::None, 0, "Alt+Shift+B"},
+		{"Proper Case", Cmd::None, 0, "Alt+U"},
+		{"Proper Case (blend)", Cmd::None, 0, "Alt+Shift+U"},
+		{"Sentence case", Cmd::None, 0, "Mod+Alt+U"},
+		{"Sentence case (blend)", Cmd::None, 0, "Mod+Alt+Shift+U"},
+		{"Split Lines", Cmd::None, 0, "Mod+I"},
+		{"Insert Blank Line Above Current", Cmd::None, 0, "Mod+Alt+Return"},
+		{"Insert Blank Line Below Current", Cmd::None, 0, "Mod+Alt+Shift+Return"},
+		{"Single Line Comment", Cmd::None, 0, "Mod+K"},
+		{"Single Line Uncomment", Cmd::None, 0, "Mod+Shift+K"},
+		{"Word Completion", Cmd::None, 0, "Mod+Return"},
+		{"Function Parameters Hint", Cmd::None, 0, "Mod+Shift+Space"},
+		{"Path Completion", Cmd::None, 0, "Mod+Alt+Space"},
+		{"Select All In-between {} [] or ()", Cmd::None, 0, "Mod+Alt+B"},
+		{"Fold Current Level", Cmd::None, 0, "Mod+Alt+F"},
+		{"Unfold Current Level", Cmd::None, 0, "Mod+Alt+Shift+F"},
+		{"Text Direction RTL", Cmd::None, 0, "Mod+Alt+R"},
+		{"Text Direction LTR", Cmd::None, 0, "Mod+Alt+L"},
+		{"Move Tab Forward", Cmd::None, 0, "Mod+Shift+PageDown"},
+		{"Move Tab Backward", Cmd::None, 0, "Mod+Shift+PageUp"},
+		{"Exit", Cmd::None, 0, "Alt+F4"},
+		{"", Cmd::JumpStyleDown, 0, "Mod+0"},
+		{"", Cmd::JumpStyleUp, 0, "Mod+Shift+0"},
+	};
+	for (int i = 1; i <= 5; i++) {
+		table.push_back({"", Cmd::JumpStyleDown, i, "Mod+" + std::to_string(i)});
+		table.push_back({"", Cmd::JumpStyleUp, i, "Mod+Shift+" + std::to_string(i)});
+	}
+	for (int i = 1; i <= 8; i++) {
+		table.push_back({"", Cmd::FoldLevel, i, "Alt+" + std::to_string(i)});
+		table.push_back({"", Cmd::UnfoldLevel, i, "Alt+Shift+" + std::to_string(i)});
+	}
+	// Tabs move to the numeric keypad, as the number row now jumps between styled text.
+	for (int i = 0; i < 9; i++) table.push_back({"", Cmd::ActivateTab, i, "Mod+KP_" + std::to_string(i + 1)});
+	std::set<std::string> taken;
+	for (const Key &key : table) taken.insert(key.shortcut);
+	walkMenu(menu, "", [&](MenuItem &item, const std::string &) {
+		if (taken.count(item.shortcut)) item.shortcut.clear();
+		for (const Key &key : table) {
+			const bool matches = key.title.empty() ? item.cmd == key.cmd && item.arg == key.arg : item.title == key.title;
+			if (matches) {
+				item.shortcut = key.shortcut;
+				item.macAction.clear();
+			}
+		}
+	});
+}
+}  // namespace
+#endif
 
 std::vector<MenuItem> Workspace::baseMenu() const {
 #ifdef __APPLE__
@@ -4582,16 +5404,22 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 		item("Open…", Cmd::Open, "Mod+O"),
 		dynamic("Open Recent", MenuItem::Dynamic::Recent),
 		item("Open Folder as Workspace…", Cmd::OpenFolder, "Mod+Alt+O"),
+		sub("Open Containing Folder", {
 #ifdef __APPLE__
-		item("Reveal in Finder", Cmd::Reveal),
+			item("Reveal in Finder", Cmd::Reveal),
 #else
-		item("Show in File Manager", Cmd::Reveal),
+			item("Show in File Manager", Cmd::Reveal),
 #endif
+			item("Terminal", Cmd::OpenTerminal),
+			item("Folder as Workspace", Cmd::OpenFolderOfFile),
+		}),
+		item("Open in Default Viewer", Cmd::OpenDefaultViewer),
 		item("Reload from Disk", Cmd::Reload, "Mod+R"),
 		separator(),
 		item("Save", Cmd::Save, "Mod+S"),
 		item("Save As…", Cmd::SaveAs, key("Mod+Shift+S", "Mod+Alt+S")),
 		item("Save a Copy As…", Cmd::SaveCopy),
+		item("Restore Recent Closed File", Cmd::RestoreClosed, "Mod+Shift+T"),
 		item("Save All", Cmd::SaveAll, key("Mod+Alt+S", "Mod+Shift+S")),
 		separator(),
 		item("Print…", Cmd::Print, "Mod+P"),
@@ -4605,10 +5433,14 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 			item("Close All but Active Document", Cmd::CloseOthers),
 			item("Close All to the Left", Cmd::CloseLeft),
 			item("Close All to the Right", Cmd::CloseRight),
+			item("Close All but Pinned Documents", Cmd::CloseUnpinned),
 			item("Close All Unchanged", Cmd::CloseUnchanged),
 		}),
 		item("Rename…", Cmd::Rename),
 		item("Move to Trash", Cmd::Trash),
+		separator(),
+		item("Load Session…", Cmd::LoadSession),
+		item("Save Session…", Cmd::SaveSession),
 	};
 #ifndef __APPLE__
 	file.push_back(separator());
@@ -4632,6 +5464,7 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 		separator(),
 		op("Sort Lines Lexicographically Ascending", LineOp::SortLexAsc),
 		op("Sort Lines Lex. Ascending Ignoring Case", LineOp::SortFoldAsc),
+		op("Sort Lines In Locale Order Ascending", LineOp::SortLocaleAsc),
 		op("Sort Lines As Integers Ascending", LineOp::SortIntAsc),
 		op("Sort Lines As Decimals (Dot) Ascending", LineOp::SortDecimalAsc),
 		op("Sort Lines As Decimals (Comma) Ascending", LineOp::SortDecimalCommaAsc),
@@ -4639,6 +5472,7 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 		separator(),
 		op("Sort Lines Lexicographically Descending", LineOp::SortLexDesc),
 		op("Sort Lines Lex. Descending Ignoring Case", LineOp::SortFoldDesc),
+		op("Sort Lines In Locale Order Descending", LineOp::SortLocaleDesc),
 		op("Sort Lines As Integers Descending", LineOp::SortIntDesc),
 		op("Sort Lines As Decimals (Dot) Descending", LineOp::SortDecimalDesc),
 		op("Sort Lines As Decimals (Comma) Descending", LineOp::SortDecimalCommaDesc),
@@ -4654,6 +5488,8 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 		edit("Paste", Cmd::Paste, "Mod+V", "paste:"),
 		edit("Select All", Cmd::SelectAll, "Mod+A", "selectAll:"),
 		item("Delete", Cmd::DeleteSelection),
+		item("Begin/End Select", Cmd::BeginEndSelect, "", 0),
+		item("Begin/End Select in Column Mode", Cmd::BeginEndSelect, "", 1),
 		separator(),
 		sub("Multi-select All", {
 			item("Ignore Case & Whole Word", Cmd::MultiSelectAll, key("Mod+Ctrl+A", "Mod+Alt+A"), 0),
@@ -4669,7 +5505,10 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 		}),
 		item("Undo the Latest Added Multi-Select", Cmd::MultiSelectUndo),
 		item("Skip Current & Go to Next Multi-select", Cmd::MultiSelectSkip),
+		item("Column Mode…", Cmd::ColumnModeInfo),
 		item("Column Editor…", Cmd::ColumnEditor, key("Mod+Alt+C", "Alt+C")),
+		item("Character Panel", Cmd::TogglePanel, "", kPanelCharacters),
+		item("Clipboard History", Cmd::TogglePanel, "", kPanelClipboard),
 		separator(),
 		sub("Auto-Completion", {
 			item("Function Completion", Cmd::CompleteFunction, key("Ctrl+Space", "Mod+Space")),
@@ -4683,15 +5522,23 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 			item("Increase Line Indent", Cmd::IndentLine),
 			item("Decrease Line Indent", Cmd::UnindentLine),
 		}),
-		item("Read-Only", Cmd::ToggleReadOnly),
+		sub("Read-Only in omapad", {
+			item("Read-Only on Current Document", Cmd::ToggleReadOnly),
+			item("Read-Only for All Documents", Cmd::ReadOnlyAll),
+			item("Clear Read-Only for All Documents", Cmd::ReadOnlyClearAll),
+		}),
+		item("Read-Only Attribute of the File", Cmd::FileReadOnly),
 		sub("Insert", {
-			item("Date and Time (short)", Cmd::InsertDate, "", 0),
-			item("Date and Time (long)", Cmd::InsertDate, "", 1),
+			item("Date Time (short)", Cmd::InsertDate, "", 0),
+			item("Date Time (long)", Cmd::InsertDate, "", 1),
+			item("Date Time (customized)", Cmd::InsertDate, "", 2),
 		}),
 		sub("Copy to Clipboard", {
 			item("Current Full File Path", Cmd::CopyPath, "", 0),
 			item("Current Filename", Cmd::CopyPath, "", 1),
 			item("Current Folder Path", Cmd::CopyPath, "", 2),
+			item("All Filenames", Cmd::CopyAllNames, "", 0),
+			item("All File Paths", Cmd::CopyAllNames, "", 1),
 		}),
 		sub("Convert Case to", {
 			kase("UPPERCASE", CaseOp::Upper, "Mod+Shift+U"),
@@ -4709,6 +5556,7 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 			item("Single Line Comment", Cmd::Comment, "", static_cast<int>(CommentMode::Comment)),
 			item("Single Line Uncomment", Cmd::Comment, "", static_cast<int>(CommentMode::Uncomment)),
 			item("Block Comment", Cmd::BlockComment, key("Mod+Alt+/", "Mod+Shift+Q")),
+			item("Block Uncomment", Cmd::BlockUncomment),
 		}),
 		sub("EOL Conversion", {
 			item("Windows (CR LF)", Cmd::EolConvert, "", static_cast<int>(Eol::CRLF)),
@@ -4720,10 +5568,27 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 			op("Trim Leading Space", LineOp::TrimLeading),
 			op("Trim Leading and Trailing Space", LineOp::TrimBoth),
 			item("EOL to Space", Cmd::EolToSpace),
+			item("Trim both and EOL to Space", Cmd::TrimEolToSpace),
 			separator(),
 			item("TAB to Space", Cmd::TabsToSpaces),
 			item("Space to TAB (All)", Cmd::SpacesToTabs, "", 0),
 			item("Space to TAB (Leading)", Cmd::SpacesToTabs, "", 1),
+		}),
+		sub("Paste Special", {
+			item("Paste HTML Content", Cmd::PasteHtml),
+			item("Paste RTF Content", Cmd::PasteRtf),
+			separator(),
+			item("Copy Binary Content", Cmd::CopyBinary),
+			item("Cut Binary Content", Cmd::CutBinary),
+			item("Paste Binary Content", Cmd::PasteBinary),
+		}),
+		sub("On Selection", {
+			item("Open File", Cmd::OpenSelection),
+			item("Open Containing Folder", Cmd::OpenSelectionFolder),
+			item("Redact Selection █", Cmd::RedactSelection, "", 0),
+			item("Redact Selection ●", Cmd::RedactSelection, "", 1),
+			item("Search on Internet", Cmd::SearchInternet),
+			item("Change Search Engine…", Cmd::ChangeSearchEngine),
 		}),
 	};
 
@@ -4748,18 +5613,24 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 	std::vector<MenuItem> search = {
 		item("Find…", Cmd::ShowFind, "Mod+F"),
 		item("Find in Files…", Cmd::ShowFindInFiles, "Mod+Shift+F"),
+		item("Find in Projects…", Cmd::FindInProjects),
 		item("Find Next", Cmd::FindNext, key("Mod+G", "F3")),
 		item("Find Previous", Cmd::FindPrevious, key("Mod+Shift+G", "Shift+F3")),
 		item("Select and Find Next", Cmd::SelectFindNext, key("Mod+E", "Mod+F3")),
 		item("Select and Find Previous", Cmd::SelectFindPrevious, key("Mod+Shift+E", "Mod+Shift+F3")),
+		item("Find (Volatile) Next", Cmd::VolatileFind, key("Mod+Alt+G", "Mod+Alt+F3"), 0),
+		item("Find (Volatile) Previous", Cmd::VolatileFind, key("Mod+Alt+Shift+G", "Mod+Alt+Shift+F3"), 1),
 		item("Replace…", Cmd::ShowReplace, key("Mod+Alt+F", "Mod+H")),
+		item("Incremental Search", Cmd::IncrementalSearch, key("Mod+Alt+I", "Mod+Alt+I")),
 		item("Search Results Window", Cmd::ToggleResults, "F7"),
 		item("Next Search Result", Cmd::NextSearchResult, "F4"),
 		item("Previous Search Result", Cmd::PreviousSearchResult, "Shift+F4"),
 		separator(),
 		item("Go to Line…", Cmd::GoToLine, key("Mod+L", "Mod+G")),
+		item("Go to…", Cmd::GoToDialog),
 		item("Go to Matching Brace", Cmd::MatchingBrace, "Mod+B"),
 		item("Select All In-between {} [] or ()", Cmd::SelectInBraces, "Mod+Alt+Shift+B"),
+		item("Mark…", Cmd::ShowMark, key("Mod+Alt+K", "Mod+M")),
 		separator(),
 		sub("Change History", {
 			item("Go to Next Change", Cmd::NextChange, "Mod+Alt+Down"),
@@ -4778,11 +5649,14 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 			item("Next Bookmark", Cmd::NextBookmark, "F2"),
 			item("Previous Bookmark", Cmd::PreviousBookmark, "Shift+F2"),
 			item("Clear All Bookmarks", Cmd::ClearBookmarks),
+			item("Cut Bookmarked Lines", Cmd::CutBookmarked),
 			item("Copy Bookmarked Lines", Cmd::CopyBookmarked),
+			item("Paste to (Replace) Bookmarked Lines", Cmd::PasteBookmarked),
 			item("Remove Bookmarked Lines", Cmd::RemoveBookmarked),
 			item("Remove Non-Bookmarked Lines", Cmd::RemoveUnbookmarked),
 			item("Inverse Bookmarks", Cmd::InvertBookmarks),
 		}),
+		item("Find Characters in Range…", Cmd::FindCharsInRange),
 	};
 
 	std::vector<MenuItem> tabsMenu;
@@ -4792,6 +5666,14 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 	tabsMenu.push_back(item("Previous Tab", Cmd::PreviousTab, key("Mod+Shift+[", "Mod+PageUp")));
 	tabsMenu.push_back(item("Move Tab Forward", Cmd::MoveTabForward));
 	tabsMenu.push_back(item("Move Tab Backward", Cmd::MoveTabBackward));
+	tabsMenu.push_back(item("First Tab", Cmd::FirstTab));
+	tabsMenu.push_back(item("Last Tab", Cmd::LastTab));
+	tabsMenu.push_back(item("Move to Start", Cmd::MoveTabStart));
+	tabsMenu.push_back(item("Move to End", Cmd::MoveTabEnd));
+	tabsMenu.push_back(separator());
+	tabsMenu.push_back(item("Pin Tab", Cmd::PinActive));
+	for (int i = 1; i <= 5; i++) tabsMenu.push_back(item("Apply Color " + std::to_string(i), Cmd::TabColour, "", i));
+	tabsMenu.push_back(item("Remove Color", Cmd::TabColour, "", 0));
 
 	std::vector<MenuItem> foldLevels, unfoldLevels;
 	for (int i = 1; i <= 8; i++) {
@@ -4802,13 +5684,40 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 	std::vector<MenuItem> viewMenu = {
 		item("Always on Top", Cmd::AlwaysOnTop),
 		item("Toggle Full Screen", Cmd::FullScreen, key("Mod+Ctrl+F", "F11")),
+		item("Post-It", Cmd::PostIt, "F12"),
+		item("Distraction Free Mode", Cmd::DistractionFree),
+		sub("View Current File in", {
+			textItem("Firefox", Cmd::ViewInBrowser, "firefox"),
+			textItem("Chrome", Cmd::ViewInBrowser, "chrome"),
+			textItem("Edge", Cmd::ViewInBrowser, "edge"),
+#ifdef __APPLE__
+			textItem("Safari", Cmd::ViewInBrowser, "safari"),
+#endif
+			textItem("Default Browser", Cmd::ViewInBrowser, ""),
+		}),
 		separator(),
 		item("Folder as Workspace", Cmd::ToggleFolderPanel, "Mod+Alt+B"),
 		item("Function List", Cmd::ToggleFunctionList, "Mod+Alt+L"),
 		item("Document Map", Cmd::ToggleDocumentMap, "Mod+Alt+M"),
+		item("Document List", Cmd::TogglePanel, "", kPanelDocuments),
+		sub("Switch to", {
+			item("Document List", Cmd::FocusPanel, "", kPanelDocuments),
+			item("Folder as Workspace", Cmd::FocusPanel, "", kPanelFolders),
+			item("Function List", Cmd::FocusPanel, "", kPanelFunctions),
+			item("Project Panel 1", Cmd::FocusPanel, "", kPanelProject1),
+			item("Project Panel 2", Cmd::FocusPanel, "", kPanelProject2),
+			item("Project Panel 3", Cmd::FocusPanel, "", kPanelProject3),
+		}),
+		sub("Project Panels", {
+			item("Project Panel 1", Cmd::TogglePanel, "", kPanelProject1),
+			item("Project Panel 2", Cmd::TogglePanel, "", kPanelProject2),
+			item("Project Panel 3", Cmd::TogglePanel, "", kPanelProject3),
+		}),
 		sub("Split View", {
 			item("Move to Other View", Cmd::MoveToOtherView, "Mod+Alt+Right"),
 			item("Clone to Other View", Cmd::CloneToOtherView, "Mod+Alt+Shift+Right"),
+			item("Move to New Instance", Cmd::MoveToNewInstance),
+			item("Open in New Instance", Cmd::OpenInNewInstance),
 			item("Focus on Other View", Cmd::FocusOtherView, "F8"),
 			separator(),
 			item("Stack Views", Cmd::RotateSplit),
@@ -4818,6 +5727,8 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 		sub("Show Symbol", {
 			item("Show Space and Tab", Cmd::ToggleSpace),
 			item("Show End of Line", Cmd::ToggleEol),
+			item("Show Non-Printing Characters", Cmd::ToggleNonPrinting),
+			item("Show Control Characters & Unicode EOL", Cmd::ToggleControlChars),
 			item("Show All Characters", Cmd::ToggleAllCharacters),
 			item("Show Indent Guide", Cmd::ToggleGuides),
 			item("Show Wrap Symbol", Cmd::ToggleWrapSymbol),
@@ -4826,6 +5737,7 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 			item("Zoom In", Cmd::ZoomIn, "Mod+="),
 			item("Zoom Out", Cmd::ZoomOut, "Mod+-"),
 			item("Restore Default Zoom", Cmd::ZoomReset, "Mod+0"),
+			item("Synchronize Across Views", Cmd::ToggleZoomSync),
 		}),
 		sub("Tab", tabsMenu),
 		item("Word Wrap", Cmd::ToggleWrap, "Alt+Z"),
@@ -4837,21 +5749,57 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 		sub("Fold Level", foldLevels),
 		sub("Unfold Level", unfoldLevels),
 		separator(),
+		item("Hide Lines", Cmd::HideLines, key("Mod+Alt+H", "Alt+H")),
 		item("Summary…", Cmd::Summary),
+		separator(),
+		item("Text Direction RTL", Cmd::TextDirection, "", 1),
+		item("Text Direction LTR", Cmd::TextDirection, "", 0),
+		item("Monitoring (tail -f)", Cmd::ToggleMonitoring),
 	};
 
-	std::vector<MenuItem> reopen, convert;
-	for (const Encoding &e : allEncodings()) {
-		reopen.push_back(textItem(e.name, Cmd::ReopenEncoding, e.identifier));
-		convert.push_back(textItem(e.name, Cmd::ConvertEncoding, e.identifier));
-	}
+	// Choosing an encoding reads the file again in it. Convert keeps the text and changes the encoding.
+	std::vector<MenuItem> encodingMenu = {
+		textItem("ANSI", Cmd::ReopenEncoding, "cp1252"),
+		textItem("UTF-8", Cmd::ReopenEncoding, "utf8"),
+		textItem("UTF-8-BOM", Cmd::ReopenEncoding, "utf8bom"),
+		textItem("UTF-16 BE BOM", Cmd::ReopenEncoding, "utf16be"),
+		textItem("UTF-16 LE BOM", Cmd::ReopenEncoding, "utf16le"),
+	};
+	const auto charsetMenu = [&](Cmd cmd) {
+		std::vector<MenuItem> groups;
+		for (const Encoding &e : allEncodings()) {
+			if (!*e.group) continue;
+			auto group = std::find_if(groups.begin(), groups.end(), [&](const MenuItem &g) { return g.title == e.group; });
+			if (group == groups.end()) {
+				groups.push_back(sub(e.group, {}));
+				group = groups.end() - 1;
+			}
+			group->children.push_back(textItem(e.name, cmd, e.identifier));
+		}
+		return groups;
+	};
+	encodingMenu.push_back(sub("Character Sets", charsetMenu(Cmd::ReopenEncoding)));
+	encodingMenu.push_back(separator());
+	encodingMenu.push_back(textItem("Convert to ANSI", Cmd::ConvertEncoding, "cp1252"));
+	encodingMenu.push_back(textItem("Convert to UTF-8", Cmd::ConvertEncoding, "utf8"));
+	encodingMenu.push_back(textItem("Convert to UTF-8-BOM", Cmd::ConvertEncoding, "utf8bom"));
+	encodingMenu.push_back(textItem("Convert to UTF-16 BE BOM", Cmd::ConvertEncoding, "utf16be"));
+	encodingMenu.push_back(textItem("Convert to UTF-16 LE BOM", Cmd::ConvertEncoding, "utf16le"));
+	encodingMenu.push_back(sub("Convert to Character Set", charsetMenu(Cmd::ConvertEncoding)));
 
 	std::vector<MenuItem> languageMenu;
 	languageMenu.push_back(textItem(catalog.plainText() ? catalog.plainText()->displayName : "Normal text", Cmd::SetLanguage, "normal"));
 	languageMenu.push_back(separator());
 	std::string letter;
+	const bool compactLanguages = settings.prefOn("languageCompact");
+	const std::string hiddenLanguages = " " + settings.pref("disabledLanguages") + " ";
 	for (const Language *language : catalog.languages()) {
 		if (language == catalog.plainText() || language->displayName.empty()) continue;
+		if (hiddenLanguages.find(" " + language->name + " ") != std::string::npos) continue;
+		if (!compactLanguages) {
+			languageMenu.push_back(textItem(language->displayName, Cmd::SetLanguage, language->name));
+			continue;
+		}
 		const std::string first(1, static_cast<char>(std::toupper(static_cast<unsigned char>(language->displayName[0]))));
 		if (first != letter) {
 			letter = first;
@@ -4882,17 +5830,80 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 	const std::pair<const char *, HashKind> hashes[] = {{"MD5", HashKind::MD5}, {"SHA-1", HashKind::SHA1}, {"SHA-256", HashKind::SHA256}, {"SHA-512", HashKind::SHA512}};
 	for (const auto &hash : hashes) {
 		toolsMenu.push_back(sub(hash.first, {
+			item("Generate…", Cmd::HashDialog, "", static_cast<int>(hash.second)),
 			item("Generate from Files…", Cmd::HashFiles, "", static_cast<int>(hash.second)),
 			item("Generate from Selection into Clipboard", Cmd::HashSelection, "", static_cast<int>(hash.second)),
 		}));
 	}
 
-	return {
+	std::vector<MenuItem> macroMenu = {
+		item("Start Recording", Cmd::MacroStart),
+		item("Stop Recording", Cmd::MacroStop),
+		item("Playback", Cmd::MacroPlay, "Mod+Shift+P"),
+		item("Save Current Recorded Macro…", Cmd::MacroSave),
+		item("Run a Macro Multiple Times…", Cmd::MacroRunMultiple),
+		item("Run to End of File", Cmd::MacroPlayToEnd),
+	};
+	if (!savedMacros.empty()) {
+		macroMenu.push_back(separator());
+		for (const SavedMacro &saved : savedMacros) macroMenu.push_back(textItem(saved.name, Cmd::MacroRunSaved, saved.name));
+		macroMenu.push_back(separator());
+		macroMenu.push_back(item("Modify or Delete Macros…", Cmd::MacroManage));
+	}
+
+	std::vector<MenuItem> runMenu = {item("Run…", Cmd::RunDialog, "F5")};
+	if (!runCommands.empty()) {
+		runMenu.push_back(separator());
+		for (const auto &command : runCommands) runMenu.push_back(textItem(command.first, Cmd::RunSaved, command.second));
+		runMenu.push_back(separator());
+		runMenu.push_back(item("Modify or Delete Commands…", Cmd::RunManage));
+	}
+	runMenu.push_back(separator());
+	runMenu.push_back(item("Validate Shortcuts", Cmd::ValidateShortcuts));
+
+	std::vector<MenuItem> windowMenu = {
+		dynamic("Documents", MenuItem::Dynamic::Documents),
+		separator(),
+		sub("Sort By", {
+			item("Name A to Z", Cmd::WindowSort, "", 0),
+			item("Name Z to A", Cmd::WindowSort, "", 1),
+			item("Path A to Z", Cmd::WindowSort, "", 2),
+			item("Path Z to A", Cmd::WindowSort, "", 3),
+			item("Type A to Z", Cmd::WindowSort, "", 4),
+			item("Type Z to A", Cmd::WindowSort, "", 5),
+			item("Content Length Ascending", Cmd::WindowSort, "", 6),
+			item("Content Length Descending", Cmd::WindowSort, "", 7),
+			item("Modified Time Ascending", Cmd::WindowSort, "", 8),
+			item("Modified Time Descending", Cmd::WindowSort, "", 9),
+		}),
+		item("Windows…", Cmd::ShowWindows, "Alt+F6"),
+		item("Recent Window", Cmd::RecentWindow),
+		item("Next Document", Cmd::DocumentSwitch, "Ctrl+Tab", 0),
+		item("Previous Document", Cmd::DocumentSwitch, "Ctrl+Shift+Tab", 1),
+	};
+
+	std::vector<MenuItem> helpMenu = {
+		item("Command Line Arguments…", Cmd::HelpArguments),
+		textItem("omapad Home", Cmd::HelpOpen, "https://github.com/andysolomon/omapad"),
+		textItem("omapad Project Page", Cmd::HelpOpen, "https://github.com/andysolomon/omapad"),
+		textItem("Online User Manual", Cmd::HelpOpen, "https://github.com/andysolomon/omapad#readme"),
+		textItem("Report a Problem", Cmd::HelpOpen, "https://github.com/andysolomon/omapad/issues"),
+		separator(),
+		item("Check for Updates…", Cmd::CheckUpdates),
+		item("Set Updater Proxy…", Cmd::SetUpdateProxy),
+		separator(),
+		item("Debug Info…", Cmd::DebugInfo),
+#ifndef __APPLE__
+		item("About omapad", Cmd::About, key("", "F1")),
+#endif
+	};
+
+	std::vector<MenuItem> menu = {
 		sub("File", file),
 		sub("Edit", editMenu),
 		sub("Search", search),
 		sub("View", viewMenu),
-		sub("Encoding", {sub("Reopen with Encoding", reopen), sub("Convert To", convert)}),
+		sub("Encoding", encodingMenu),
 		sub("Language", languageMenu),
 		sub("Settings", {
 			sub("Theme", themeMenu),
@@ -4900,26 +5911,32 @@ std::vector<MenuItem> Workspace::baseMenu() const {
 			sub("Tab Size", widths),
 			item("Insert Spaces for Tabs", Cmd::ToggleInsertSpaces),
 			item("Preferences…", Cmd::ShowPreferences, "Mod+,"),
+			item("Style Configurator…", Cmd::StyleConfigurator),
 			item("Shortcut Mapper…", Cmd::ShowShortcutMapper),
+			item("File Association…", Cmd::FileAssociation),
+			sub("Import", {
+				item("Import Plugin(s)…", Cmd::ImportPlugin),
+				item("Import Style Theme(s)…", Cmd::ImportTheme),
+			}),
+			item("Edit Popup ContextMenu", Cmd::EditContextMenu),
 		}),
 		sub("Tools", toolsMenu),
-		sub("Macro", {
-			item("Start Recording", Cmd::MacroStart),
-			item("Stop Recording", Cmd::MacroStop),
-			item("Playback", Cmd::MacroPlay, "Mod+Shift+P"),
-			item("Run to End of File", Cmd::MacroPlayToEnd),
-		}),
+		sub("Macro", macroMenu),
+		sub("Run", runMenu),
 		sub("Folders", {
 			item("Open Folder as Workspace…", Cmd::OpenFolder),
 			item("Show Hidden Files", Cmd::ToggleHiddenInFolders),
 			item("Refresh", Cmd::RefreshFolders),
 			item("Close All Folders", Cmd::CloseAllFolders),
 		}),
-		dynamic("Window", MenuItem::Dynamic::Documents),
-#ifndef __APPLE__
-		sub("Help", {item("About omapad", Cmd::About)}),
-#endif
+		sub("Plugins", pluginMenu()),
+		sub("Window", windowMenu),
+		sub("Help", helpMenu),
 	};
+#ifndef __APPLE__
+	adoptNotepadKeys(menu);
+#endif
+	return menu;
 }
 
 }  // namespace omapad

@@ -11,3 +11,8 @@ MimeType=text/plain;text/x-csrc;text/x-c++src;text/x-python;text/x-shellscript;t
 Keywords=notepad;notepad++;text;editor;code;
 StartupWMClass=omapad
 StartupNotify=true
+Actions=NewInstance;
+
+[Desktop Action NewInstance]
+Name=Edit with omapad in a New Window
+Exec=@BINDIR@/omapad -multiInst %F

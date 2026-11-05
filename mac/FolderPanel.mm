@@ -234,6 +234,19 @@ static NSString *toNS(const std::string &s) {
 }
 
 - (void)addFolder:(id)sender { _workspace->run(omapad::Cmd::OpenFolder); }
+
+- (NSView *)focusTarget { return _outline; }
+
+- (void)selectPath:(NSString *)path {
+	for (NSInteger row = 0; row < _outline.numberOfRows; row++) {
+		OmaFolderNode *node = [_outline itemAtRow:row];
+		if (![node.path isEqualToString:path]) continue;
+		[_outline selectRowIndexes:[NSIndexSet indexSetWithIndex:row] byExtendingSelection:NO];
+		[_outline scrollRowToVisible:row];
+		[self.window makeFirstResponder:_outline];
+		return;
+	}
+}
 - (void)refresh:(id)sender { [self reload]; }
 
 @end
