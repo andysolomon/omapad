@@ -14,3 +14,6 @@ std::string OmaShortcutFromEvent(NSEvent *event);
 
 // Sets the key equivalent for a shortcut like "Mod+Shift+F".
 void OmaApplyShortcut(const std::string &shortcut, NSMenuItem *item);
+
+// Runs a print job, or writes it to a PDF. Cancelling returns YES.
+BOOL OmaRunPrint(omapad::PrintJob &job, const omapad::PrintOutput &output, std::string &error);

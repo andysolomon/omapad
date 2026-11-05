@@ -1,18 +1,56 @@
-# Validation — omapad 0.3.0
+# Validation — omapad 0.4.0
 
 Verified on 2026-11-04 on an Intel Mac and two x86_64 Linux machines running Omarchy.
 
-| Target | Build | Core tests | Installed application |
-| --- | --- | --- | --- |
-| macOS / AppKit | CMake Release | 2,094 checks, zero failures | `/Applications/omapad.app`; ad-hoc signature verified |
-| Omarchy machine 1 / GTK3 | GCC, GNUmakefile | 2,101 checks, zero failures | `~/.local/bin/omapad`; resources, icon and desktop entry installed |
-| Omarchy machine 2 / GTK3 | GCC, GNUmakefile | 2,101 checks, zero failures | `~/.local/bin/omapad`; resources, icon and desktop entry installed |
+| Target | Build | Core tests |
+| --- | --- | --- |
+| macOS / AppKit | CMake Release | 2,272 checks, zero failures |
+| Omarchy machine 1 / GTK3 | GCC, GNUmakefile | 2,278 checks, zero failures |
+| Omarchy machine 2 / GTK3 | GCC, GNUmakefile | 2,278 checks, zero failures |
 
 The tests exercise the real Scintilla editing widgets, including encodings, file operations,
 search and PCRE2 regex, split views, clones, folders, session restore, themes, language lexers,
 preferences, shortcuts, completion, hints, all 47 Function List rule files, multi-select, the
-Column Editor, change history, token styles and the Document Map. The totals differ by platform;
-all suites completed without failures.
+Column Editor, change history, token styles, the Document Map, user-defined language files and
+colouring, and print pagination. On macOS they also write a real PDF through the app's print code.
+The totals differ by platform; all suites completed without failures.
+
+## 0.4.0 results
+
+Linux, through GTK's Broadway backend and a headless browser, with isolated support directories:
+
+- Save as PDF from the menu: 12 A4 pages with the header, footer, line numbers and word wrap, syntax
+  colours on white, and 11 pt text measured in the PDF. The print dialog opens and Cancel returns
+  to a working editor.
+- Language editor: all six pages, a new language saved with a keyword and a picked colour, the file
+  written correctly, and the open tab recoloured. Bundled Markdown highlights a `.md` file.
+
+macOS:
+
+- Save as PDF from the menu in the real app, before the print view moved to a hidden editor: 13
+  Letter pages, the right way up. The final code then wrote PDFs through the same print code from
+  the test suite, including one from a dark theme, which has a white background and dark text.
+- The language editor was rendered to images offscreen with its real controls. The pages I viewed
+  (Keywords, Comments and Numbers, Styles, Nesting) look right, and pressing OK through those controls
+  keeps a language byte-for-byte. That check found and fixed a crash on pages starting with a heading.
+
+Fixed in the bundled lexer during these checks: fold levels landed on the wrong line after a comment
+that closes at the end of a line. Details are in `NOTICE`.
+
+**Not checked in 0.4.0:**
+
+- Printing on paper. A real printer was available on Linux and wasn't used. **Print Now** and printing
+  from the dialog weren't run on either platform.
+- The final Mac build's language editor, print dialog and menu commands in a live window with real
+  clicks, because the screen was locked and then in use.
+- Importing, exporting and removing languages in the real windows, on either platform. These commands
+  are covered by the core tests.
+- Clicking a colour well on macOS.
+- Any of the new windows on a live Wayland session.
+
+0.4.0 hasn't been installed on any of these machines.
+
+## 0.3.0 results
 
 Added in 0.3.0, checked by driving the real windows with isolated support directories:
 
@@ -22,7 +60,7 @@ Added in 0.3.0, checked by driving the real windows with isolated support direct
   Function List filter and double-click, Document Map click, drag and wheel, Column Editor form,
   Shortcut Mapper capture, and a rebound Undo key. The installed binary found its resources.
 
-**Not checked in 0.3.0:** these new windows on a live Wayland session. One Linux machine's session
+**Not checked in 0.3.0:** these windows on a live Wayland session. One Linux machine's session
 was locked and the other was in use, so Broadway stood in for Wayland. That leaves the placement
 of the completion list and hint popups on Hyprland unconfirmed. Word completion's list was seen
 on macOS only; on Linux it's covered by the core tests. Also not exercised: Apple Silicon hardware,

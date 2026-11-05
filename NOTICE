@@ -19,11 +19,15 @@ Scintilla 5.6.6 and Lexilla 5.5.3, Copyright 1998-2021 Neil Hodgson, https://www
 
 Changes to the bundled third-party code:
   - Removed unused platform folders, documentation, tests and scripts.
-  - third_party/lexilla/src/Lexilla.cxx: removed the lmUserDefine lexer, and the build leaves out
-    lexers/LexUser.cxx, because it depends on Windows.
+  - third_party/lexilla/lexers/LexUser.cxx: replaced <windows.h> with standard headers and a small portable _itoa, and
+    fixed fold levels landing on the wrong line after a comment that closes at the end of a line.
   - resources/mac_cursor_*.tiff are made from Scintilla's cocoa/res PNGs using tiffutil.
   - third_party/scintilla/include/Sci_Position.h: explicitly includes stdint.h so intptr_t
     is available when compiling the GTK port with GCC.
+
+Markdown-plus-plus, Copyright (c) Edditoria, https://github.com/Edditoria/markdown-plus-plus
+  resources/userDefineLangs/markdown._preinstalled*.udl.xml come unmodified from the Notepad++
+  source tag above and are distributed under the MIT license, as their headers say.
 
 pugixml 1.16, Copyright (C) 2006-2026 Arseny Kapoulkine, https://pugixml.org/
   third_party/pugixml is distributed under the MIT license.

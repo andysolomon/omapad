@@ -21,7 +21,14 @@ Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 #include <map>
 #include <vector>
 #include <assert.h>
-#include <windows.h>
+#include <stdio.h>
+#include <string.h>
+// omapad: these replace what this file used from <windows.h>, on every platform.
+static inline char *_itoa(int value, char *buffer, int) {
+    // Callers write into the tail of a fixed "userDefine.nesting.00" buffer: 1 digit at offset 20, 2 at offset 19.
+    snprintf(buffer, 3, "%d", value);
+    return buffer;
+}
 
 #include "ILexer.h"
 #include "LexAccessor.h"
@@ -1781,6 +1788,11 @@ static void ColouriseUserDoc(Sci_PositionU startPos, Sci_Position length, int in
                         // paint backward keyword and move on
                         sc.SetState(SCE_USER_STYLE_COMMENT);
                         sc.Forward(iter->length());
+                        // omapad: like delimiters. Otherwise a close at the end of a line counts that line twice.
+                        if (sc.atLineStart)
+                            checkEOL = EOL_FORCE_CHECK;
+                        else if (sc.atLineEnd)
+                            checkEOL = EOL_SKIP_CHECK;
                         // was current comment sequence nested, or do we start over from SCE_USER_STYLE_IDENTIFIER?
                         readLastNested(lastNestedGroup, newState, openIndex);
                         // paint end of comment sequence
@@ -1855,7 +1867,11 @@ static void ColouriseUserDoc(Sci_PositionU startPos, Sci_Position length, int in
                         {
                             visibleChars = false;
                             skipVisibleCheck = true;
+                            // omapad: like delimiters. Otherwise a ((EOL)) close skips this line and later folds land a line early.
+                            checkEOL = EOL_FORCE_CHECK;
                         }
+                        else if (sc.atLineEnd)
+                            checkEOL = EOL_SKIP_CHECK;
                         // was current line comment sequence nested, or do we start over from SCE_USER_STYLE_IDENTIFIER?
                         readLastNested(lastNestedGroup, newState, openIndex);
                         // paint end of line comment sequence

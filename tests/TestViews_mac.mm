@@ -1,5 +1,6 @@
 #import <Cocoa/Cocoa.h>
 #include "TestViews.h"
+#import "Dialogs.h"
 #import "ScintillaView.h"
 #import "Scintilla.h"
 
@@ -29,4 +30,18 @@ std::unique_ptr<omapad::SciView> makeHiddenSciView(std::function<void(const SCNo
 	out->delegate.handler = notify;
 	out->view.delegate = out->delegate;
 	return out;
+}
+
+void *makeTestSurface() {
+	CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+	CGContextRef context = CGBitmapContextCreate(nullptr, 600, 800, 8, 0, space, kCGImageAlphaPremultipliedLast);
+	CGColorSpaceRelease(space);
+	return context;
+}
+
+void freeTestSurface(void *surface) { CGContextRelease(static_cast<CGContextRef>(surface)); }
+
+bool writeTestPdf(omapad::PrintJob &job, const omapad::PrintOutput &output, std::string &error) {
+	OmaRunPrint(job, output, error);
+	return true;
 }

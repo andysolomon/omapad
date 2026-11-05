@@ -4,6 +4,7 @@
 #include "Completion.h"
 #include "FunctionList.h"
 #include "Languages.h"
+#include "Print.h"
 #include "Regex.h"
 #include "TextCore.h"
 
@@ -60,6 +61,8 @@ enum class Cmd {
 	StyleAllOccurrences, StyleOneToken, ClearStyle, JumpStyleUp, JumpStyleDown, CopyStyled,
 	NextSearchResult, PreviousSearchResult, SelectInBraces, IndentLine, UnindentLine, DeleteSelection,
 	ToggleReadOnly, Rename, CloseLeft, CloseRight,
+	Print, PrintNow, PrintSelection, SaveAsPdf,
+	DefineLanguage, ImportLanguage, ExportLanguage, RemoveLanguage, OpenLanguageFolder,
 };
 
 // A menu described once and drawn natively by each platform.
@@ -85,10 +88,15 @@ struct FolderEntry { std::string name, path; bool isDirectory = false; bool isSy
 // Colours for the window around the editor, on platforms that draw their own.
 // One setting in a generated form. Each platform draws the same list natively.
 struct FormField {
-	enum class Kind { Heading, Bool, Int, Text, Choice };
+	// Page starts a tab, and a form with pages shows them as tabs. LongText is a few lines tall.
+	// StyleRow is colours and font style on one row. Flags is a grid of checkboxes.
+	enum class Kind { Heading, Bool, Int, Text, Choice, Page, LongText, StyleRow, Flags };
 	std::string key, label;
 	Kind kind = Kind::Bool;
-	std::string value;  // "1" or "0" for Bool, the number for Int, the choice's key for Choice.
+	// "1" or "0" for Bool, the number for Int, the choice's key for Choice. For StyleRow,
+	// "RRGGBB,RRGGBB,N": foreground and background, empty for the theme's, then font style bits
+	// (1 bold, 2 italic, 4 underline). For Flags, the sum of the chosen choices' keys.
+	std::string value;
 	int minimum = 0, maximum = 0;
 	std::vector<std::pair<std::string, std::string>> choices;  // Key and label.
 };
@@ -110,6 +118,7 @@ struct Host {
 	virtual SciView &paneView(int pane) = 0;
 	virtual SciView &resultsView() = 0;
 	virtual SciView &backgroundView() = 0;
+	virtual SciView &printView() = 0;  // Never shown. It draws printouts, so the editor doesn't change.
 
 	virtual int ask(const std::string &title, const std::string &detail, const std::vector<std::string> &buttons) = 0;
 	virtual bool chooseFilesToOpen(const std::string &startDirectory, std::vector<std::string> &out) = 0;
@@ -133,6 +142,8 @@ struct Host {
 	virtual void menusChanged() = 0;   // Shortcuts changed, so menus need building again.
 	virtual bool runForm(const std::string &title, std::vector<FormField> &fields) = 0;
 	virtual void runShortcutMapper() = 0;
+	// Returns false with a message if it couldn't be done. Cancelling isn't a failure.
+	virtual bool print(PrintJob &job, const PrintOutput &output, std::string &error) = 0;
 	virtual SciView &mapView() = 0;
 	virtual void setDocumentMapVisible(bool visible) = 0;
 	virtual void setFunctionListVisible(bool visible) = 0;
@@ -181,6 +192,11 @@ struct Settings {
 	int completeThreshold = 2;
 	bool restoreSessionOnStart = true;
 	int backupSeconds = 7;
+	bool printLineNumbers = true;
+	std::string printColours = "auto";  // auto (a light theme on white), invert, black, colour or screen.
+	std::string printHeaderLeft = "$(FILE_NAME)", printHeaderMiddle, printHeaderRight = "$(SHORT_DATE)";
+	std::string printFooterLeft, printFooterMiddle = "$(CURRENT_PRINTING_PAGE) / $(TOTAL_PAGES)", printFooterRight;
+	int printMarginTop = 15, printMarginBottom = 15, printMarginLeft = 15, printMarginRight = 15;  // Millimetres.
 };
 
 struct Document;
@@ -383,6 +399,17 @@ private:
 	std::string wordBeforeCaret(long &start) const;
 	void showPathCompletion();
 	void columnEditorDialog();
+	void printActive(bool selectionOnly, const PrintOutput &output);
+	std::string userLanguageFolder() const;
+	// Picks from the user languages, with an optional "New language" entry that returns an empty name.
+	bool chooseUserLanguage(const std::string &title, bool offerNew, bool personalOnly, std::string &outName);
+	bool storeUserLanguage(const UserLanguage &language, const std::string &previousName, std::string &error);
+	void removeUserLanguageFromFolder(const std::string &name, std::string &error);
+	void userLanguagesChanged(const std::string &renamedFrom = std::string(), const std::string &renamedTo = std::string());
+	void defineUserLanguage();
+	void importUserLanguages();
+	void exportUserLanguage();
+	void removeUserLanguage();
 	void columnInsert(const std::vector<std::string> &values);
 	void multiSelectPrepare(int flags);
 	long styleIndicator(int style) const;
